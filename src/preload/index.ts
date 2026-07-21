@@ -20,6 +20,7 @@ export interface AppEntry {
   workingDirectory: string
   description: string
   isFolder?: boolean
+  specialType?: 'this-pc' | 'recycle-bin'
 }
 
 // Custom APIs for renderer
@@ -38,7 +39,12 @@ const api = {
     ipcRenderer.invoke('save-shortcuts', data),
   /** Select a folder and return its path, name, and system icon. */
   selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string } | null> =>
-    ipcRenderer.invoke('select-folder')
+    ipcRenderer.invoke('select-folder'),
+  /** Add a special system location (This PC or Recycle Bin). */
+  addSpecialItem: (type: 'this-pc' | 'recycle-bin'): Promise<{
+    path: string; name: string; iconDataUrl: string; specialType: string
+  } | null> =>
+    ipcRenderer.invoke('add-special-item', type)
 }
 
 if (process.contextIsolated) {
