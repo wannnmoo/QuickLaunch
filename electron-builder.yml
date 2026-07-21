@@ -1,0 +1,26 @@
+appId: com.quicklaunch.app
+productName: QuickLaunch
+directories:
+  buildResources: resources
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron-vite.config.*'
+  - '!{.eslintignore,.eslintrc,.prettierignore,.prettierrc,tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+extraResources:
+  - from: resources/icon.ico
+    to: icon.ico
+  - from: resources/tray-icon.png
+    to: tray-icon.png
+win:
+  executableName: QuickLaunch
+  icon: resources/icon.ico
+mac:
+  entitlementsInherit: entitlements.mac.plist
+  icon: resources/icon.ico
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Utility
+  icon: resources/icon.ico

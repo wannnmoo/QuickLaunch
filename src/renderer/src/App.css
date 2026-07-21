@@ -1,0 +1,125 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100vh;
+  padding: 40px 24px;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+  color: #e0e0e0;
+}
+
+.app-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 40px;
+  -webkit-app-region: drag;
+  user-select: none;
+  padding-top: 12px;
+  width: 100%;
+}
+
+.app-header h1 {
+  font-size: 1.6rem;
+  font-weight: 600;
+  background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.header-buttons {
+  display: flex;
+  gap: 12px;
+  -webkit-app-region: no-drag;
+}
+
+.btn {
+  padding: 8px 24px;
+  font-size: 0.95rem;
+  color: #fff;
+  background: linear-gradient(135deg, #3a7bd5, #00d2ff);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+  -webkit-app-region: no-drag;
+}
+
+.btn:hover {
+  opacity: 0.85;
+}
+
+.btn:active {
+  opacity: 0.7;
+}
+
+.btn-folder {
+  background: linear-gradient(135deg, #f0a040, #e08030);
+}
+
+.hint {
+  margin-top: 40px;
+  color: #606080;
+  font-size: 0.9rem;
+}
+
+/* ---- icon grid ---- */
+
+.icon-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 16px;
+  width: 100%;
+  max-width: 720px;
+}
+
+.icon-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 8px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s;
+}
+
+.icon-card:hover {
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateY(-2px);
+}
+
+.app-icon {
+  width: 72px;
+  height: 72px;
+  border-radius: 14px;
+  pointer-events: none;
+  image-rendering: auto;
+}
+
+.icon-label {
+  font-size: 0.78rem;
+  color: #a0a0c0;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  pointer-events: none;
+}
