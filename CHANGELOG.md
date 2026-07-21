@@ -58,6 +58,7 @@
 | `run-app` | Renderer → Main | 启动目标程序（exe/URL），或通过 `shell.openPath` 打开文件夹 |
 | `load-shortcuts` | Renderer → Main | 从 `userData/shortcuts.json` 加载已保存的快捷方式 |
 | `save-shortcuts` | Renderer → Main | 保存快捷方式数据到 `userData/shortcuts.json` |
+| `add-special-item` | Renderer → Main | 添加系统位置（此电脑/回收站），从注册表解析图标 |
 
 ### LnkInfo 结构
 
@@ -93,8 +94,8 @@ app/
 │       ├── index.html            # HTML 入口
 │       └── src/
 │           ├── main.tsx          # React 入口
-│           ├── App.tsx           # 根组件（快捷方式 + 文件夹网格面板）
-│           ├── App.css           # 样式（含拖拽区 + 自定义标题栏）
+│           ├── App.tsx           # 根组件（Dock 栏 + 拖拽排序 + 放大效果）
+│           ├── App.css           # 样式（毛玻璃 Dock + 动画）
 │           └── env.d.ts          # TypeScript 全局类型声明
 ├── electron-vite.config.ts       # electron-vite 配置
 ├── tsconfig.json                 # TypeScript 总配置
@@ -118,6 +119,17 @@ npm run package    # 构建并打包为可执行安装包
 ---
 
 ## 更新日志
+
+### v1.2.0 (2026-07-21)
+
+- **Dock 风格 UI 重设计**：透明毛玻璃 Dock 栏替代网格面板，悬浮桌面
+- **图标拖拽排序**：按住图标拖放到目标位置，蓝色指示线显示插入点
+- **自定义右键菜单**：右键图标弹出「删除」选项，不再直接删除
+- **系统位置支持**：一键添加「此电脑」和「回收站」，图标从注册表动态解析
+- **合并添加按钮**：四个添加选项统一到一个下拉菜单
+- **Dock 放大效果**：鼠标靠近图标时平滑放大 + 上浮动画
+- **代码精简**：提取共享图标提取器（`ICON_EXTRACTOR_CS`）、`resolveResource`、`doAdd` 泛型辅助，消除约 120 行重复代码
+- **透明常驻窗口**：`transparent: true` + `alwaysOnTop` + `skipTaskbar`，Dock 悬浮桌面
 
 ### v1.1.0 (2026-07-21)
 
