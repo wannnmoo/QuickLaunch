@@ -23,7 +23,9 @@ html, body {
   height: 100%;
 }
 
-/* ─── App shell ─────────────────────────────────────────────────────── */
+/* ─── App shell + 主题变量 ──────────────────────────────────────────── */
+/* 主题通过 .app 上的 CSS 变量控制，默认黑夜；.theme-light 覆盖为白天。
+   菜单/上下文菜单也复用这些变量，切换主题时自动跟随。 */
 
 .app {
   display: flex;
@@ -32,17 +34,62 @@ html, body {
   justify-content: flex-end;
   height: 100vh;
   background: transparent;
+
+  /* 黑夜（默认） */
+  --dock-bg-top: rgba(44, 50, 70, 0.68);
+  --dock-bg-bottom: rgba(27, 32, 46, 0.6);
+  --dock-border: rgba(255, 255, 255, 0.12);
+  --dock-border-hover: rgba(255, 255, 255, 0.2);
+  --dock-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+  --dock-edge: rgba(18, 22, 34, 0.75);
+  --label-color: rgba(255, 255, 255, 0.62);
+  --label-color-hover: #fff;
+  --label-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  --icon-wrap-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.03) 100%);
+  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
+  --add-btn-color: rgba(255, 255, 255, 0.25);
+  --add-btn-hover-color: rgba(255, 255, 255, 0.7);
+  --menu-bg: rgba(22, 27, 40, 0.92);
+  --menu-border: rgba(255, 255, 255, 0.1);
+  --menu-text: #c0c0d0;
+  --menu-hover-bg: rgba(58, 123, 213, 0.35);
+  --menu-hover-text: #fff;
+  --context-hover-bg: rgba(255, 255, 255, 0.08);
+  --divider-bg: rgba(255, 255, 255, 0.1);
+  --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
 }
 
-.hint {
-  position: absolute;
-  bottom: 50%;
-  left: 50%;
-  transform: translate(-50%, 50%);
-  font-size: 0.75rem;
-  color: rgba(255, 255, 255, 0.18);
-  letter-spacing: 0.1em;
-  pointer-events: none;
+.app.theme-light {
+  /* 白天 */
+  --dock-bg-top: rgba(255, 255, 255, 0.75);
+  --dock-bg-bottom: rgba(240, 242, 248, 0.65);
+  --dock-border: rgba(0, 0, 0, 0.12);
+  --dock-border-hover: rgba(0, 0, 0, 0.22);
+  --dock-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.16),
+    0 2px 8px rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+  --dock-edge: rgba(238, 241, 247, 0.88);
+  --label-color: rgba(0, 0, 0, 0.6);
+  --label-color-hover: #111;
+  --label-shadow: 0 1px 2px rgba(255, 255, 255, 0.7);
+  --icon-wrap-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.05) 0%, rgba(0, 0, 0, 0.02) 100%);
+  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.04) 100%);
+  --add-btn-color: rgba(0, 0, 0, 0.4);
+  --add-btn-hover-color: rgba(0, 0, 0, 0.75);
+  --menu-bg: rgba(255, 255, 255, 0.92);
+  --menu-border: rgba(0, 0, 0, 0.1);
+  --menu-text: #333;
+  --menu-hover-bg: rgba(58, 123, 213, 0.22);
+  --menu-hover-text: #1659b0;
+  --context-hover-bg: rgba(0, 0, 0, 0.06);
+  --divider-bg: rgba(0, 0, 0, 0.1);
+  --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
 }
 
 /* ─── Dock ──────────────────────────────────────────────────────────── */
@@ -66,21 +113,17 @@ html, body {
   top: 44px; /* 图标顶上方留 8px */
   bottom: 0; /* 图标底下方留 8px（图标底 131，dock 底 139） */
   z-index: 0;
-  background: linear-gradient(180deg, rgba(44, 50, 70, 0.68) 0%, rgba(27, 32, 46, 0.6) 100%);
+  background: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   backdrop-filter: blur(32px) saturate(1.6);
   -webkit-backdrop-filter: blur(32px) saturate(1.6);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--dock-border);
   border-radius: 22px;
-  box-shadow:
-    0 12px 32px rgba(0, 0, 0, 0.45),
-    0 2px 8px rgba(0, 0, 0, 0.3),
-    inset 0 1px 0 rgba(255, 255, 255, 0.1),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+  box-shadow: var(--dock-shadow);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .dock:hover .dock-bg {
-  border-color: rgba(255, 255, 255, 0.2);
+  border-color: var(--dock-border-hover);
 }
 
 .dock-inner {
@@ -119,13 +162,13 @@ html, body {
 
 .dock-edge.left {
   left: 24px;
-  background: linear-gradient(to right, rgba(18, 22, 34, 0.75), rgba(18, 22, 34, 0));
+  background: linear-gradient(to right, var(--dock-edge), rgba(18, 22, 34, 0));
   border-radius: 22px 0 0 22px;
 }
 
 .dock-edge.right {
   right: 24px;
-  background: linear-gradient(to left, rgba(18, 22, 34, 0.75), rgba(18, 22, 34, 0));
+  background: linear-gradient(to left, var(--dock-edge), rgba(18, 22, 34, 0));
   border-radius: 0 22px 22px 0;
 }
 
@@ -155,13 +198,13 @@ html, body {
   align-items: center;
   justify-content: center;
   border-radius: 16px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.03) 100%);
+  background: var(--icon-wrap-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   transition: background 0.2s, box-shadow 0.2s;
 }
 
 .dock-item:hover .dock-icon-wrap {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
+  background: var(--icon-wrap-hover-bg);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.14),
     0 6px 20px rgba(0, 0, 0, 0.35);
@@ -178,19 +221,19 @@ html, body {
 
 .dock-label {
   font-size: 0.68rem;
-  color: rgba(255, 255, 255, 0.62);
+  color: var(--label-color);
   white-space: nowrap;
   max-width: 72px;
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: center;
   pointer-events: none;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  text-shadow: var(--label-shadow);
   transition: color 0.2s;
 }
 
 .dock-item:hover .dock-label {
-  color: #fff;
+  color: var(--label-color-hover);
 }
 
 /* ─── Drag & drop ──────────────────────────────────────────────────── */
@@ -219,7 +262,7 @@ html, body {
 
 .dock-add-btn {
   background: rgba(255, 255, 255, 0.03) !important;
-  color: rgba(255, 255, 255, 0.25);
+  color: var(--add-btn-color);
   transition: background 0.2s, color 0.2s, box-shadow 0.2s !important;
 }
 
@@ -229,7 +272,7 @@ html, body {
 
 .dock-add-btn:hover {
   background: rgba(255, 255, 255, 0.1) !important;
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--add-btn-hover-color);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
 }
 
@@ -245,14 +288,14 @@ html, body {
   left: 50%;
   transform: translateX(-50%);
   min-width: 155px;
-  background: rgba(22, 27, 40, 0.92);
+  background: var(--menu-bg);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
+  border: 1px solid var(--menu-border);
+  border-radius: 16px;
   padding: 6px 0;
   z-index: 100;
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--menu-shadow);
   overflow: hidden;
   overflow-y: auto; /* 菜单超高（如 300px 窗口装不下 5+ 项）时内部滚动，不再被窗口裁掉 */
   animation: dropdown-in 0.16s ease-out;
@@ -264,7 +307,7 @@ html, body {
   width: 100%;
   padding: 7px 16px;
   font-size: 0.84rem;
-  color: #c0c0d0;
+  color: var(--menu-text);
   background: none;
   border: none;
   cursor: pointer;
@@ -277,14 +320,30 @@ html, body {
 }
 
 .dropdown-item:hover {
-  background: rgba(58, 123, 213, 0.35);
-  color: #fff;
+  background: var(--menu-hover-bg);
+  color: var(--menu-hover-text);
 }
 
 .dropdown-divider {
   height: 1px;
   margin: 6px 12px;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--divider-bg);
+}
+
+/* ─── 菜单滚动条：隐藏 ──────────────────────────────────────────────────── */
+/* 滚动条滑块是接近满高的竖条，其方角会盖住菜单右上/右下角的圆角，右边缘看起来
+   就成了直角；且原生滚动条与毛玻璃界面格格不入。直接隐藏（与 .dock-inner 横向
+   滚动一致）——菜单超出时用滚轮/触控板滚动，四个角始终保持 16px 圆角。 */
+
+.dropdown-menu::-webkit-scrollbar,
+.context-menu::-webkit-scrollbar {
+  display: none;
+}
+
+/* Firefox（Electron 用 Chromium，此处仅防御性兼容） */
+.dropdown-menu,
+.context-menu {
+  scrollbar-width: none;
 }
 
 /* ─── Context menu ──────────────────────────────────────────────────── */
@@ -293,14 +352,14 @@ html, body {
   position: fixed;
   min-width: 100px;
   -webkit-app-region: no-drag;
-  background: rgba(22, 27, 40, 0.92);
+  background: var(--menu-bg);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
+  border: 1px solid var(--menu-border);
+  border-radius: 16px;
   padding: 6px 0;
   z-index: 200;
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--menu-shadow);
   overflow: hidden;
   animation: context-in 0.14s ease-out;
 }
@@ -310,7 +369,7 @@ html, body {
   width: 100%;
   padding: 9px 20px;
   font-size: 0.85rem;
-  color: #c0c0d0;
+  color: var(--menu-text);
   background: none;
   border: none;
   cursor: pointer;
@@ -321,8 +380,8 @@ html, body {
 }
 
 .context-menu-item:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+  background: var(--context-hover-bg);
+  color: var(--menu-hover-text);
 }
 
 /* ─── 菜单入场动画 ────────────────────────────────────────────────────── */

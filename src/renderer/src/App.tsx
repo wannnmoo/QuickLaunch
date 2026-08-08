@@ -23,6 +23,10 @@ function App(): React.ReactElement {
   const [scrollState, setScrollState] = useState({ left: false, right: false })
   // 桌面图标当前是否隐藏（决定菜单项文案「隐藏/显示桌面图标」）
   const [desktopIconsHidden, setDesktopIconsHidden] = useState(false)
+  // 白天/黑夜主题：默认黑夜，偏好持久化到 localStorage（跟随 Electron 用户数据目录）
+  const [theme, setTheme] = useState<'dark' | 'light'>(() =>
+    localStorage.getItem('ql-theme') === 'light' ? 'light' : 'dark'
+  )
 
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
@@ -280,15 +284,50 @@ function App(): React.ReactElement {
       })
   }
 
-  const handleAdd = () => doAdd(
-    () => window.api.parseLnk(),
-    (r) => ({ iconDataUrl: r.iconDataUrl, targetPath: r.targetPath, arguments: r.arguments, workingDirectory: r.workingDirectory, description: r.description })
-  )
+  // 切换白天/黑夜主题（偏好持久化到 localStorage）
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark'
+    localStorage.setItem('ql-theme', next)
+    setTheme(next)
+    setMenuPos(null)
+  }
 
-  const handleAddFolder = () => doAdd(
-    () => window.api.selectFolder(),
-    (r) => ({ iconDataUrl: r.iconDataUrl, targetPath: r.path, arguments: '', workingDirectory: '', description: r.name, isFolder: true })
-  )
+  // 添加快捷方式：支持一次多选（Windows 对话框 multiSelections），逐个生成条目
+  const handleAdd = async () => {
+    setMenuPos(null)
+    try {
+      const shortcuts = await window.api.parseLnk()
+      if (shortcuts && shortcuts.length > 0) {
+        setApps((prev) => [...prev, ...shortcuts.map((r) => ({
+          id: nextId++,
+          iconDataUrl: r.iconDataUrl,
+          targetPath: r.targetPath,
+          arguments: r.arguments,
+          workingDirectory: r.workingDirectory,
+          description: r.description
+        }))])
+      }
+    } catch { /* ignore */ }
+  }
+
+  // 添加文件夹：支持一次多选（Windows 对话框 multiSelections），逐个生成条目
+  const handleAddFolder = async () => {
+    setMenuPos(null)
+    try {
+      const folders = await window.api.selectFolder()
+      if (folders && folders.length > 0) {
+        setApps((prev) => [...prev, ...folders.map((r) => ({
+          id: nextId++,
+          iconDataUrl: r.iconDataUrl,
+          targetPath: r.path,
+          arguments: '',
+          workingDirectory: '',
+          description: r.name,
+          isFolder: true
+        }))])
+      }
+    } catch { /* ignore */ }
+  }
 
   const handleAddSpecial = (type: 'this-pc' | 'recycle-bin') => doAdd(
     () => window.api.addSpecialItem(type),
@@ -348,9 +387,8 @@ function App(): React.ReactElement {
 
   return (
     <div
-      className="app"
+      className={theme === 'light' ? 'app theme-light' : 'app'}
       onMouseEnter={() => window.api.dockPointer(true)}
-      onMouseLeave={() => window.api.dockPointer(false)}
     >
       <div
         className="dock"
@@ -420,7 +458,9 @@ function App(): React.ReactElement {
           ref={menuRef}
           className="dropdown-menu"
           style={{
-            left: menuPos.cx,
+            // 水平钳制在窗口内：菜单以按钮中心为锚点居中，若按钮靠近窗口右缘，
+            // 菜单会伸出窗口被裁掉右角（圆角变直角）。钳到距边缘 100px 内保证完整。
+            left: Math.min(Math.max(menuPos.cx, 100), window.innerWidth - 100),
             bottom: window.innerHeight - menuPos.top + 8,
             transform: 'translateX(-50%)',
             // 菜单不超过「添加」按钮上方空间，否则顶部会超出 300px 窗口被裁掉
@@ -443,18 +483,22 @@ function App(): React.ReactElement {
           <button className="dropdown-item" onClick={handleToggleDesktopIcons}>
             {desktopIconsHidden ? '显示桌面图标' : '隐藏桌面图标'}
           </button>
+          <div className="dropdown-divider" />
+          <button className="dropdown-item" onClick={toggleTheme}>
+            {theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'}
+          </button>
         </div>
-      )}
-
-      {apps.length === 0 && (
-        <p className="hint">点击 + 添加</p>
       )}
 
       {contextMenu && (
         <div
           ref={ctxRef}
           className="context-menu"
-          style={{ left: contextMenu.x + 4, top: contextMenu.y - 8 }}
+          style={{
+            // 同样钳制在窗口内，防止右缘被裁掉圆角
+            left: Math.min(Math.max(contextMenu.x + 4, 60), window.innerWidth - 60),
+            top: contextMenu.y - 8
+          }}
         >
           <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId)}>
             删除

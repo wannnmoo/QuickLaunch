@@ -25,8 +25,8 @@ export interface AppEntry {
 
 // Custom APIs for renderer
 const api = {
-  /** Parse a .lnk shortcut file. Pass a path, or omit to open a file dialog. */
-  parseLnk: (filePath?: string): Promise<LnkInfo | null> =>
+  /** Parse one or more .lnk shortcut files. Pass a path, or omit to open a multi-select file dialog. */
+  parseLnk: (filePath?: string): Promise<LnkInfo[]> =>
     ipcRenderer.invoke('parse-lnk', filePath),
   /** Launch an executable with optional args and working directory. */
   runApp: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
@@ -37,8 +37,8 @@ const api = {
   /** Save shortcuts to disk for persistence across restarts. */
   saveShortcuts: (data: AppEntry[]): Promise<void> =>
     ipcRenderer.invoke('save-shortcuts', data),
-  /** Select a folder and return its path, name, and system icon. */
-  selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string } | null> =>
+  /** Select one or more folders, returning each one's path, name, and system icon. */
+  selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string }[]> =>
     ipcRenderer.invoke('select-folder'),
   /** Add a special system location (This PC or Recycle Bin). */
   addSpecialItem: (type: 'this-pc' | 'recycle-bin'): Promise<{
@@ -51,8 +51,8 @@ const api = {
   /** Toggle desktop icon visibility (registry + shell refresh); returns new state. */
   toggleDesktopIcons: (): Promise<boolean> =>
     ipcRenderer.invoke('toggle-desktop-icons'),
-  /** 通知主进程鼠标进入(inside=true)/离开(inside=false) Dock 窗口。
-   *  离开时让出置顶沉底，进入时恢复置顶——用于滚动其他软件时 Dock 不遮挡。 */
+  /** 通知主进程鼠标进入 Dock 窗口（inside=true）恢复置顶。
+   *  沉底仅由点击其他软件（blur）触发——鼠标移出或在其他软件上滚动都不让位。 */
   dockPointer: (inside: boolean): void =>
     ipcRenderer.send('dock-pointer', inside)
 }

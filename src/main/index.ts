@@ -10,10 +10,6 @@ let tray: Tray | null = null
 // 系统文件/文件夹对话框打开期间禁止 Dock 沉底：模态对话框跟随父窗口层级，
 // 若此时 blur/mouseleave 触发沉底，对话框会被连带压到其他软件下面
 let dialogOpen = false
-// 鼠标离开 Dock 后的延迟沉底计时器：快速划过/短暂移出 Dock 不立即让位，避免闪沉
-let sinkTimer: ReturnType<typeof setTimeout> | null = null
-// 鼠标移出 Dock 到真正沉底的延迟（ms）：鼠标快速划过（<该值）不会闪沉
-const SINK_DELAY_MS = 500
 
 function toggleWindow(): void {
   if (!mainWindow) return
@@ -95,29 +91,11 @@ Write-Output $b64`
 
 // ─── IPC: parse .lnk shortcut file via PowerShell ──────────────────────────
 
-ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
-  if (!filePath) {
-    // 对话框打开期间保持 Dock 置顶（模态对话框跟随父窗口层级，否则会被压到其他软件下面）
-    dialogOpen = true
-    mainWindow?.setAlwaysOnTop(true)
-    mainWindow?.moveTop()
-    let result: Electron.OpenDialogReturnValue
-    try {
-      result = await dialog.showOpenDialog(mainWindow!, {
-        title: '选择快捷方式文件',
-        filters: [
-          { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
-          { name: '全部文件', extensions: ['*'] }
-        ],
-        properties: ['openFile']
-      })
-    } finally {
-      dialogOpen = false
-    }
-    if (result.canceled || result.filePaths.length === 0) return null
-    filePath = result.filePaths[0]
-  }
+// 新增文件/文件夹对话框的默认起始目录：优先用户重定向到 D 盘的桌面，回退系统桌面
+const DEFAULT_DIALOG_PATH = existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
 
+// 解析单个 .lnk/.url/.pif 快捷方式文件，返回该文件的完整信息
+function parseLnkFile(filePath: string): Promise<any> {
   return new Promise((resolve, reject) => {
     const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -228,6 +206,38 @@ if (-not $displayName) {
       }
     })
   })
+}
+
+ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
+  if (!filePath) {
+    // 对话框打开期间保持 Dock 置顶（模态对话框跟随父窗口层级，否则会被压到其他软件下面）
+    dialogOpen = true
+    mainWindow?.setAlwaysOnTop(true)
+    mainWindow?.moveTop()
+    let result: Electron.OpenDialogReturnValue
+    try {
+      result = await dialog.showOpenDialog(mainWindow!, {
+        title: '选择快捷方式文件',
+        defaultPath: DEFAULT_DIALOG_PATH,
+        filters: [
+          { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
+          { name: '全部文件', extensions: ['*'] }
+        ],
+        // openFile + multiSelections：Win32 原生（IFileOpenDialog）支持多选
+        properties: ['openFile', 'multiSelections']
+      })
+    } finally {
+      dialogOpen = false
+    }
+    if (result.canceled || result.filePaths.length === 0) return []
+    // 多选：逐个解析快捷方式，单个解析失败不影响其余
+    const parsed = await Promise.all(
+      result.filePaths.map((p) => parseLnkFile(p).catch(() => null))
+    )
+    return parsed.filter(Boolean)
+  }
+  // 显式传路径时同样返回数组，保持返回类型一致（LnkInfo[]）
+  return [await parseLnkFile(filePath)]
 })
 
 // ─── IPC: persist shortcuts ─────────────────────────────────────────────────
@@ -257,18 +267,20 @@ ipcMain.handle('select-folder', async () => {
   try {
     result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择文件夹',
-      properties: ['openDirectory']
+      defaultPath: DEFAULT_DIALOG_PATH,
+      // multiSelections + openDirectory：Win32 原生（IFileOpenDialog）支持文件夹多选
+      properties: ['openDirectory', 'multiSelections']
     })
   } finally {
     dialogOpen = false
   }
-  if (result.canceled || result.filePaths.length === 0) return null
+  if (result.canceled || result.filePaths.length === 0) return []
 
-  const folderPath = result.filePaths[0]
-  const name = basename(folderPath)
-  const iconDataUrl = await extractIcon('C:\\Windows\\System32\\shell32.dll', 4, 256)
-
-  return { path: folderPath, name, iconDataUrl }
+  // 每个选中的文件夹提取系统黄色文件夹图标
+  return Promise.all(result.filePaths.map(async (folderPath) => {
+    const iconDataUrl = await extractIcon('C:\\Windows\\System32\\shell32.dll', 4, 256)
+    return { path: folderPath, name: basename(folderPath), iconDataUrl }
+  }))
 })
 
 // ─── IPC: add special system folder (This PC / Recycle Bin) ─────────────────
@@ -482,41 +494,13 @@ function resolveResource(filename: string): string {
   return existsSync(devPath) ? devPath : join(app.getAppPath(), '..', filename)
 }
 
-// 鼠标进入/离开 Dock 窗口：进入恢复置顶，离开沉底（覆盖「滚动滚轮」等不转移
-// 焦点的场景——滚轮不触发 blur，只有鼠标悬停变化才能感知）。
-// 用 ipcRenderer.send（单向 fire-and-forget），高频进出也不阻塞 renderer。
-// 取消待执行的延迟沉底（鼠标回到 Dock / 窗口获得焦点 / 点击其他软件 blur 时调用）
-function cancelSink(): void {
-  if (sinkTimer) {
-    clearTimeout(sinkTimer)
-    sinkTimer = null
-  }
-}
-
-// 延迟沉底：鼠标移出 Dock 后等 SINK_DELAY_MS 再让位，期间 mouseenter 移回即取消。
-// 鼠标快速划过 Dock（<500ms）或短暂悬停边缘不会闪沉；点击其他软件由 blur 立即沉底，不受此延迟影响。
-function scheduleSink(): void {
-  cancelSink()
-  sinkTimer = setTimeout(() => {
-    sinkTimer = null
-    if (!mainWindow || mainWindow.isDestroyed() || dialogOpen) return
-    mainWindow.setAlwaysOnTop(false)
-    sendToBottom(mainWindow)
-  }, SINK_DELAY_MS)
-}
-
+// 鼠标进入 Dock 窗口：恢复置顶（沉底后鼠标移回 Dock 即拉回）。
+// 鼠标移出 / 在其他软件上滚动不再沉底——用户可自由移动鼠标，
+// 只有点击其他软件（blur）才让出置顶。
 ipcMain.on('dock-pointer', (_e, inside: boolean) => {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  if (inside) {
-    // 鼠标回到 Dock：取消待执行的延迟沉底，立即恢复置顶
-    cancelSink()
-    mainWindow.setAlwaysOnTop(true)
-    mainWindow.moveTop()
-  } else {
-    // 对话框打开期间不沉底（鼠标从 Dock 移到系统对话框上会触发 mouseleave）
-    if (dialogOpen) return
-    scheduleSink()
-  }
+  if (!mainWindow || mainWindow.isDestroyed() || !inside) return
+  mainWindow.setAlwaysOnTop(true)
+  mainWindow.moveTop()
 })
 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
@@ -588,8 +572,6 @@ function createWindow(): void {
     // 系统文件对话框打开期间不沉底：对话框是模态的，会抢走焦点触发 blur，
     // 此时沉底会连带把对话框压到其他软件下面（模态对话框跟随父窗口层级）
     if (dialogOpen) return
-    // 点击其他软件是有意让位，立即沉底；取消可能待执行的延迟沉底避免重复
-    cancelSink()
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(false)
       sendToBottom(mainWindow)
@@ -599,8 +581,6 @@ function createWindow(): void {
   // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
   // run-app 会临时让出置顶让新程序窗口浮到 Dock 之上，这里负责重新拉回。
   mainWindow.on('focus', () => {
-    // 取消可能待执行的延迟沉底——鼠标移回 Dock 但尚未触发 mouseenter 时窗口可能先获得焦点
-    cancelSink()
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(true)
       mainWindow.moveTop()

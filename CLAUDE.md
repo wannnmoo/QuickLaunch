@@ -41,12 +41,11 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 - `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏幕宽，最大 1200px，居中）
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
-- **自动让位（三路触发）**：点击其他软件 / 滚动滚轮等操作时 Dock 沉到 z-order 最底不遮挡，鼠标移回 / Alt+Space / 托盘唤出恢复置顶：
+- **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
   1. `blur` 事件（点击其他窗口失去焦点）→ 立即 `setAlwaysOnTop(false)` + `sendToBottom()`（点击其他软件是有意让位）
-  2. renderer 的 `mouseenter/mouseleave` → `ipcRenderer.send('dock-pointer', inside)` → 进入置顶、离开**延迟 500ms 沉底**（覆盖滚动滚轮这类不转移焦点的操作）。延迟期间鼠标移回立即取消（`cancelSink()`）——快速划过 Dock 或短暂悬停边缘不会闪沉；`blur`/`focus` 时也取消待执行的延迟，避免重复沉底
-  3. `run-app` 启动目标前 `setAlwaysOnTop(false)`，让新程序窗口浮到 Dock 之上
-- **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` / `dock-pointer` 沉底逻辑都检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
-- **恢复置顶**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）→ `setAlwaysOnTop(true)` + `moveTop()`
+  2. `run-app` 启动目标前 `setAlwaysOnTop(false)`，让新程序窗口浮到 Dock 之上
+- **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
+- **恢复置顶**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）→ `setAlwaysOnTop(true)` + `moveTop()`
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
 - Dock 栏在窗口底部。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中，上下各 8px），`blur(32px) saturate(1.6)` 圆角阴影
 - Dock 空白区域可拖拽移动窗口（`-webkit-app-region: drag`）
@@ -71,15 +70,15 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 | Channel | 方向 | 说明 |
 |---|---|---|
-| `parse-lnk` | Renderer → Main | 解析 .lnk/.url/.pif 快捷方式文件，返回 `LnkInfo`；不传路径则弹出系统文件对话框 |
-| `select-folder` | Renderer → Main | 选择文件夹，从 `shell32.dll` index 4 提取黄色文件夹图标 |
+| `parse-lnk` | Renderer → Main | 解析 .lnk/.url/.pif 快捷方式文件，返回 `LnkInfo[]`；不传路径则弹出系统文件对话框（`multiSelections` 支持一次多选，单个解析失败不影响其余）。对话框默认定位 `D:\Desktop`（重定向后的桌面，回退系统桌面） |
+| `select-folder` | Renderer → Main | 选择文件夹（`multiSelections` 支持一次多选），从 `shell32.dll` index 4 提取黄色文件夹图标，返回数组 |
 | `add-special-item` | Renderer → Main | 添加系统位置（`this-pc` / `recycle-bin`），从注册表解析图标，带 CLSID 回退 |
 | `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹；URL 判定正则 `/^(https?\|ftp\|steam):\/\/\|^mailto:/i` |
 | `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
 | `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json` |
 | `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，找不到 ListView 时回退读注册表 HideIcons） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
-| `dock-pointer` | Renderer → Main | 通知主进程鼠标进入/离开 Dock 窗口（用 `ipcRenderer.send` 单向，非 invoke；高频进出不阻塞 renderer） |
+| `dock-pointer` | Renderer → Main | 通知主进程鼠标进入 Dock 窗口恢复置顶（`inside=true`；离开不再沉底——沉底仅由点击其他软件 `blur` 触发）。用 `ipcRenderer.send` 单向，非 invoke；高频进出不阻塞 renderer |
 
 ### React UI
 
@@ -88,8 +87,10 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
 - 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
 - **Dock 栏**：底部毛玻璃横栏，图标水平排列，gap 4px；内容超过宽度时横向滚动
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站/**隐藏或显示桌面图标**）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——6 项菜单超过 300px 窗口高度时内部滚动
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站/**隐藏或显示桌面图标**/**切换到白天或黑夜模式**）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——7 项菜单超过 300px 窗口高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
+- **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
+- **白天/黑夜主题**：`theme` state（`'dark' | 'light'`），根元素加 `theme-light` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：自定义右键菜单（删除选项），fixed 定位在光标右侧
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确
@@ -151,6 +152,8 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 
 快捷方式保存至 `{userData}/shortcuts.json`，格式为 `AppEntry[]` 数组。字段：`id`、`iconDataUrl`、`targetPath`、`arguments`、`workingDirectory`、`description`，可选 `isFolder`（文件夹）与 `specialType`（`'this-pc'` / `'recycle-bin'`）。`parse-lnk` 解析出的 `windowStyle`/`hotkey`/`iconLocation` 在持久化时被丢弃（`AppEntry` 不含这些字段）。
 
+主题偏好（白天/黑夜）存在渲染端 localStorage（key `ql-theme`），不走 IPC 文件持久化——纯 UI 偏好，无需主进程参与。
+
 ## 平台限制
 
 此应用**仅限 Windows**。依赖 PowerShell、`WScript.Shell` COM、`SHDefExtractIcon` Win32 API、`System.Drawing` GDI+。
@@ -170,6 +173,6 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
 - `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
 - `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
-- **版本号管理**：git 提交信息用版本号（如 `v1.4.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（目前仍是 `1.1.0`，滞后于提交版本）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.4.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.5.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.5.0`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.5.0），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）
