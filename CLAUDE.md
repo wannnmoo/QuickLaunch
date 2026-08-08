@@ -18,28 +18,39 @@ npm run package     # 构建并打包为可分发的安装程序（electron-buil
 
 ### Electron 三进程模型
 
-项目遵循 `electron-vite` 标准结构，严格区分三个进程：
+项目遵循 `electron-vite` 标准结构（配置文件 [`electron-vite.config.ts`](electron-vite.config.ts)），严格区分三个进程：
 
 | 进程 | 入口 | 职责 |
 |---|---|---|
 | **Main** | [`src/main/index.ts`](src/main/index.ts) | 应用生命周期、透明无边框窗口、系统托盘、全局快捷键、IPC 处理器、PowerShell 调用 |
 | **Preload** | [`src/preload/index.ts`](src/preload/index.ts) | `contextBridge.exposeInMainWorld` 暴露 `window.api` 和 `window.electron`，定义 `LnkInfo` 和 `AppEntry` 类型 |
-| **Renderer** | [`src/renderer/src/main.tsx`](src/renderer/src/main.tsx) | React 19 SPA，挂载 `<App />` 到 `#root` |
+| **Renderer** | [`src/renderer/src/main.tsx`](src/renderer/src/main.tsx) | React 19 SPA，挂载 `<App />` 到 `#root`，样式在 [`App.css`](src/renderer/src/App.css) |
 
 Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接访问 Node.js 或 Electron API。
 
+### TypeScript 项目引用
+
+`tsconfig.json` 通过 references 分为两个子项目：
+
+| 配置文件 | 涵盖范围 |
+|---|---|
+| [`tsconfig.node.json`](tsconfig.node.json) | `src/main/` + `src/preload/`（ESNext，无 DOM） |
+| [`tsconfig.web.json`](tsconfig.web.json) | `src/renderer/src/`（ESNext + DOM + JSX） |
+
 ### 透明窗口 + Dock 布局
 
-- `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏幕宽，居中）
+- `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏幕宽，最大 1200px，居中）
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
-- Dock 栏在窗口底部，毛玻璃背景（`backdrop-filter: blur`），圆角阴影
+- **临时让位**：`run-app` 启动目标前 `setAlwaysOnTop(false)`，让新程序窗口浮到 Dock 之上不被遮挡；窗口 `focus` 事件（点击 Dock / Alt+Space / 托盘唤出）恢复置顶
+- Dock 栏在窗口底部。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中，上下各 8px），`blur(32px) saturate(1.6)` 圆角阴影
 - Dock 空白区域可拖拽移动窗口（`-webkit-app-region: drag`）
-- 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，计算距离决定缩放比例）
-- 图标支持拖拽排序（自定义鼠标事件，5px 阈值区分点击和拖拽）
+- 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，最大放大 1.4×，上浮 8px，影响半径 140px）。放大图标从背景顶部**透明区顶出**（类似 macOS）——`.dock-inner` 顶部有 44px 透明 padding 作为放大显示区，否则 `overflow` 会把放大溢出裁掉
+- 图标放不下时**横向滚动**：`.dock-inner` 是滚动容器（`overflow-x: auto`，隐藏滚动条），滚轮/触控板转水平滚动（`handleDockWheel`）；两端 `dock-edge` 渐隐遮罩提示「还有更多」，仅可滚动侧显示（`scrollState`）
+- 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）
 
 ### 系统托盘 + 快捷键
 
-- **Alt+Space** 全局快捷键切换窗口显隐
+- **Alt+Space** 全局快捷键切换窗口显隐（优先注册，失败自动回退 `Ctrl+Alt+Space`；Ctrl+Alt 在 Windows 上等同 AltGr，易被输入法/键盘布局占用）
 - 关闭窗口 → 隐藏到系统托盘（不退出）
 - 托盘左键单击 → 切换显隐
 - 托盘右键菜单 →「显示窗口」/「退出」
@@ -48,14 +59,16 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 ### IPC 通道
 
-所有 IPC 使用 `ipcMain.handle` / `ipcRenderer.invoke`（Promise 模式）：
+所有 IPC 使用 `ipcMain.handle` / `ipcRenderer.invoke`（Promise 模式）。Preload 暴露两个对象：
+- `window.api` — 自定义 API（见下表）
+- `window.electron` — 来自 `@electron-toolkit/preload` 的标准 Electron API
 
 | Channel | 方向 | 说明 |
 |---|---|---|
-| `parse-lnk` | Renderer → Main | 解析 .lnk/.url/.pif 快捷方式文件，返回 `LnkInfo` |
+| `parse-lnk` | Renderer → Main | 解析 .lnk/.url/.pif 快捷方式文件，返回 `LnkInfo`；不传路径则弹出系统文件对话框 |
 | `select-folder` | Renderer → Main | 选择文件夹，从 `shell32.dll` index 4 提取黄色文件夹图标 |
-| `add-special-item` | Renderer → Main | 添加系统位置（此电脑/回收站），从注册表解析图标 |
-| `run-app` | Renderer → Main | 启动程序/URL/shell:/CLSID 命令，或通过 `shell.openPath()` 打开文件夹 |
+| `add-special-item` | Renderer → Main | 添加系统位置（`this-pc` / `recycle-bin`），从注册表解析图标，带 CLSID 回退 |
+| `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹 |
 | `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
 | `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json` |
 
@@ -64,28 +77,61 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)）：
 
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
-- 模块级 `nextId` 生成自增 ID，启动时从已保存数据恢复
-- **Dock 栏**：底部毛玻璃横栏，图标水平排列
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站）
-- **左键点击**：启动程序/打开文件夹
-- **右键菜单**：自定义右键菜单（删除选项），在光标右侧弹出
-- **拖拽排序**：按住图标拖动到目标位置释放，蓝色指示线显示插入点
-- **放大效果**：鼠标靠近图标时放大 + 上浮（拖拽时暂停）
-- **持久化**：`apps` 变化时自动保存，启动时自动恢复
+- 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
+- **Dock 栏**：底部毛玻璃横栏，图标水平排列，gap 4px；内容超过宽度时横向滚动
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内
+- **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
+- **右键菜单**：自定义右键菜单（删除选项），fixed 定位在光标右侧
+- **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确
+- **放大效果**：`handleDockMouseMove` 计算鼠标到每个图标的距离，< 140px 时缩放 + 上浮（拖拽时暂停）
+- **持久化**：`apps` 变化时 `useEffect` 自动保存，启动时 `useEffect` 自动恢复
+
+### 特殊项目（此电脑 / 回收站）
+
+Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 DLL+索引、显示名称、shell 命令：
+
+| 项目 | CLSID | shell32 回退索引 |
+|---|---|---|
+| 此电脑 | `{20D04FE0-3AEA-1069-A2D8-08002B30309D}` | index 15 |
+| 回收站 | `{645FF040-5081-101B-9F08-00AA002F954E}` | index 31 |
+
+图标解析流程：先查注册表 `HKCR\CLSID\{CLSID}\DefaultIcon` → 提取图标路径和索引 → 回退到 shell32.dll 硬编码索引。
 
 ### 图标提取机制
 
-- 共享 C# P/Invoke 类 `IconExtractor`（常量 `ICON_EXTRACTOR_CS`），通过 `SHDefExtractIcon` + `System.Drawing` 提取图标
-- `extractIcon()` 封装：PowerShell 调用 → 提取 → Base64 → data URL
+- 共享 C# P/Invoke 类 `IconExtractor`（模块级常量 `ICON_EXTRACTOR_CS`），通过 `SHDefExtractIcon` + `System.Drawing` 提取图标
+- `extractIcon()` 封装：PowerShell 调用 → C# 提取 → Base64 → `data:image/png;base64,...` URL
 - `parse-lnk` 复用 `ICON_EXTRACTOR_CS` 常量
 - `select-folder` 和 `add-special-item` 复用 `extractIcon()`
-- 特殊项目（此电脑/回收站）通过注册表 `HKCR\CLSID\{CLSID}\DefaultIcon` 动态解析图标位置
-- URL 快捷方式图标解析链：`.url` 的 `IconFile` → 浏览器 favicon → 默认浏览器 exe → shell32.dll 地球图标（index 13）
-- PowerShell 超时 10 秒，每次调用启动新 `powershell.exe`
+- URL 快捷方式图标解析链：`.url` 的 `IconFile` → favicon 下载 → 默认浏览器 exe → `shell32.dll` 地球图标（index 13）
+- PowerShell 超时 10 秒（`extractIcon`）/ 5 秒（`resolveClsidIcon`），每次调用启动新 `powershell.exe`
+- **每个 PowerShell 脚本开头都强制 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`**，适配中文 Windows GBK 编码——新增/修改 PS 脚本时务必保留，否则输出中文乱码
+
+### 资源路径解析
+
+`resolveResource(filename)` 先尝试 `<__dirname>/../../resources/`（开发环境），不存在则回退到 `<appPath>/../`（生产环境 asar 包外）。
+
+### electron-vite 构建配置
+
+[`electron-vite.config.ts`](electron-vite.config.ts) 定义三个构建目标：
+
+| 目标 | 插件 | 说明 |
+|---|---|---|
+| `main` | `externalizeDepsPlugin` | 将 Electron/Node 依赖外部化，不打包进 bundle |
+| `preload` | `externalizeDepsPlugin` | 同上 |
+| `renderer` | `@vitejs/plugin-react` | React JSX/TS 支持，`@` 别名映射到 `src/renderer/src` |
+
+### 打包配置
+
+[`electron-builder.yml`](electron-builder.yml) 定义构建产物：
+- appId: `com.quicklaunch.app`
+- 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.png` → `tray-icon.png`
+- Windows：`executableName: QuickLaunch`，图标 `resources/icon.ico`
+- 排除源码和配置文件，仅打包编译输出
 
 ### 持久化格式
 
-快捷方式保存至 `{userData}/shortcuts.json`，格式为 `AppEntry[]` 数组。`AppEntry` 通过 `isFolder` 区分文件夹，通过 `specialType` 区分系统项目（此电脑/回收站）。
+快捷方式保存至 `{userData}/shortcuts.json`，格式为 `AppEntry[]` 数组。字段：`id`、`iconDataUrl`、`targetPath`、`arguments`、`workingDirectory`、`description`，可选 `isFolder`（文件夹）与 `specialType`（`'this-pc'` / `'recycle-bin'`）。`parse-lnk` 解析出的 `windowStyle`/`hotkey`/`iconLocation` 在持久化时被丢弃（`AppEntry` 不含这些字段）。
 
 ## 平台限制
 
@@ -93,10 +139,16 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 
 ## 注意事项
 
-- **已初始化为 git 仓库**（`Initial commit: QuickLaunch v1.1.0`）
 - **无测试框架**、**无 ESLint/Prettier**
-- `AppEntry` 类型在 [`src/preload/index.ts`](src/preload/index.ts) 和 [`src/renderer/src/App.tsx`](src/renderer/src/App.tsx) 中各自定义，修改时需保持同步
+- `AppEntry` 类型在 [`src/preload/index.ts`](src/preload/index.ts)、[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)、[`src/renderer/src/env.d.ts`](src/renderer/src/env.d.ts) 三处各自定义，修改时需保持同步
 - `env.d.ts` 再次复刻 API 类型到 `Window` 接口——contextBridge 隔离导致 Renderer 端类型必须在此声明
 - `App.tsx` 使用模块级变量 `nextId`（非 React state）；启动时从已保存最大 ID + 1 重建
-- `resolveResource()` 统一处理开发/生产环境的资源路径解析
-- 窗口拖拽：`.dock` 设为 `drag` 区域，所有交互元素（`.dock-inner`、`.dock-item`、`.dropdown-menu` 等）显式设为 `no-drag`
+- 窗口拖拽：`.dock` 设为 `drag` 区域，所有交互元素（`.dock-inner`、`.dock-item`、`.dropdown-menu`、`.context-menu` 等）显式设为 `no-drag`
+- `.dock-inner` 是横向滚动容器（`overflow-x: auto`），CSS 规范强制其垂直方向也裁剪——**向上弹出的下拉菜单必须渲染在容器外**（fixed 定位），放容器内会被裁掉
+- 滚动容器会裁剪垂直溢出的放大图标，`.dock-inner` 顶部 44px 透明 padding 即预留的放大显示区；`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区
+- 开发模式下窗口加载 `ELECTRON_RENDERER_URL` 环境变量 URL；生产模式下加载 `../renderer/index.html` 文件
+- `webPreferences.sandbox: false`：preload 依赖 `process.contextIsolated` 分支和 `@electron-toolkit/preload`，改成 `true` 会破坏 contextBridge
+- 关闭 → 隐藏托盘通过 `forceQuit` 标志区分：普通关闭 `preventDefault()` + `hide()`；托盘「退出」置 `forceQuit=true` 后 `app.quit()`。新增退出路径需同步设置该标志
+- 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
+- `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
+- 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

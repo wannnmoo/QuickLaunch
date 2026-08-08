@@ -51,25 +51,86 @@ html, body {
   width: 100%;
   display: flex;
   justify-content: center;
+  position: relative; /* 渐隐遮罩定位参照 */
   padding: 8px 24px;
   z-index: 50;
   -webkit-app-region: drag;
 }
 
+/* 毛玻璃背景：独立层，只覆盖图标区（图标在其中垂直居中，上下各 8px 小间距）。
+   顶部 44px 放大区是透明的，hover 放大时图标会顶出背景之上——macOS Dock 观感。 */
+.dock-bg {
+  position: absolute;
+  left: 24px;
+  right: 24px;
+  top: 44px; /* 图标顶上方留 8px */
+  bottom: 0; /* 图标底下方留 8px（图标底 131，dock 底 139） */
+  z-index: 0;
+  background: linear-gradient(180deg, rgba(44, 50, 70, 0.68) 0%, rgba(27, 32, 46, 0.6) 100%);
+  backdrop-filter: blur(32px) saturate(1.6);
+  -webkit-backdrop-filter: blur(32px) saturate(1.6);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 22px;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.dock:hover .dock-bg {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
 .dock-inner {
+  position: relative;
+  z-index: 1; /* 盖在 .dock-bg 之上 */
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  padding: 10px 16px 8px;
-  background: rgba(30, 35, 50, 0.55);
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 20px;
-  box-shadow:
-    0 4px 24px rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  /* 图标放不下时横向滚动查看。顶部 44px 为透明放大区：hover 放大（1.4× + 8px 上浮，
+     图标列含 label 约 79px → 放大后上移约 40px）的图标在这里顶出背景，不被 overflow 裁剪 */
+  padding: 44px 16px 0;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none; /* Firefox 隐藏滚动条 */
   -webkit-app-region: no-drag;
+}
+
+.dock-inner::-webkit-scrollbar {
+  display: none; /* Chromium 隐藏滚动条 */
+}
+
+/* ─── 两端渐隐提示（还有更多图标） ─────────────────────────────────── */
+
+.dock-edge {
+  position: absolute;
+  top: 44px; /* 对齐 .dock-bg 背景区 */
+  bottom: 0;
+  width: 48px;
+  pointer-events: none;
+  z-index: 60;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.dock-edge.left {
+  left: 24px;
+  background: linear-gradient(to right, rgba(18, 22, 34, 0.75), rgba(18, 22, 34, 0));
+  border-radius: 22px 0 0 22px;
+}
+
+.dock-edge.right {
+  right: 24px;
+  background: linear-gradient(to left, rgba(18, 22, 34, 0.75), rgba(18, 22, 34, 0));
+  border-radius: 0 22px 22px 0;
+}
+
+.dock-edge.show {
+  opacity: 1;
 }
 
 /* ─── Dock items ────────────────────────────────────────────────────── */
@@ -82,6 +143,7 @@ html, body {
   cursor: pointer;
   transition: transform 0.12s cubic-bezier(0.25, 0.1, 0.25, 1);
   will-change: transform;
+  transform-origin: center bottom; /* 放大从底部升起，贴合 macOS Dock */
   position: relative;
   -webkit-app-region: no-drag;
 }
@@ -93,13 +155,16 @@ html, body {
   align-items: center;
   justify-content: center;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.04);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.03) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   transition: background 0.2s, box-shadow 0.2s;
 }
 
 .dock-item:hover .dock-icon-wrap {
-  background: rgba(255, 255, 255, 0.12);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 6px 20px rgba(0, 0, 0, 0.35);
 }
 
 .dock-icon {
@@ -108,22 +173,24 @@ html, body {
   border-radius: 10px;
   pointer-events: none;
   image-rendering: auto;
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35));
 }
 
 .dock-label {
   font-size: 0.68rem;
-  color: rgba(255, 255, 255, 0.3);
+  color: rgba(255, 255, 255, 0.62);
   white-space: nowrap;
   max-width: 72px;
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: center;
   pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
   transition: color 0.2s;
 }
 
 .dock-item:hover .dock-label {
-  color: rgba(255, 255, 255, 0.75);
+  color: #fff;
 }
 
 /* ─── Drag & drop ──────────────────────────────────────────────────── */
@@ -156,10 +223,18 @@ html, body {
   transition: background 0.2s, color 0.2s, box-shadow 0.2s !important;
 }
 
+.dock-add-btn svg {
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
 .dock-add-btn:hover {
   background: rgba(255, 255, 255, 0.1) !important;
   color: rgba(255, 255, 255, 0.7);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.dock-add-btn:hover svg {
+  transform: rotate(90deg) scale(1.12);
 }
 
 /* ─── Dropdown menu ─────────────────────────────────────────────────── */
@@ -179,6 +254,7 @@ html, body {
   z-index: 100;
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+  animation: dropdown-in 0.16s ease-out;
   -webkit-app-region: no-drag;
 }
 
@@ -219,6 +295,7 @@ html, body {
   z-index: 200;
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+  animation: context-in 0.14s ease-out;
 }
 
 .context-menu-item {
@@ -239,4 +316,29 @@ html, body {
 .context-menu-item:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
+}
+
+/* ─── 菜单入场动画 ────────────────────────────────────────────────────── */
+
+/* dropdown 依赖 translateX(-50%) 居中定位，动画必须保留它 */
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+@keyframes context-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }

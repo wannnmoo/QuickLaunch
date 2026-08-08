@@ -106,7 +106,7 @@ ${ICON_EXTRACTOR_CS}
 
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut('${filePath.replace(/'/g, "''")}')
 $targetPath = $s.TargetPath
-$isUrl = ($targetPath -match '^(https?|ftp|mailto|steam)://')
+$isUrl = ($targetPath -match '^(https?|ftp|steam)://|^mailto:')
 
 # Parse IconLocation: "path,index" -> icon file & index
 $iconFile = $targetPath
@@ -309,6 +309,12 @@ ipcMain.handle('add-special-item', async (_event, type: string) => {
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
+  // 启动目标前让出置顶：新程序窗口是普通层级，可浮到 Dock 之上不被遮挡。
+  // Dock 在下次获得焦点（点击 / Alt+Space / 托盘唤出）时由 focus 事件恢复置顶。
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setAlwaysOnTop(false)
+  }
+
   // Windows shell: / CLSID → open via explorer (This PC, Recycle Bin, etc.)
   if (targetPath.startsWith('shell:') || targetPath.startsWith('::')) {
     execFile('explorer', [targetPath])
@@ -326,14 +332,25 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   }
 
   // URL
-  if (/^(https?|ftp|mailto|steam):\/\//i.test(targetPath)) {
+  if (/^(https?|ftp|steam):\/\/|^mailto:/i.test(targetPath)) {
     shell.openExternal(targetPath)
     return true
   }
 
   // Executable
   execFile(targetPath, args ? args.split(' ') : [], { cwd: workingDir || undefined }, (err) => {
-    if (err) console.error('Failed to launch:', err)
+    if (!err) return
+    // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
+    // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
+    // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
+      console.log(`[launcher] Direct spawn blocked (likely admin required); falling back to Shell: ${targetPath}`)
+      shell.openPath(targetPath).then((msg) => {
+        if (msg) console.error('[launcher] Shell fallback also failed:', msg)
+      })
+      return
+    }
+    console.error('Failed to launch:', err)
   })
   return true
 })
@@ -381,6 +398,14 @@ function createWindow(): void {
     }
   })
 
+  // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
+  // run-app 会临时让出置顶让新程序窗口浮到 Dock 之上，这里负责重新拉回。
+  mainWindow.on('focus', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setAlwaysOnTop(true)
+    }
+  })
+
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
@@ -423,10 +448,21 @@ app.whenReady().then(() => {
   ])
   tray.setContextMenu(contextMenu)
 
-  // Global shortcut: Alt+Space to toggle window
-  globalShortcut.register('Alt+Space', () => {
-    toggleWindow()
-  })
+  // Global shortcut to toggle window. Prefer Alt+Space (verified working);
+  // fall back to Ctrl+Alt+Space only if it fails to register. Note: Ctrl+Alt
+  // is treated as AltGr on Windows and can be grabbed by IME/keyboard layouts,
+  // which is why Alt+Space is tried first.
+  let shortcutRegistered = false
+  for (const combo of ['Alt+Space', 'Ctrl+Alt+Space']) {
+    if (globalShortcut.register(combo, () => toggleWindow())) {
+      shortcutRegistered = true
+      console.log(`Registered global shortcut: ${combo}`)
+      break
+    }
+  }
+  if (!shortcutRegistered) {
+    console.warn('Failed to register any global toggle shortcut')
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
