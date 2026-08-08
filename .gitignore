@@ -1,6 +1,8 @@
 node_modules/
 out/
 dist/
+# 手动下载的 Electron 分发包（打包临时用，随版本变大）
+electron-v*.zip
 *.log
 .DS_Store
 Thumbs.db

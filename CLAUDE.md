@@ -147,6 +147,7 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 - 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.png` → `tray-icon.png`
 - Windows：`executableName: QuickLaunch`，图标 `resources/icon.ico`
 - 排除源码和配置文件，仅打包编译输出
+- `electronDist: ./electron-v*.zip`：用项目根目录**手动下载**的 Electron 分发包打包，跳过网络下载（日志出现 `using custom electronDist zip file` 即为生效）。zip 已被 `.gitignore` 的 `electron-v*.zip` 规则忽略；需与 `package.json` 的 Electron 版本一致，换机器打包前删掉该行或用 `ELECTRON_MIRROR` 环境变量
 
 ### 持久化格式
 

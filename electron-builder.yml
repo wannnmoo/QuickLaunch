@@ -1,5 +1,7 @@
 appId: com.quicklaunch.app
 productName: QuickLaunch
+# 使用本地手动下载的 Electron zip，跳过网络下载（需与项目根目录的 electron-v*.zip 版本一致）
+electronDist: ./electron-v43.1.0-win32-x64.zip
 directories:
   buildResources: resources
 files:
