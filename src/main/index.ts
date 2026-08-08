@@ -7,13 +7,23 @@ import { execFile } from 'child_process'
 let mainWindow: BrowserWindow | null = null
 let forceQuit = false
 let tray: Tray | null = null
+// 系统文件/文件夹对话框打开期间禁止 Dock 沉底：模态对话框跟随父窗口层级，
+// 若此时 blur/mouseleave 触发沉底，对话框会被连带压到其他软件下面
+let dialogOpen = false
+// 鼠标离开 Dock 后的延迟沉底计时器：快速划过/短暂移出 Dock 不立即让位，避免闪沉
+let sinkTimer: ReturnType<typeof setTimeout> | null = null
+// 鼠标移出 Dock 到真正沉底的延迟（ms）：鼠标快速划过（<该值）不会闪沉
+const SINK_DELAY_MS = 500
 
 function toggleWindow(): void {
   if (!mainWindow) return
-  if (mainWindow.isVisible()) {
+  // 正在置顶显示 → 隐藏；沉底或已隐藏 → 唤回置顶
+  if (mainWindow.isVisible() && mainWindow.isAlwaysOnTop()) {
     mainWindow.hide()
   } else {
     mainWindow.show()
+    mainWindow.setAlwaysOnTop(true)
+    mainWindow.moveTop()
     mainWindow.focus()
   }
 }
@@ -87,14 +97,23 @@ Write-Output $b64`
 
 ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
   if (!filePath) {
-    const result = await dialog.showOpenDialog(mainWindow!, {
-      title: '选择快捷方式文件',
-      filters: [
-        { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
-        { name: '全部文件', extensions: ['*'] }
-      ],
-      properties: ['openFile']
-    })
+    // 对话框打开期间保持 Dock 置顶（模态对话框跟随父窗口层级，否则会被压到其他软件下面）
+    dialogOpen = true
+    mainWindow?.setAlwaysOnTop(true)
+    mainWindow?.moveTop()
+    let result: Electron.OpenDialogReturnValue
+    try {
+      result = await dialog.showOpenDialog(mainWindow!, {
+        title: '选择快捷方式文件',
+        filters: [
+          { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
+          { name: '全部文件', extensions: ['*'] }
+        ],
+        properties: ['openFile']
+      })
+    } finally {
+      dialogOpen = false
+    }
     if (result.canceled || result.filePaths.length === 0) return null
     filePath = result.filePaths[0]
   }
@@ -231,10 +250,18 @@ ipcMain.handle('save-shortcuts', (_event, data: unknown) => {
 // ─── IPC: select a folder ───────────────────────────────────────────────────
 
 ipcMain.handle('select-folder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
-    title: '选择文件夹',
-    properties: ['openDirectory']
-  })
+  dialogOpen = true
+  mainWindow?.setAlwaysOnTop(true)
+  mainWindow?.moveTop()
+  let result: Electron.OpenDialogReturnValue
+  try {
+    result = await dialog.showOpenDialog(mainWindow!, {
+      title: '选择文件夹',
+      properties: ['openDirectory']
+    })
+  } finally {
+    dialogOpen = false
+  }
   if (result.canceled || result.filePaths.length === 0) return null
 
   const folderPath = result.filePaths[0]
@@ -267,6 +294,7 @@ const SPECIAL_ITEMS: Record<string, { clsid: string; fallbackDll: string; fallba
 function resolveClsidIcon(clsid: string): Promise<{ dll: string; index: number }> {
   return new Promise((resolve) => {
     const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $iconPath = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\\CLSID\\${clsid}\\DefaultIcon" -Name '(Default)' -ErrorAction SilentlyContinue).'(Default)'
 if ($iconPath) {
   Write-Output ([Environment]::ExpandEnvironmentVariables($iconPath))
@@ -302,6 +330,98 @@ ipcMain.handle('add-special-item', async (_event, type: string) => {
     iconDataUrl,
     specialType: type
   }
+})
+
+// ─── IPC: hide/show desktop icons ───────────────────────────────────────────
+// 方案：向桌面 SHELLDLL_DefView 发送 WM_COMMAND 0x7402 —— 与 Windows
+// 「右键桌面 → 查看 → 显示桌面图标」底层完全一致，不依赖 SHChangeNotify
+// （该刷新在部分 Win11 系统上不生效）。0x7402 切换后 Explorer 会自动同步
+// 注册表 HideIcons，状态由系统持久化。状态读取用 IsWindowVisible(ListView)，
+// 比读注册表更贴近真实视觉状态。
+
+const DESKTOP_ICONS_CS = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class DesktopIcons {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    public static IntPtr FindDefView() {
+        IntPtr progman = FindWindow("Progman", null);
+        IntPtr defView = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+        if (defView == IntPtr.Zero) {
+            IntPtr worker = IntPtr.Zero;
+            while ((worker = FindWindowEx(IntPtr.Zero, worker, "WorkerW", null)) != IntPtr.Zero) {
+                defView = FindWindowEx(worker, IntPtr.Zero, "SHELLDLL_DefView", null);
+                if (defView != IntPtr.Zero) break;
+            }
+        }
+        return defView;
+    }
+
+    public static IntPtr FindListView() {
+        IntPtr dv = FindDefView();
+        if (dv == IntPtr.Zero) return IntPtr.Zero;
+        return FindWindowEx(dv, IntPtr.Zero, "SysListView32", "FolderView");
+    }
+}
+'@
+[Console]::OutputEncoding = [Text.Encoding]::UTF8`
+
+/** 读当前桌面图标隐藏状态：ListView 不可见 = 图标隐藏；找不到 ListView 时回退读注册表。 */
+function readDesktopIconsHidden(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const psScript = `${DESKTOP_ICONS_CS}
+$lv = [DesktopIcons]::FindListView()
+if ($lv -eq [IntPtr]::Zero) {
+  $v = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced' -Name HideIcons -ErrorAction SilentlyContinue).HideIcons
+  if ($null -eq $v) { Write-Output '0' } else { Write-Output $v }
+} else {
+  if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
+}`
+    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err, stdout) => {
+      if (err || !stdout.trim()) { resolve(false); return }
+      resolve(stdout.trim() === '1')
+    })
+  })
+}
+
+ipcMain.handle('get-desktop-icons-hidden', () => readDesktopIconsHidden())
+
+ipcMain.handle('toggle-desktop-icons', async () => {
+  return new Promise<boolean>((resolve) => {
+    const psScript = `${DESKTOP_ICONS_CS}
+$dv = [DesktopIcons]::FindDefView()
+if ($dv -eq [IntPtr]::Zero) {
+  Write-Output '0'
+} else {
+  [DesktopIcons]::SendMessage($dv, 0x0111, [IntPtr]0x7402, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 500
+  $lv = [DesktopIcons]::FindListView()
+  if ($lv -eq [IntPtr]::Zero) {
+    $v = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced' -Name HideIcons -ErrorAction SilentlyContinue).HideIcons
+    if ($null -eq $v) { Write-Output '0' } else { Write-Output $v }
+  } else {
+    if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
+  }
+}`
+    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error('[desktop-icons] PS error:', err.message, '| stderr:', stderr?.slice(0, 300))
+        resolve(false)
+        return
+      }
+      resolve(stdout.trim() === '1')
+    })
+  })
 })
 
 // ─── IPC: launch an executable, URL, shell location, or open a folder ───────
@@ -362,6 +482,67 @@ function resolveResource(filename: string): string {
   return existsSync(devPath) ? devPath : join(app.getAppPath(), '..', filename)
 }
 
+// 鼠标进入/离开 Dock 窗口：进入恢复置顶，离开沉底（覆盖「滚动滚轮」等不转移
+// 焦点的场景——滚轮不触发 blur，只有鼠标悬停变化才能感知）。
+// 用 ipcRenderer.send（单向 fire-and-forget），高频进出也不阻塞 renderer。
+// 取消待执行的延迟沉底（鼠标回到 Dock / 窗口获得焦点 / 点击其他软件 blur 时调用）
+function cancelSink(): void {
+  if (sinkTimer) {
+    clearTimeout(sinkTimer)
+    sinkTimer = null
+  }
+}
+
+// 延迟沉底：鼠标移出 Dock 后等 SINK_DELAY_MS 再让位，期间 mouseenter 移回即取消。
+// 鼠标快速划过 Dock（<500ms）或短暂悬停边缘不会闪沉；点击其他软件由 blur 立即沉底，不受此延迟影响。
+function scheduleSink(): void {
+  cancelSink()
+  sinkTimer = setTimeout(() => {
+    sinkTimer = null
+    if (!mainWindow || mainWindow.isDestroyed() || dialogOpen) return
+    mainWindow.setAlwaysOnTop(false)
+    sendToBottom(mainWindow)
+  }, SINK_DELAY_MS)
+}
+
+ipcMain.on('dock-pointer', (_e, inside: boolean) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (inside) {
+    // 鼠标回到 Dock：取消待执行的延迟沉底，立即恢复置顶
+    cancelSink()
+    mainWindow.setAlwaysOnTop(true)
+    mainWindow.moveTop()
+  } else {
+    // 对话框打开期间不沉底（鼠标从 Dock 移到系统对话框上会触发 mouseleave）
+    if (dialogOpen) return
+    scheduleSink()
+  }
+})
+
+// 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
+// 只能通过 SetWindowPos 调 Windows API 实现真正沉底。
+function sendToBottom(win: BrowserWindow): void {
+  const buf = win.getNativeWindowHandle()
+  const hwnd = buf.length >= 8
+    ? `0x${buf.readBigUInt64LE(0).toString(16)}`
+    : `0x${buf.readUInt32LE(0).toString(16)}`
+  const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WinZ {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+'@
+# HWND_BOTTOM=1, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
+[WinZ]::SetWindowPos([IntPtr]::new(${hwnd}), [IntPtr]::new(1), 0, 0, 0, 0, 0x0002 -bor 0x0001 -bor 0x0010) | Out-Null`
+  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err) => {
+    if (err) console.error('[dock] sendToBottom failed:', err.message)
+  })
+}
+
 function createWindow(): void {
   const iconPath = resolveResource('icon.ico')
   const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize
@@ -398,11 +579,31 @@ function createWindow(): void {
     }
   })
 
+  // 点击其他软件时让出置顶：Dock 沉到普通窗口下方，不再遮挡正在使用的应用。
+  // 点击 Dock / Alt+Space / 托盘唤出时由 focus 事件恢复置顶。
+  // 注意：setAlwaysOnTop(false) 只从置顶层降级（HWND_NOTOPMOST），z-order 仍停在
+  // 非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然排在它之上。必须再调
+  // SetWindowPos(HWND_BOTTOM) 把 z-order 压到最底，Dock 才会真正沉到其他窗口下方。
+  mainWindow.on('blur', () => {
+    // 系统文件对话框打开期间不沉底：对话框是模态的，会抢走焦点触发 blur，
+    // 此时沉底会连带把对话框压到其他软件下面（模态对话框跟随父窗口层级）
+    if (dialogOpen) return
+    // 点击其他软件是有意让位，立即沉底；取消可能待执行的延迟沉底避免重复
+    cancelSink()
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setAlwaysOnTop(false)
+      sendToBottom(mainWindow)
+    }
+  })
+
   // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
   // run-app 会临时让出置顶让新程序窗口浮到 Dock 之上，这里负责重新拉回。
   mainWindow.on('focus', () => {
+    // 取消可能待执行的延迟沉底——鼠标移回 Dock 但尚未触发 mouseenter 时窗口可能先获得焦点
+    cancelSink()
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(true)
+      mainWindow.moveTop()
     }
   })
 

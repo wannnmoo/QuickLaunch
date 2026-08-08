@@ -17,5 +17,8 @@ interface Window {
     saveShortcuts: (data: { id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin' }[]) => Promise<void>
     selectFolder: () => Promise<{ path: string; name: string; iconDataUrl: string } | null>
     addSpecialItem: (type: 'this-pc' | 'recycle-bin') => Promise<{ path: string; name: string; iconDataUrl: string; specialType: string } | null>
+    getDesktopIconsHidden: () => Promise<boolean>
+    toggleDesktopIcons: () => Promise<boolean>
+    dockPointer: (inside: boolean) => void
   }
 }

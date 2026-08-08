@@ -44,7 +44,17 @@ const api = {
   addSpecialItem: (type: 'this-pc' | 'recycle-bin'): Promise<{
     path: string; name: string; iconDataUrl: string; specialType: string
   } | null> =>
-    ipcRenderer.invoke('add-special-item', type)
+    ipcRenderer.invoke('add-special-item', type),
+  /** Get whether desktop icons are currently hidden (registry HideIcons). */
+  getDesktopIconsHidden: (): Promise<boolean> =>
+    ipcRenderer.invoke('get-desktop-icons-hidden'),
+  /** Toggle desktop icon visibility (registry + shell refresh); returns new state. */
+  toggleDesktopIcons: (): Promise<boolean> =>
+    ipcRenderer.invoke('toggle-desktop-icons'),
+  /** 通知主进程鼠标进入(inside=true)/离开(inside=false) Dock 窗口。
+   *  离开时让出置顶沉底，进入时恢复置顶——用于滚动其他软件时 Dock 不遮挡。 */
+  dockPointer: (inside: boolean): void =>
+    ipcRenderer.send('dock-pointer', inside)
 }
 
 if (process.contextIsolated) {

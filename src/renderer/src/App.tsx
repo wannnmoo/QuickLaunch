@@ -21,6 +21,8 @@ function App(): React.ReactElement {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; appId: number } | null>(null)
   // 横向滚动边界状态：true 表示该侧还有图标未显示，用于显示渐隐提示
   const [scrollState, setScrollState] = useState({ left: false, right: false })
+  // 桌面图标当前是否隐藏（决定菜单项文案「隐藏/显示桌面图标」）
+  const [desktopIconsHidden, setDesktopIconsHidden] = useState(false)
 
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
@@ -257,6 +259,25 @@ function App(): React.ReactElement {
     if (!btn) return
     const rect = btn.getBoundingClientRect()
     setMenuPos({ cx: rect.left + rect.width / 2, top: rect.top })
+    // 打开菜单时同步桌面图标当前状态（决定菜单项文案）
+    window.api.getDesktopIconsHidden().then(setDesktopIconsHidden).catch(() => {})
+  }
+
+  // 切换桌面图标显隐（方案 1：写注册表 HideIcons + SHChangeNotify 刷新）
+  const handleToggleDesktopIcons = () => {
+    // 乐观更新：点击立即切换菜单文案，避免"点了没反应"的观感；IPC 结果再校正
+    const target = !desktopIconsHidden
+    setDesktopIconsHidden(target)
+    setMenuPos(null)
+    window.api
+      .toggleDesktopIcons()
+      .then((next) => {
+        if (next !== target) setDesktopIconsHidden(next)
+      })
+      .catch((err) => {
+        console.error('[desktop-icons] toggle failed:', err)
+        setDesktopIconsHidden(!target)
+      })
   }
 
   const handleAdd = () => doAdd(
@@ -326,7 +347,11 @@ function App(): React.ReactElement {
   }
 
   return (
-    <div className="app">
+    <div
+      className="app"
+      onMouseEnter={() => window.api.dockPointer(true)}
+      onMouseLeave={() => window.api.dockPointer(false)}
+    >
       <div
         className="dock"
         ref={dockRef}
@@ -397,7 +422,9 @@ function App(): React.ReactElement {
           style={{
             left: menuPos.cx,
             bottom: window.innerHeight - menuPos.top + 8,
-            transform: 'translateX(-50%)'
+            transform: 'translateX(-50%)',
+            // 菜单不超过「添加」按钮上方空间，否则顶部会超出 300px 窗口被裁掉
+            maxHeight: menuPos.top - 8
           }}
         >
           <button className="dropdown-item" onClick={handleAdd}>
@@ -411,6 +438,10 @@ function App(): React.ReactElement {
           </button>
           <button className="dropdown-item" onClick={() => handleAddSpecial('recycle-bin')}>
             回收站
+          </button>
+          <div className="dropdown-divider" />
+          <button className="dropdown-item" onClick={handleToggleDesktopIcons}>
+            {desktopIconsHidden ? '显示桌面图标' : '隐藏桌面图标'}
           </button>
         </div>
       )}
