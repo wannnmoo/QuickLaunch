@@ -105,6 +105,22 @@ $s = (New-Object -ComObject WScript.Shell).CreateShortcut('${filePath.replace(/'
 $targetPath = $s.TargetPath
 $isUrl = ($targetPath -match '^(https?|ftp|steam)://|^mailto:')
 
+# .url 文件是 INI 格式：WScript.Shell 读不到 TargetPath（实测为空），
+# 需从 INI 解析 URL 字段，否则 isUrl 判定失败导致图标/名称全部丢失
+$urlIni = @()
+if ([System.IO.Path]::GetExtension('${filePath.replace(/'/g, "''")}').ToLowerInvariant() -eq '.url') {
+  $urlIni = Get-Content '${filePath.replace(/'/g, "''")}' -Encoding Default -ErrorAction SilentlyContinue
+  if (-not $targetPath) {
+    foreach ($line in $urlIni) {
+      if ($line -match '^URL\\s*=\\s*(.+)$') {
+        $targetPath = $Matches[1].Trim()
+        break
+      }
+    }
+    $isUrl = ($targetPath -match '^(https?|ftp|steam)://|^mailto:')
+  }
+}
+
 # Parse IconLocation: "path,index" -> icon file & index
 $iconFile = $targetPath
 $iconIdx = 0
@@ -118,37 +134,45 @@ if ($loc -and $loc -match '(.+),(-?\\d+)$') {
 }
 
 # For .url files: try to read IconFile from the raw INI contents
-if ($isUrl) {
-  $urlIni = Get-Content '${filePath.replace(/'/g, "''")}' -Encoding Default -ErrorAction SilentlyContinue
-  if ($urlIni) {
-    foreach ($line in $urlIni) {
-      if ($line -match '^IconFile\\s*=\\s*(.+)$') {
-        $iniIcon = $Matches[1].Trim()
-        if ($iniIcon -match '^(https?|ftp)://') {
-          # Download favicon to temp file
-          try {
-            $tmpIco = [System.IO.Path]::GetTempFileName() + '.ico'
-            (New-Object System.Net.WebClient).DownloadFile($iniIcon, $tmpIco)
-            if (Test-Path $tmpIco) {
-              $raw = [System.IO.File]::ReadAllBytes($tmpIco)
-              $iconBase64 = [Convert]::ToBase64String($raw)
-              Remove-Item $tmpIco -Force
-            }
-          } catch {}
-        } elseif (Test-Path $iniIcon) {
-          $iconFile = $iniIcon
-          if ($urlIni -match 'IconIndex\\s*=\\s*(\\d+)') { $iconIdx = [int]$Matches[1] }
+if ($isUrl -and $urlIni) {
+  foreach ($line in $urlIni) {
+    if ($line -match '^IconFile\\s*=\\s*(.+)$') {
+      $iniIcon = $Matches[1].Trim()
+      if ($iniIcon -match '^(https?|ftp)://') {
+        # Download favicon to temp file
+        try {
+          $tmpIco = [System.IO.Path]::GetTempFileName() + '.ico'
+          (New-Object System.Net.WebClient).DownloadFile($iniIcon, $tmpIco)
+          if (Test-Path $tmpIco) {
+            $raw = [System.IO.File]::ReadAllBytes($tmpIco)
+            $iconBase64 = [Convert]::ToBase64String($raw)
+            Remove-Item $tmpIco -Force
+          }
+        } catch {}
+      } elseif (Test-Path $iniIcon) {
+        $iconFile = $iniIcon
+        # 逐行标量匹配（数组 -match 不会设置 $Matches，且值可能是空行）
+        foreach ($iniLine in $urlIni) {
+          if ($iniLine -match 'IconIndex\\s*=\\s*(\\d+)') { $iconIdx = [int]$Matches[1]; break }
         }
-        break
       }
+      break
     }
   }
 }
 
 if (-not $iconBase64) {
   $iconBase64 = ''
-  if ($iconFile -and (Test-Path $iconFile)) {
+  # 图标优先级（通用方案）：
+  # 1) IconLocation 指定的图标文件，或快捷方式目标自身——是普通文件就提取（尊重自定义图标）
+  if ($iconFile -and (Test-Path $iconFile -PathType Leaf)) {
     $iconBase64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, 256)
+  }
+  # 2) 目标是文件夹：SHDefExtractIcon 对目录返回 E_FAIL 无法取图标，上面提取失败时
+  #    统一回退系统黄色文件夹图标（与「添加文件夹」select-folder 一致）
+  #    注意：JS 模板字符串里路径必须写双反斜杠 \\，单反斜杠会被当成转义吞掉
+  if (-not $iconBase64 -and $targetPath -and (Test-Path $targetPath -PathType Container)) {
+    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, 256)
   }
 
   # Fallback for URL shortcuts: use default browser icon
@@ -163,6 +187,11 @@ if (-not $iconBase64) {
     if (-not $iconBase64) {
       $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 13, 256)
     }
+  }
+
+  # 终极兜底：目标不存在/图标提取全部失败时给通用文档图标（shell32 index 1），避免 Dock 破图
+  if (-not $iconBase64) {
+    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256)
   }
 }
 

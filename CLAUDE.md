@@ -87,13 +87,14 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
 - 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
 - **Dock 栏**：底部毛玻璃横栏，图标水平排列，gap 4px；内容超过宽度时横向滚动
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站/**隐藏或显示桌面图标**/**切换到白天或黑夜模式**）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——7 项菜单超过 300px 窗口高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/此电脑/回收站/**隐藏或显示桌面图标**/**切换到白天或黑夜模式**）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——6 项菜单（外加 2 分隔线）超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角
+- **菜单自动关闭**：下拉菜单和右键菜单鼠标移出即自动关闭（无需点击）——`mousemove` 用 `elementFromPoint` 判断鼠标是否仍在菜单（或「添加」按钮）DOM 内，不在则延迟 120ms 关闭，期间移回取消；鼠标移出窗口（`mouseleave`）立即关闭，点击外部（`mousedown`）也关闭
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
 - **白天/黑夜主题**：`theme` state（`'dark' | 'light'`），根元素加 `theme-light` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：自定义右键菜单（删除选项），fixed 定位在光标右侧
-- **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确
+- **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
 - **放大效果**：`handleDockMouseMove` 计算鼠标到每个图标的距离，< 140px 时缩放 + 上浮（拖拽时暂停）
 - **持久化**：`apps` 变化时 `useEffect` 自动保存，启动时 `useEffect` 自动恢复
 
@@ -117,6 +118,7 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 - URL 快捷方式图标解析链：`.url` 的 `IconFile` → favicon 下载 → 默认浏览器 exe → `shell32.dll` 地球图标（index 13）
 - PowerShell 超时 10 秒（`extractIcon`）/ 5 秒（`resolveClsidIcon`），每次调用启动新 `powershell.exe`
 - **每个 PowerShell 脚本开头都强制 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`**，适配中文 Windows GBK 编码——新增/修改 PS 脚本时务必保留，否则输出中文乱码
+- **JS 模板字符串里内嵌的 PowerShell 脚本，写 Windows 路径必须用双反斜杠 `\\`**（如 `'C:\\Windows\\System32\\shell32.dll'`）——单反斜杠的 `\W`/`\S` 等会被 JS 当转义符吞掉，编译后路径变成 `C:WindowsSystem32...`（静默失效，Test-Path/图标提取返回空，无明显报错）。新增硬编码路径时务必双反斜杠
 
 ### 桌面图标显隐机制
 
@@ -169,11 +171,12 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 - `.dock-inner` 是横向滚动容器（`overflow-x: auto`），CSS 规范强制其垂直方向也裁剪——**向上弹出的下拉菜单必须渲染在容器外**（fixed 定位），放容器内会被裁掉
 - 滚动容器会裁剪垂直溢出的放大图标，`.dock-inner` 顶部 44px 透明 padding 即预留的放大显示区；`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区
 - 开发模式下窗口加载 `ELECTRON_RENDERER_URL` 环境变量 URL；生产模式下加载 `../renderer/index.html` 文件
+- `setWindowOpenHandler` 拦截所有 `target=_blank`/新窗口请求：一律 `shell.openExternal()` 用默认浏览器打开并 `deny`，应用内不产生新窗口
 - `webPreferences.sandbox: false`：preload 依赖 `process.contextIsolated` 分支和 `@electron-toolkit/preload`，改成 `true` 会破坏 contextBridge
 - 关闭 → 隐藏托盘通过 `forceQuit` 标志区分：普通关闭 `preventDefault()` + `hide()`；托盘「退出」置 `forceQuit=true` 后 `app.quit()`。新增退出路径需同步设置该标志
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
 - `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
 - `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
-- **版本号管理**：git 提交信息用版本号（如 `v1.5.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.5.0`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.5.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.5.1: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.5.1`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.5.1），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）
