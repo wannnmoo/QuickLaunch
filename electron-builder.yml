@@ -17,6 +17,25 @@ extraResources:
 win:
   executableName: QuickLaunch
   icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  # 向导式安装（非一键）：安装时出现「选择安装位置」页面，可改路径。
+  # 注意：electron-builder 的 NSIS 配置是顶层键，不是 win.nsis
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # 按用户安装，默认目录 %LOCALAPPDATA%\Programs\QuickLaunch，无需管理员权限；
+  # 向导中用户可自行改为任意路径（如 D:\...）
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 快捷方式面板
+  # 安装向导语言：中英文都打进安装包，按系统语言自动选择
+  installerLanguages:
+    - zh_CN
+    - en_US
 mac:
   entitlementsInherit: entitlements.mac.plist
   icon: resources/icon.ico

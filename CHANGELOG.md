@@ -149,6 +149,7 @@ npm run package    # 构建并打包为可执行安装包
 - **置顶沉底逻辑修复**：
   - **dock-pointer 恢复置顶补 `focus()`**：此前鼠标移回 Dock 只恢复置顶不抢焦点，Dock 保持「置顶但无焦点」状态，之后再点击其他软件不会触发 `blur` 而无法沉底、持续遮挡——现在焦点闭环，点击让位恢复生效（副作用：鼠标滑过 Dock 时会短暂抢走焦点）
   - **sendToBottom 竞态修复**：`sendToBottom` 通过 PowerShell 异步执行 `HWND_BOTTOM`，若期间用户已通过 dock-pointer/focus 恢复置顶，迟到的压底操作会把 Dock 压到底部——回调检测到窗口仍处于置顶态时 `moveTop()` 拉回抵消
+- **安装程序向导化**：NSIS 由一键安装改为向导式（`oneClick: false` + `allowToChangeInstallationDirectory: true`），安装时出现「选择安装位置」页面可自由改路径；加入中英文向导语言（`installerLanguages: zh_CN + en_US`），按系统语言自动选择
 
 ### v1.5.1 (2026-08-10)
 
