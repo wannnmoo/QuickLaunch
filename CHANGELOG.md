@@ -144,6 +144,12 @@ npm run package    # 构建并打包为可执行安装包
 
 ## 更新日志
 
+### v1.5.2 (2026-08-12)
+
+- **置顶沉底逻辑修复**：
+  - **dock-pointer 恢复置顶补 `focus()`**：此前鼠标移回 Dock 只恢复置顶不抢焦点，Dock 保持「置顶但无焦点」状态，之后再点击其他软件不会触发 `blur` 而无法沉底、持续遮挡——现在焦点闭环，点击让位恢复生效（副作用：鼠标滑过 Dock 时会短暂抢走焦点）
+  - **sendToBottom 竞态修复**：`sendToBottom` 通过 PowerShell 异步执行 `HWND_BOTTOM`，若期间用户已通过 dock-pointer/focus 恢复置顶，迟到的压底操作会把 Dock 压到底部——回调检测到窗口仍处于置顶态时 `moveTop()` 拉回抵消
+
 ### v1.5.1 (2026-08-10)
 
 - **文件夹快捷方式图标修复**：`SHDefExtractIcon` 对目录返回 E_FAIL 取不到图标，导入指向文件夹的 `.lnk` 显示破图——目标为文件夹时统一回退 `shell32.dll` 黄色文件夹图标（index 4），与「添加文件夹」一致

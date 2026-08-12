@@ -526,10 +526,13 @@ function resolveResource(filename: string): string {
 // 鼠标进入 Dock 窗口：恢复置顶（沉底后鼠标移回 Dock 即拉回）。
 // 鼠标移出 / 在其他软件上滚动不再沉底——用户可自由移动鼠标，
 // 只有点击其他软件（blur）才让出置顶。
+// 鼠标进入 Dock 窗口：恢复置顶并抢回焦点。必须 focus——否则 Dock 保持「置顶但无焦点」，
+// 之后点击其他软件不会触发 blur，Dock 无法沉底（违背「只有点击其他软件才让位」的设计）。
 ipcMain.on('dock-pointer', (_e, inside: boolean) => {
   if (!mainWindow || mainWindow.isDestroyed() || !inside) return
   mainWindow.setAlwaysOnTop(true)
   mainWindow.moveTop()
+  mainWindow.focus()
 })
 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
@@ -552,7 +555,15 @@ public static class WinZ {
 # HWND_BOTTOM=1, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
 [WinZ]::SetWindowPos([IntPtr]::new(${hwnd}), [IntPtr]::new(1), 0, 0, 0, 0, 0x0002 -bor 0x0001 -bor 0x0010) | Out-Null`
   execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err) => {
-    if (err) console.error('[dock] sendToBottom failed:', err.message)
+    if (err) {
+      console.error('[dock] sendToBottom failed:', err.message)
+      return
+    }
+    // PS 异步执行 HWND_BOTTOM 有延迟：若期间用户已通过 dock-pointer/focus 恢复置顶，
+    // 迟到的 SetWindowPos(HWND_BOTTOM) 会把 Dock 压底，这里检测到置顶态则 moveTop() 拉回抵消
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isAlwaysOnTop()) {
+      mainWindow.moveTop()
+    }
   })
 }
 

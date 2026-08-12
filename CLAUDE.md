@@ -177,6 +177,6 @@ Main 进程维护 `SPECIAL_ITEMS` 映射表，每个项目包含 CLSID、回退 
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
 - `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
 - `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
-- **版本号管理**：git 提交信息用版本号（如 `v1.5.1: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.5.1`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.5.1），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.5.2: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.5.2`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.5.2），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）
