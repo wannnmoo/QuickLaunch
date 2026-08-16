@@ -11,6 +11,22 @@ let tray: Tray | null = null
 // 若此时 blur/mouseleave 触发沉底，对话框会被连带压到其他软件下面
 let dialogOpen = false
 
+// 单实例锁：防止重复启动（开机自启已在运行、用户又手动启动 exe）时出现两个 Dock。
+// 后启动的实例直接退出，并唤起已有实例的窗口。必须在 app ready 前调用。
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!mainWindow.isVisible()) mainWindow.show()
+      mainWindow.setAlwaysOnTop(true)
+      mainWindow.moveTop()
+      mainWindow.focus()
+    }
+  })
+}
+
 function toggleWindow(): void {
   if (!mainWindow) return
   // 正在置顶显示 → 隐藏；沉底或已隐藏 → 唤回置顶
@@ -312,65 +328,92 @@ ipcMain.handle('select-folder', async () => {
   }))
 })
 
-// ─── IPC: add special system folder (This PC / Recycle Bin) ─────────────────
+// ─── IPC: 扫描桌面文件夹 + 系统位置（启动时自动合并） ─────────────────────
+// 单次 PowerShell 调用完成全部工作（避免启动时拉起 6 个 powershell 进程）：
+// 1) 枚举桌面文件夹 + 指向文件夹的 .lnk 快捷方式（WScript.Shell 解析目标，目标为目录才纳入）
+// 2) 提取共享的黄色文件夹图标（shell32 index 4，失败回退通用文档图标 index 1）
+// 3) 解析「此电脑」「回收站」注册表 CLSID 图标（失败逐级回退：黄色文件夹图标 → 通用文档图标）
+// 返回 { path, name, iconBase64, specialType? }[]。去重由 renderer 完成。
 
-const SPECIAL_ITEMS: Record<string, { clsid: string; fallbackDll: string; fallbackIndex: number; name: string; shellCommand: string }> = {
-  'this-pc': {
-    clsid: '{20D04FE0-3AEA-1069-A2D8-08002B30309D}',
-    fallbackDll: 'C:\\Windows\\System32\\shell32.dll',
-    fallbackIndex: 15,
-    name: '此电脑',
-    shellCommand: 'shell:MyComputerFolder'
-  },
-  'recycle-bin': {
-    clsid: '{645FF040-5081-101B-9F08-00AA002F954E}',
-    fallbackDll: 'C:\\Windows\\System32\\shell32.dll',
-    fallbackIndex: 31,
-    name: '回收站',
-    shellCommand: 'shell:RecycleBinFolder'
-  }
-}
-
-/** Resolve the actual icon file path and index for a CLSID from the Windows Registry. */
-function resolveClsidIcon(clsid: string): Promise<{ dll: string; index: number }> {
+ipcMain.handle('scan-desktop-folders', async () => {
+  const desktop = existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
   return new Promise((resolve) => {
     const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
-$iconPath = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\\CLSID\\${clsid}\\DefaultIcon" -Name '(Default)' -ErrorAction SilentlyContinue).'(Default)'
-if ($iconPath) {
-  Write-Output ([Environment]::ExpandEnvironmentVariables($iconPath))
-}
-`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err, stdout) => {
-      if (err || !stdout.trim()) { resolve({ dll: '', index: 0 }); return }
-      const raw = stdout.trim()
-      // Format: "C:\path\to.dll,-109" or "C:\path\to.dll,15" or just "C:\path\to.dll"
-      const match = raw.match(/^(.+?),(-?\d+)$/)
-      if (match) {
-        resolve({ dll: match[1], index: parseInt(match[2], 10) })
-      } else {
-        resolve({ dll: raw, index: 0 })
+${ICON_EXTRACTOR_CS}
+
+$desktop = '${desktop.replace(/'/g, "''")}'
+$results = @()
+
+# 1) 桌面文件夹 + 指向文件夹的 .lnk 快捷方式
+if (Test-Path -LiteralPath $desktop) {
+  Get-ChildItem -LiteralPath $desktop -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $results += @{ path = $_.FullName; name = $_.Name; specialType = $null }
+  }
+  $shell = New-Object -ComObject WScript.Shell
+  Get-ChildItem -LiteralPath $desktop -Filter *.lnk -File -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $s = $shell.CreateShortcut($_.FullName)
+      $target = $s.TargetPath
+      if ($target -and (Test-Path -LiteralPath $target -PathType Container)) {
+        $results += @{ path = $target; name = $_.BaseName; specialType = $null }
       }
+    } catch {}
+  }
+}
+
+# 2) 文件夹共享图标：黄色文件夹 → 通用文档兜底（只提取一次）
+$folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, 256)
+if (-not $folderIcon) {
+  $folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256)
+}
+
+# 3) 系统位置：此电脑 / 回收站（注册表 CLSID 图标，失败逐级回退）
+$specials = @(
+  @{ type = 'this-pc'; clsid = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'; name = '此电脑'; shell = 'shell:MyComputerFolder' },
+  @{ type = 'recycle-bin'; clsid = '{645FF040-5081-101B-9F08-00AA002F954E}'; name = '回收站'; shell = 'shell:RecycleBinFolder' }
+)
+foreach ($sp in $specials) {
+  $iconPath = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\\CLSID\\$($sp.clsid)\\DefaultIcon" -Name '(Default)' -ErrorAction SilentlyContinue).'(Default)'
+  $iconFile = 'C:\\Windows\\System32\\shell32.dll'
+  $iconIdx = 15
+  if ($sp.type -eq 'recycle-bin') { $iconIdx = 31 }
+  if ($iconPath) {
+    $expanded = [Environment]::ExpandEnvironmentVariables($iconPath)
+    if ($expanded -match '^(.+?),(-?\\d+)$') {
+      $iconFile = $Matches[1]
+      $iconIdx = [int]$Matches[2]
+    } else {
+      $iconFile = $expanded
+      $iconIdx = 0
+    }
+  }
+  $iconB64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, 256)
+  if (-not $iconB64) { $iconB64 = $folderIcon }
+  $results += @{ path = $sp.shell; name = $sp.name; specialType = $sp.type; iconBase64 = $iconB64 }
+}
+
+# 4) 文件夹条目统一附共享图标
+foreach ($r in $results) {
+  if (-not $r.iconBase64) { $r.iconBase64 = $folderIcon }
+}
+
+if ($results.Count -gt 0) {
+  $results | ConvertTo-Json -Compress -Depth 3
+}`
+    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 20000 }, (err, stdout) => {
+      if (err || !stdout.trim()) { resolve([]); return }
+      try {
+        const items = JSON.parse(stdout.trim())
+        resolve(items.map((it) => ({
+          path: it.path,
+          name: it.name,
+          iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : '',
+          ...(it.specialType ? { specialType: it.specialType } : {})
+        })))
+      } catch { resolve([]) }
     })
   })
-}
-
-ipcMain.handle('add-special-item', async (_event, type: string) => {
-  const item = SPECIAL_ITEMS[type]
-  if (!item) return null
-
-  // Try registry resolution first, fall back to hardcoded values
-  const { dll, index } = await resolveClsidIcon(item.clsid)
-  const iconFile = dll || item.fallbackDll
-  const iconIndex = dll ? index : item.fallbackIndex
-
-  const iconDataUrl = await extractIcon(iconFile, iconIndex, 256)
-  return {
-    path: item.shellCommand,
-    name: item.name,
-    iconDataUrl,
-    specialType: type
-  }
 })
 
 // ─── IPC: hide/show desktop icons ───────────────────────────────────────────
@@ -464,6 +507,38 @@ if ($dv -eq [IntPtr]::Zero) {
     })
   })
 })
+
+// ─── IPC: 开机自启动（注册表 HKCU\...\Run 登录项） ───────────────────────
+// 用 Electron 原生 app.setLoginItemSettings，无需第三方依赖。
+// 打包后 process.execPath 是 QuickLaunch.exe，直接带 --autostart 参数；
+// 开发模式下 process.execPath 是 electron.exe，必须附带应用路径参数（第一个
+// 非开关参数会被 Electron 当作 app 路径）才会启动本项目。Chromium 写注册表时
+// 会自动给含空格的路径加引号，无需手动处理。
+
+function autoStartArgs(): string[] {
+  return app.isPackaged ? ['--autostart'] : ['--autostart', app.getAppPath()]
+}
+
+function getAutoStartSetting(): boolean {
+  // getLoginItemSettings 需传入与 set 相同的 path/args 才能正确匹配注册表项
+  return app.getLoginItemSettings({ path: process.execPath, args: autoStartArgs() }).openAtLogin
+}
+
+function setAutoStartSetting(enabled: boolean): boolean {
+  app.setLoginItemSettings({
+    openAtLogin: enabled,
+    path: process.execPath,
+    args: autoStartArgs()
+  })
+  return getAutoStartSetting()
+}
+
+ipcMain.handle('get-auto-start', () => getAutoStartSetting())
+ipcMain.handle('set-auto-start', (_event, enabled: boolean) => setAutoStartSetting(!!enabled))
+
+// 通过 Run 登录项（--autostart 参数）启动时，窗口默认隐藏到托盘，不打扰登录后的桌面；
+// Alt+Space / 托盘图标随时唤出
+const startedAtLogin = process.argv.includes('--autostart')
 
 // ─── IPC: launch an executable, URL, shell location, or open a folder ───────
 
@@ -592,7 +667,8 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => {
-    mainWindow?.show()
+    // 开机自启动（--autostart）时默认隐藏到托盘，不打扰登录后的桌面
+    if (!startedAtLogin) mainWindow?.show()
   })
 
   // Hide to tray instead of closing
@@ -640,6 +716,9 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // 未获得单实例锁：本实例正在退出流程中，不初始化窗口/托盘
+  if (!gotSingleInstanceLock) return
+
   createWindow()
 
   // System tray

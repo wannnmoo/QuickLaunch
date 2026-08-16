@@ -40,17 +40,21 @@ const api = {
   /** Select one or more folders, returning each one's path, name, and system icon. */
   selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string }[]> =>
     ipcRenderer.invoke('select-folder'),
-  /** Add a special system location (This PC or Recycle Bin). */
-  addSpecialItem: (type: 'this-pc' | 'recycle-bin'): Promise<{
-    path: string; name: string; iconDataUrl: string; specialType: string
-  } | null> =>
-    ipcRenderer.invoke('add-special-item', type),
+  /** 扫描桌面上的文件夹和指向文件夹的 .lnk 快捷方式，并固定附加「此电脑」「回收站」系统位置（启动时自动合并，renderer 端去重）。 */
+  scanDesktopFolders: (): Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]> =>
+    ipcRenderer.invoke('scan-desktop-folders'),
   /** Get whether desktop icons are currently hidden (registry HideIcons). */
   getDesktopIconsHidden: (): Promise<boolean> =>
     ipcRenderer.invoke('get-desktop-icons-hidden'),
   /** Toggle desktop icon visibility (registry + shell refresh); returns new state. */
   toggleDesktopIcons: (): Promise<boolean> =>
     ipcRenderer.invoke('toggle-desktop-icons'),
+  /** 开机自启动当前是否开启（注册表 Run 登录项）。 */
+  getAutoStart: (): Promise<boolean> =>
+    ipcRenderer.invoke('get-auto-start'),
+  /** 开启/关闭开机自启动（写注册表 Run 登录项），返回切换后实际状态。 */
+  setAutoStart: (enabled: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('set-auto-start', enabled),
   /** 通知主进程鼠标进入 Dock 窗口（inside=true）恢复置顶。
    *  沉底仅由点击其他软件（blur）触发——鼠标移出或在其他软件上滚动都不让位。 */
   dockPointer: (inside: boolean): void =>

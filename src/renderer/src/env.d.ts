@@ -16,9 +16,11 @@ interface Window {
     loadShortcuts: () => Promise<{ id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin' }[]>
     saveShortcuts: (data: { id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin' }[]) => Promise<void>
     selectFolder: () => Promise<{ path: string; name: string; iconDataUrl: string }[]>
-    addSpecialItem: (type: 'this-pc' | 'recycle-bin') => Promise<{ path: string; name: string; iconDataUrl: string; specialType: string } | null>
+    scanDesktopFolders: () => Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]>
     getDesktopIconsHidden: () => Promise<boolean>
     toggleDesktopIcons: () => Promise<boolean>
+    getAutoStart: () => Promise<boolean>
+    setAutoStart: (enabled: boolean) => Promise<boolean>
     dockPointer: (inside: boolean) => void
   }
 }

@@ -61,6 +61,7 @@ html, body {
   --context-hover-bg: rgba(255, 255, 255, 0.08);
   --divider-bg: rgba(255, 255, 255, 0.1);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+  --switch-off-bg: rgba(255, 255, 255, 0.22);
 }
 
 .app.theme-light {
@@ -90,6 +91,7 @@ html, body {
   --context-hover-bg: rgba(0, 0, 0, 0.06);
   --divider-bg: rgba(0, 0, 0, 0.1);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
+  --switch-off-bg: rgba(0, 0, 0, 0.2);
 }
 
 /* ─── Dock ──────────────────────────────────────────────────────────── */
@@ -303,7 +305,10 @@ html, body {
 }
 
 .dropdown-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   width: 100%;
   padding: 7px 16px;
   font-size: 0.84rem;
@@ -322,6 +327,39 @@ html, body {
 .dropdown-item:hover {
   background: var(--menu-hover-bg);
   color: var(--menu-hover-text);
+}
+
+/* 开机自启动开关指示器（iOS 风格）：靠菜单项右侧显示（space-between 推右），
+   开=绿色轨道+圆球在右，关=灰色轨道+圆球在左；纯展示，点击整个菜单项切换 */
+.item-switch {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  border-radius: 9px;
+  background: var(--switch-off-bg);
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+
+.item-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: left 0.2s;
+}
+
+.item-switch.on {
+  background: #34c759;
+}
+
+.item-switch.on::after {
+  left: 15px;
 }
 
 .dropdown-divider {

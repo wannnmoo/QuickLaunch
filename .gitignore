@@ -9,3 +9,5 @@ Thumbs.db
 *.lnk
 *.url
 *.pif
+# 视觉调试工具的临时产物目录
+.dsh-vision-toolkit/
