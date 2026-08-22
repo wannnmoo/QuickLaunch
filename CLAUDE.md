@@ -55,7 +55,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 ### 系统托盘 + 快捷键
 
-- **Alt+Space** 全局快捷键：置顶显示时按 → 隐藏到托盘；沉底或已隐藏时按 → 唤回置顶（`toggleWindow()` 用 `isVisible() && isAlwaysOnTop()` 区分两种状态，不是简单的 show/hide）。优先注册，失败自动回退 `Ctrl+Alt+Space`；Ctrl+Alt 在 Windows 上等同 AltGr，易被输入法/键盘布局占用
+- **Alt+Space** 全局快捷键：隐藏/不可见时按 → 唤回置顶；可见（置顶或沉底）时按 → 隐藏到托盘。`toggleWindow()` 用**自维护意图状态 `dockTrayHidden`**（非 `isAlwaysOnTop()`——桌面无其他窗口时前台锁会拒绝激活，Dock 获得焦点约 500ms 后被抢回产生虚假 `blur` 沉底，读置顶位会陷入「显示→被压底→再显示」死循环，v1.7.1 修复）。`dockTrayHidden` 在所有显示/隐藏路径同步维护（run-app 隐藏、close 到托盘、`--autostart` 启动、second-instance、托盘「显示窗口」、dock-pointer、focus）。优先注册 Alt+Space，失败自动回退 `Ctrl+Alt+Space`；Ctrl+Alt 在 Windows 上等同 AltGr，易被输入法/键盘布局占用
 - 关闭窗口 → 隐藏到系统托盘（不退出）
 - 托盘左键单击 → `toggleWindow()`（同上逻辑）
 - 托盘右键菜单 →「显示窗口」/「退出」
@@ -179,7 +179,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **插入顺序**：updater 内纯合并——系统位置区块（既有 + 新增，按 此电脑→回收站 稳定排序）+ 新文件夹 + 其余（保持原顺序）。Dock 前部固定为此电脑/回收站/文件夹；若用户手动拖动过系统位置，下次合并会归位到区块前部
 - **去重/排序/id 分配都在 updater 外完成**（StrictMode 双调用 updater 时无副作用；updater 内仍有防御性路径过滤，防止与启动早期手动添加竞态）
 - 加载完成即解锁保存（`loadedRef`，不等扫描）；**顺序执行（load → prune → scan 链式）避免竞态**——若并行，扫描结果可能被 `loadShortcuts` 的 `setApps` 覆盖丢失
-- **实时同步（v1.8.0）**：主进程 `startDesktopWatch()` 对桌面目录挂 `fs.watch`（非递归——只关心桌面直接子项，文件夹内部文件变化不触发；debounce 1s 聚合）→ `webContents.send('desktop-changed')` → renderer 重新执行「清理缺失 + 扫描合并」（`pruneMissingFolders` + `mergeDesktopScan`，与启动共用同一套逻辑，基线分别为当前列表/已加载列表）。`appsRef` 镜像最新列表供事件回调读取（避免过期闭包）；`desktopSyncBusyRef` 防重入——清理/扫描进行中跳过重复事件（debounce 只聚合 watch 事件，扫描自身耗时可更长）
+- **实时同步（v1.7.0）**：主进程 `startDesktopWatch()` 对桌面目录挂 `fs.watch`（非递归——只关心桌面直接子项，文件夹内部文件变化不触发；debounce 1s 聚合）→ `webContents.send('desktop-changed')` → renderer 重新执行「清理缺失 + 扫描合并」（`pruneMissingFolders` + `mergeDesktopScan`，与启动共用同一套逻辑，基线分别为当前列表/已加载列表）。`appsRef` 镜像最新列表供事件回调读取（避免过期闭包）；`desktopSyncBusyRef` 防重入——清理/扫描进行中跳过重复事件（debounce 只聚合 watch 事件，扫描自身耗时可更长）
 - **缺失清理**：`pruneMissingFolders` 收集所有 `isFolder` 条目路径 → `check-folders-missing` IPC（主进程纯 `fs.existsSync`，无 PowerShell）→ 返回不存在子集 → 移出 Dock（随保存 effect 持久化）。系统位置（`shell:` 命令，`specialType` 条目）不参与。权衡：外部硬盘/网络盘未连接时其文件夹条目也会被清理（桌面文件夹重新连接后由扫描恢复，手动添加的需重新添加）
 - 注意：被用户删除的桌面文件夹会从 Dock 移除（实时或下次启动），重新创建同名文件夹后会再次加入（暂无忽略列表——跳过某文件夹需在扫描脚本里加过滤）；桌面路径沿用 `D:\Desktop`（重定向桌面，回退系统桌面）
 
@@ -204,6 +204,6 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
 - `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.6.0`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.6.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.7.1`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.7.1），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

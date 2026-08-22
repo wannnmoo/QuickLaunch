@@ -20,6 +20,7 @@ if (!gotSingleInstanceLock) {
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show()
+      dockTrayHidden = false
       mainWindow.setAlwaysOnTop(true)
       mainWindow.moveTop()
       mainWindow.focus()
@@ -27,16 +28,26 @@ if (!gotSingleInstanceLock) {
   })
 }
 
+// Dock 是否隐藏到托盘（我们主动维护的打开/关闭意图状态）。
+// 不依赖 isAlwaysOnTop() 判断：当桌面无其他窗口（前台被 Progman 桌面持有）时，
+// show()+focus() 的激活会被前台锁拒绝——Dock 短暂获得焦点后约 500ms 被抢回，
+// 触发一次虚假 blur 把 Dock 压到底部（仍可见）；此时若按键逻辑读置顶位，就会陷入
+// 「显示→被压底→再次显示→再次被压底」的死循环，Alt+Space 永远无法隐藏（v1.7.1 修复）。
+let dockTrayHidden = false
+
 function toggleWindow(): void {
   if (!mainWindow) return
-  // 正在置顶显示 → 隐藏；沉底或已隐藏 → 唤回置顶
-  if (mainWindow.isVisible() && mainWindow.isAlwaysOnTop()) {
-    mainWindow.hide()
-  } else {
+  if (dockTrayHidden || !mainWindow.isVisible()) {
+    // 隐藏到托盘 / 不可见 → 唤回置顶显示
+    dockTrayHidden = false
     mainWindow.show()
     mainWindow.setAlwaysOnTop(true)
     mainWindow.moveTop()
     mainWindow.focus()
+  } else {
+    // 可见（置顶或被沉底）→ 隐藏到托盘
+    dockTrayHidden = true
+    mainWindow.hide()
   }
 }
 
@@ -583,9 +594,10 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   if (!targetPath) return false
 
   // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
-  // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 isVisible()
-  // 判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
+  // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 dockTrayHidden
+  // 意图状态判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
   if (mainWindow && !mainWindow.isDestroyed()) {
+    dockTrayHidden = true
     mainWindow.hide()
   }
 
@@ -643,6 +655,7 @@ function resolveResource(filename: string): string {
 // 之后点击其他软件不会触发 blur，Dock 无法沉底（违背「只有点击其他软件才让位」的设计）。
 ipcMain.on('dock-pointer', (_e, inside: boolean) => {
   if (!mainWindow || mainWindow.isDestroyed() || !inside) return
+  dockTrayHidden = false
   mainWindow.setAlwaysOnTop(true)
   mainWindow.moveTop()
   mainWindow.focus()
@@ -707,12 +720,14 @@ function createWindow(): void {
   mainWindow.on('ready-to-show', () => {
     // 开机自启动（--autostart）时默认隐藏到托盘，不打扰登录后的桌面
     if (!startedAtLogin) mainWindow?.show()
+    else dockTrayHidden = true
   })
 
   // Hide to tray instead of closing
   mainWindow.on('close', (event) => {
     if (!forceQuit) {
       event.preventDefault()
+      dockTrayHidden = true
       mainWindow?.hide()
     }
   })
@@ -735,6 +750,7 @@ function createWindow(): void {
   // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
   // run-app 启动后窗口隐藏到托盘，唤回时由这里恢复置顶并拉回顶层。
   mainWindow.on('focus', () => {
+    dockTrayHidden = false
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(true)
       mainWindow.moveTop()
@@ -772,6 +788,7 @@ app.whenReady().then(() => {
       label: '显示窗口',
       click: () => {
         if (mainWindow) {
+          dockTrayHidden = false
           mainWindow.show()
           mainWindow.focus()
         }
