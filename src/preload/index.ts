@@ -43,6 +43,15 @@ const api = {
   /** 扫描桌面上的文件夹和指向文件夹的 .lnk 快捷方式，并固定附加「此电脑」「回收站」系统位置（启动时自动合并，renderer 端去重）。 */
   scanDesktopFolders: (): Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]> =>
     ipcRenderer.invoke('scan-desktop-folders'),
+  /** 检查哪些文件夹路径已不存在（用于清理被删除的桌面文件夹条目），返回不存在的子集。 */
+  checkMissingFolders: (paths: string[]): Promise<string[]> =>
+    ipcRenderer.invoke('check-folders-missing', paths),
+  /** 订阅桌面文件夹变化事件（fs.watch + debounce 后推送），返回取消订阅函数。 */
+  onDesktopChanged: (callback: () => void): (() => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('desktop-changed', listener)
+    return () => { ipcRenderer.removeListener('desktop-changed', listener) }
+  },
   /** Get whether desktop icons are currently hidden (registry HideIcons). */
   getDesktopIconsHidden: (): Promise<boolean> =>
     ipcRenderer.invoke('get-desktop-icons-hidden'),

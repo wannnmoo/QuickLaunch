@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen } from 'electron'
 import { join, basename } from 'path'
-import { readFileSync, writeFileSync, existsSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync, statSync, watch, type FSWatcher } from 'fs'
 import { execFile } from 'child_process'
 
 
@@ -108,7 +108,10 @@ Write-Output $b64`
 // ─── IPC: parse .lnk shortcut file via PowerShell ──────────────────────────
 
 // 新增文件/文件夹对话框的默认起始目录：优先用户重定向到 D 盘的桌面，回退系统桌面
-const DEFAULT_DIALOG_PATH = existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
+function desktopPath(): string {
+  return existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
+}
+const DEFAULT_DIALOG_PATH = desktopPath()
 
 // 解析单个 .lnk/.url/.pif 快捷方式文件，返回该文件的完整信息
 function parseLnkFile(filePath: string): Promise<any> {
@@ -336,7 +339,7 @@ ipcMain.handle('select-folder', async () => {
 // 返回 { path, name, iconBase64, specialType? }[]。去重由 renderer 完成。
 
 ipcMain.handle('scan-desktop-folders', async () => {
-  const desktop = existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
+  const desktop = desktopPath()
   return new Promise((resolve) => {
     const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -415,6 +418,40 @@ if ($results.Count -gt 0) {
     })
   })
 })
+
+// ─── IPC: 文件夹条目存在性检查（实时清理被删除的桌面文件夹） ─────────────
+// 纯 fs 检查（无 PowerShell）；返回传入路径中已不存在（被删除/移动/磁盘未挂载）的子集
+
+ipcMain.handle('check-folders-missing', (_e, paths: unknown) => {
+  if (!Array.isArray(paths)) return []
+  return paths.filter((p): p is string => typeof p === 'string' && !!p && !existsSync(p))
+})
+
+// ─── 桌面目录实时监听（fs.watch + debounce）─────────────────────────────
+// 桌面目录下任何文件/文件夹的增删改都会触发 'rename'/'change' 事件；debounce 1s
+// 聚合后向 renderer 推送 desktop-changed，由 renderer 重新执行「清理缺失 + 扫描合并」：
+// 桌面新增文件夹即时加入 Dock，被删除的即时移除（与启动扫描共用同一条合并逻辑）。
+// 注意：非递归监听——只关心桌面的直接子项，文件夹内部文件变化不影响。
+
+let desktopWatcher: FSWatcher | null = null
+let desktopWatchTimer: ReturnType<typeof setTimeout> | null = null
+
+function startDesktopWatch(): void {
+  try {
+    desktopWatcher = watch(desktopPath(), { persistent: true }, () => {
+      if (desktopWatchTimer) clearTimeout(desktopWatchTimer)
+      desktopWatchTimer = setTimeout(() => {
+        desktopWatchTimer = null
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('desktop-changed')
+        }
+      }, 1000)
+    })
+    desktopWatcher.on('error', (err) => console.error('[desktop-watch] error:', err))
+  } catch (err) {
+    console.error('[desktop-watch] failed to start:', err)
+  }
+}
 
 // ─── IPC: hide/show desktop icons ───────────────────────────────────────────
 // 方案：向桌面 SHELLDLL_DefView 发送 WM_COMMAND 0x7402 —— 与 Windows
@@ -545,10 +582,11 @@ const startedAtLogin = process.argv.includes('--autostart')
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
-  // 启动目标前让出置顶：新程序窗口是普通层级，可浮到 Dock 之上不被遮挡。
-  // Dock 在下次获得焦点（点击 / Alt+Space / 托盘唤出）时由 focus 事件恢复置顶。
+  // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
+  // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 isVisible()
+  // 判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setAlwaysOnTop(false)
+    mainWindow.hide()
   }
 
   // Windows shell: / CLSID → open via explorer (This PC, Recycle Bin, etc.)
@@ -688,14 +726,14 @@ function createWindow(): void {
     // 系统文件对话框打开期间不沉底：对话框是模态的，会抢走焦点触发 blur，
     // 此时沉底会连带把对话框压到其他软件下面（模态对话框跟随父窗口层级）
     if (dialogOpen) return
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setAlwaysOnTop(false)
-      sendToBottom(mainWindow)
-    }
+    // 窗口已隐藏（如 run-app 启动后自动隐藏到托盘，hide() 会触发 blur）：不可见窗口无需沉底
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return
+    mainWindow.setAlwaysOnTop(false)
+    sendToBottom(mainWindow)
   })
 
   // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
-  // run-app 会临时让出置顶让新程序窗口浮到 Dock 之上，这里负责重新拉回。
+  // run-app 启动后窗口隐藏到托盘，唤回时由这里恢复置顶并拉回顶层。
   mainWindow.on('focus', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(true)
@@ -720,6 +758,8 @@ app.whenReady().then(() => {
   if (!gotSingleInstanceLock) return
 
   createWindow()
+  // 桌面目录实时监听：文件夹新增/删除时通知 renderer 同步 Dock 图标
+  startDesktopWatch()
 
   // System tray
   const trayIcon = nativeImage.createFromPath(resolveResource('tray-icon.png'))

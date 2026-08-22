@@ -42,8 +42,8 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏幕宽，最大 1200px，居中）
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
 - **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
-  1. `blur` 事件（点击其他窗口失去焦点）→ 立即 `setAlwaysOnTop(false)` + `sendToBottom()`（点击其他软件是有意让位）
-  2. `run-app` 启动目标前 `setAlwaysOnTop(false)`，让新程序窗口浮到 Dock 之上
+  1. `blur` 事件（点击其他窗口失去焦点）→ 立即 `setAlwaysOnTop(false)` + `sendToBottom()`（点击其他软件是有意让位）；**窗口已隐藏（`isVisible()` 为 false）时跳过**——`run-app` 隐藏到托盘触发的 blur 不再白跑一次 PowerShell 沉底
+  2. `run-app` 启动目标后**自动隐藏到托盘**（`mainWindow.hide()`，不退出进程）——用户点开图标后 Dock 彻底让出桌面；托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回（`toggleWindow` 按 `isVisible()` 判断，隐藏状态下任一唤回路径均显示并恢复置顶）
 - **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
 - **恢复置顶**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）→ `setAlwaysOnTop(true)` + `moveTop()`
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
@@ -81,7 +81,9 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `parse-lnk` | Renderer → Main | 解析 .lnk/.url/.pif 快捷方式文件，返回 `LnkInfo[]`；不传路径则弹出系统文件对话框（`multiSelections` 支持一次多选，单个解析失败不影响其余）。对话框默认定位 `D:\Desktop`（重定向后的桌面，回退系统桌面） |
 | `select-folder` | Renderer → Main | 选择文件夹（`multiSelections` 支持一次多选），从 `shell32.dll` index 4 提取黄色文件夹图标，返回数组 |
 | `scan-desktop-folders` | Renderer → Main | 扫描桌面上的文件夹和指向文件夹的 .lnk 快捷方式，并**固定附加「此电脑」「回收站」系统位置**（启动时自动合并，renderer 端路径规范化去重），返回 `{path, name, iconDataUrl, specialType?}[]`（单次 PS 调用完成枚举 + 图标提取，图标失败逐级回退） |
-| `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹；URL 判定正则 `/^(https?\|ftp\|steam):\/\/\|^mailto:/i` |
+| `check-folders-missing` | Renderer → Main | 检查哪些文件夹路径已不存在（主进程纯 `fs.existsSync`，无 PowerShell），返回不存在的子集——用于清理被删除的桌面文件夹条目 |
+| `desktop-changed` | Main → Renderer | 主进程 `fs.watch` 桌面目录（非递归，debounce 1s）后推送的事件（`webContents.send`，非 handle/invoke）；renderer 收到后重新执行「清理缺失 + 扫描合并」，桌面文件夹增删实时同步到 Dock |
+| `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹；URL 判定正则 `/^(https?\|ftp\|steam):\/\/\|^mailto:/i`；启动后 Dock 自动隐藏到托盘（`blur` 沉底逻辑对不可见窗口跳过——`hide()` 触发的 blur 不再白跑一次 PowerShell 沉底） |
 | `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
 | `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json` |
 | `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，找不到 ListView 时回退读注册表 HideIcons） |
@@ -176,8 +178,10 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - 去重在 renderer：`normPath()`（去尾部 `\` + 小写）与 `saved`（加载结果）比较（系统位置的 `targetPath` 是 `shell:` 命令，同样参与比较）；新增条目按 `specialType` 有无分别标 `specialType` / `isFolder: true`，合并后由保存 effect 持久化
 - **插入顺序**：updater 内纯合并——系统位置区块（既有 + 新增，按 此电脑→回收站 稳定排序）+ 新文件夹 + 其余（保持原顺序）。Dock 前部固定为此电脑/回收站/文件夹；若用户手动拖动过系统位置，下次合并会归位到区块前部
 - **去重/排序/id 分配都在 updater 外完成**（StrictMode 双调用 updater 时无副作用；updater 内仍有防御性路径过滤，防止与启动早期手动添加竞态）
-- 加载完成即解锁保存（`loadedRef`，不等扫描）；**顺序执行（load → scan 链式）避免竞态**——若并行，扫描结果可能被 `loadShortcuts` 的 `setApps` 覆盖丢失
-- 注意：被用户删除的桌面文件夹/系统位置下次启动会重新加入（暂无忽略列表）；桌面路径沿用 `D:\Desktop`（重定向桌面，回退系统桌面）
+- 加载完成即解锁保存（`loadedRef`，不等扫描）；**顺序执行（load → prune → scan 链式）避免竞态**——若并行，扫描结果可能被 `loadShortcuts` 的 `setApps` 覆盖丢失
+- **实时同步（v1.8.0）**：主进程 `startDesktopWatch()` 对桌面目录挂 `fs.watch`（非递归——只关心桌面直接子项，文件夹内部文件变化不触发；debounce 1s 聚合）→ `webContents.send('desktop-changed')` → renderer 重新执行「清理缺失 + 扫描合并」（`pruneMissingFolders` + `mergeDesktopScan`，与启动共用同一套逻辑，基线分别为当前列表/已加载列表）。`appsRef` 镜像最新列表供事件回调读取（避免过期闭包）；`desktopSyncBusyRef` 防重入——清理/扫描进行中跳过重复事件（debounce 只聚合 watch 事件，扫描自身耗时可更长）
+- **缺失清理**：`pruneMissingFolders` 收集所有 `isFolder` 条目路径 → `check-folders-missing` IPC（主进程纯 `fs.existsSync`，无 PowerShell）→ 返回不存在子集 → 移出 Dock（随保存 effect 持久化）。系统位置（`shell:` 命令，`specialType` 条目）不参与。权衡：外部硬盘/网络盘未连接时其文件夹条目也会被清理（桌面文件夹重新连接后由扫描恢复，手动添加的需重新添加）
+- 注意：被用户删除的桌面文件夹会从 Dock 移除（实时或下次启动），重新创建同名文件夹后会再次加入（暂无忽略列表——跳过某文件夹需在扫描脚本里加过滤）；桌面路径沿用 `D:\Desktop`（重定向桌面，回退系统桌面）
 
 ## 平台限制
 

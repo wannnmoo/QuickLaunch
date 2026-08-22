@@ -395,8 +395,78 @@ function App(): React.ReactElement {
   // 能靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失。
   const loadedRef = useRef(false)
 
-  // 启动：先加载已保存的快捷方式，加载完成后解锁保存，再扫描桌面文件夹并去重合并。
-  // 顺序执行避免竞态——若并行，扫描结果可能被 loadShortcuts 的 setApps 覆盖丢失。
+  // ─── 桌面文件夹同步：清理缺失 + 扫描合并（启动与实时事件共用）───────────
+
+  // 最新列表镜像 ref：fs.watch 事件回调里避免读到过期闭包里的旧 apps
+  const appsRef = useRef<AppEntry[]>([])
+  useEffect(() => { appsRef.current = apps }, [apps])
+  // 清理/扫描进行中时跳过重复事件（debounce 只聚合了 watch 事件，扫描自身耗时可更长）
+  const desktopSyncBusyRef = useRef(false)
+
+  // 合并扫描结果：新增的桌面文件夹 / 指向文件夹的 .lnk / 「此电脑」「回收站」加入 Dock。
+  // baseline 用于去重（启动时为已加载列表，实时事件时为当前列表）。去重、排序、id 分配
+  // 都在 updater 外完成——StrictMode 双调用 updater 时无副作用；updater 内仍有防御性去重。
+  const mergeDesktopScan = useCallback((baseline: AppEntry[]) => {
+    return window.api.scanDesktopFolders().then((found) => {
+      if (!found || found.length === 0) return
+      const existing = new Set(baseline.map((a) => normPath(a.targetPath)))
+      const fresh = found.filter((f) => !existing.has(normPath(f.path)))
+      if (fresh.length === 0) return
+      // 固定顺序：此电脑 → 回收站 → 文件夹（其余保持扫描顺序）
+      const rank = (f: { specialType?: 'this-pc' | 'recycle-bin' }): number =>
+        f.specialType === 'this-pc' ? 0 : f.specialType === 'recycle-bin' ? 1 : 2
+      fresh.sort((a, b) => rank(a) - rank(b))
+      const entries = fresh.map((f) => ({
+        id: nextId++,
+        iconDataUrl: f.iconDataUrl,
+        targetPath: f.path,
+        arguments: '',
+        workingDirectory: '',
+        description: f.name,
+        // 系统位置（此电脑/回收站）保留 specialType；桌面文件夹标 isFolder
+        ...(f.specialType
+          ? { specialType: f.specialType as 'this-pc' | 'recycle-bin' }
+          : { isFolder: true })
+      }))
+      setApps((prev) => {
+        // 纯合并（无任何副作用）：
+        // - 防御：prev 中已存在的路径不再加入（防止与手动添加/并行合并竞态）
+        const have = new Set(prev.map((a) => normPath(a.targetPath)))
+        const add = entries.filter((e) => !have.has(normPath(e.targetPath)))
+        if (add.length === 0) return prev
+        // - 系统位置区块（此电脑 → 回收站，稳定排序保持相对顺序）+ 新文件夹 + 其余。
+        //   保证 Dock 前部固定为 此电脑 → 回收站 → 文件夹；若用户手动拖动过系统位置，
+        //   本次合并会把它们归位到区块前部（与固定顺序设计一致）
+        const spRank = (e: AppEntry): number => (e.specialType === 'this-pc' ? 0 : 1)
+        const specialBlock = [...prev.filter((a) => a.specialType), ...add.filter((e) => e.specialType)]
+          .sort((a, b) => spRank(a) - spRank(b))
+        const newFolders = add.filter((e) => !e.specialType)
+        const rest = prev.filter((a) => !a.specialType)
+        return [...specialBlock, ...newFolders, ...rest]
+      })
+    }).catch(() => {})
+  }, [])
+
+  // 清理已不存在的文件夹条目：桌面文件夹被删除/移动 → 从 Dock 移除（与扫描合并互补）。
+  // 存在性由主进程纯 fs 检查（无 PowerShell）；系统位置（shell: 命令）不参与。
+  // 注意：外部硬盘/网络盘未连接时其文件夹条目也会被移除（重新连接后桌面文件夹会由扫描恢复）
+  const pruneMissingFolders = useCallback((baseline: AppEntry[]) => {
+    const paths = [...new Set(
+      baseline.filter((a) => a.isFolder && a.targetPath).map((a) => a.targetPath)
+    )]
+    if (paths.length === 0) return Promise.resolve()
+    return window.api.checkMissingFolders(paths).then((missing) => {
+      if (!missing || missing.length === 0) return
+      const gone = new Set(missing)
+      setApps((prev) => {
+        const next = prev.filter((a) => !(a.isFolder && a.targetPath && gone.has(a.targetPath)))
+        return next.length === prev.length ? prev : next
+      })
+    }).catch(() => {})
+  }, [])
+
+  // 启动：先加载已保存的快捷方式，加载完成后解锁保存，再清理缺失文件夹 + 扫描合并。
+  // 顺序（load → prune → scan）链式执行避免竞态——若并行，扫描结果可能被 setApps 覆盖丢失。
   useEffect(() => {
     let cancelled = false
     window.api.loadShortcuts().then((saved) => {
@@ -405,55 +475,44 @@ function App(): React.ReactElement {
         setApps(saved)
         nextId = Math.max(-1, ...saved.map((a) => a.id)) + 1
       }
-      // 加载完成即解锁保存（不等扫描，启动早期用户操作也能正常持久化）
+      // 加载完成即解锁保存（不等同步结束，启动早期用户操作也能正常持久化）
       loadedRef.current = true
-      // 扫描桌面文件夹 / 指向文件夹的 .lnk 快捷方式 + 「此电脑」「回收站」系统位置。
-      // 去重、排序、id 分配都在 updater 外完成——StrictMode 双调用 updater 时无副作用
-      return window.api.scanDesktopFolders().then((found) => {
-        if (cancelled || !found || found.length === 0) return
-        // 以 saved 为基准去重（saved 即当前列表）
-        const existing = new Set((saved || []).map((a) => normPath(a.targetPath)))
-        const fresh = found.filter((f) => !existing.has(normPath(f.path)))
-        if (fresh.length === 0) return
-        // 固定顺序：此电脑 → 回收站 → 文件夹（其余保持扫描顺序）
-        const rank = (f: { specialType?: 'this-pc' | 'recycle-bin' }): number =>
-          f.specialType === 'this-pc' ? 0 : f.specialType === 'recycle-bin' ? 1 : 2
-        fresh.sort((a, b) => rank(a) - rank(b))
-        const entries = fresh.map((f) => ({
-          id: nextId++,
-          iconDataUrl: f.iconDataUrl,
-          targetPath: f.path,
-          arguments: '',
-          workingDirectory: '',
-          description: f.name,
-          // 系统位置（此电脑/回收站）保留 specialType；桌面文件夹标 isFolder
-          ...(f.specialType
-            ? { specialType: f.specialType as 'this-pc' | 'recycle-bin' }
-            : { isFolder: true })
-        }))
-        setApps((prev) => {
-          // 纯合并（无任何副作用）：
-          // - 防御：prev 中已存在的路径不再加入（防止与启动早期用户手动添加竞态）
-          const have = new Set(prev.map((a) => normPath(a.targetPath)))
-          const add = entries.filter((e) => !have.has(normPath(e.targetPath)))
-          if (add.length === 0) return prev
-          // - 系统位置区块（此电脑 → 回收站，稳定排序保持相对顺序）+ 新文件夹 + 其余。
-          //   保证 Dock 前部固定为 此电脑 → 回收站 → 文件夹；若用户手动拖动过系统位置，
-          //   本次合并会把它们归位到区块前部（与固定顺序设计一致）
-          const spRank = (e: AppEntry): number => (e.specialType === 'this-pc' ? 0 : 1)
-          const specialBlock = [...prev.filter((a) => a.specialType), ...add.filter((e) => e.specialType)]
-            .sort((a, b) => spRank(a) - spRank(b))
-          const newFolders = add.filter((e) => !e.specialType)
-          const rest = prev.filter((a) => !a.specialType)
-          return [...specialBlock, ...newFolders, ...rest]
-        })
-      }).catch(() => {})
+      desktopSyncBusyRef.current = true
+      const sync = async () => {
+        try {
+          await pruneMissingFolders(saved || [])
+          if (cancelled) return
+          await mergeDesktopScan(saved || [])
+        } finally {
+          desktopSyncBusyRef.current = false
+        }
+      }
+      sync()
     }).catch(() => {
       // 加载失败也解锁保存（不阻塞后续持久化）
       if (!cancelled) loadedRef.current = true
     })
     return () => { cancelled = true }
-  }, [])
+  }, [pruneMissingFolders, mergeDesktopScan])
+
+  // 实时同步：主进程 fs.watch 桌面目录（debounce 1s）→ 重新「清理缺失 + 扫描合并」。
+  // 桌面新增文件夹即时入 Dock、删除即时移除；清理/扫描进行中跳过重复事件。
+  useEffect(() => {
+    const unsubscribe = window.api.onDesktopChanged(() => {
+      if (desktopSyncBusyRef.current) return
+      desktopSyncBusyRef.current = true
+      const sync = async () => {
+        try {
+          await pruneMissingFolders(appsRef.current)
+          await mergeDesktopScan(appsRef.current)
+        } finally {
+          desktopSyncBusyRef.current = false
+        }
+      }
+      sync()
+    })
+    return unsubscribe
+  }, [pruneMissingFolders, mergeDesktopScan])
 
   useEffect(() => {
     // 初始加载完成前不保存（见 loadedRef 注释：防止挂载时 save([]) 清空磁盘数据）

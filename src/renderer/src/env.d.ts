@@ -17,6 +17,8 @@ interface Window {
     saveShortcuts: (data: { id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin' }[]) => Promise<void>
     selectFolder: () => Promise<{ path: string; name: string; iconDataUrl: string }[]>
     scanDesktopFolders: () => Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]>
+    checkMissingFolders: (paths: string[]) => Promise<string[]>
+    onDesktopChanged: (callback: () => void) => () => void
     getDesktopIconsHidden: () => Promise<boolean>
     toggleDesktopIcons: () => Promise<boolean>
     getAutoStart: () => Promise<boolean>
