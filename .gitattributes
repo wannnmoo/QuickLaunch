@@ -1,0 +1,7 @@
+# 规范化行尾：Windows 下提交时不产生 LF/CRLF 混用警告
+* text=auto
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.md text eol=lf
