@@ -1,7 +1,7 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename } from 'path'
 import { readFileSync, writeFileSync, existsSync, statSync, watch, type FSWatcher } from 'fs'
-import { execFile } from 'child_process'
+import { execFile, exec } from 'child_process'
 
 
 let mainWindow: BrowserWindow | null = null
@@ -225,18 +225,19 @@ if (-not $iconBase64) {
   }
 }
 
-# Extract display name
+# Extract display name —— 优先级：快捷方式自身描述 → 目标 exe 版本信息 → 快捷方式文件名 → 目标文件名。
+# 描述放最前：wscript.exe 这类脚本宿主没有有意义的 FileDescription（会显示成 "Windows Script Host"），
+# 而快捷方式自带的描述（如 "DeepSeek Harness"）才是用户在 Explorer 里看到的名称
 $displayName = ''
-if (-not $isUrl -and $targetPath -and (Test-Path $targetPath)) {
+if (-not $displayName) { $displayName = $s.Description }
+if (-not $displayName -and -not $isUrl -and $targetPath -and (Test-Path $targetPath)) {
   try { $displayName = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($targetPath).FileDescription } catch {}
 }
-if (-not $displayName) { $displayName = $s.Description }
 if (-not $displayName) {
-  if ($isUrl) {
-    $displayName = [System.IO.Path]::GetFileNameWithoutExtension('${filePath.replace(/'/g, "''")}')
-  } else {
-    $displayName = [System.IO.Path]::GetFileNameWithoutExtension($targetPath)
-  }
+  $displayName = [System.IO.Path]::GetFileNameWithoutExtension('${filePath.replace(/'/g, "''")}')
+}
+if (-not $displayName -and -not $isUrl -and $targetPath) {
+  $displayName = [System.IO.Path]::GetFileNameWithoutExtension($targetPath)
 }
 
 @{
@@ -302,6 +303,28 @@ ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
 // ─── IPC: persist shortcuts ─────────────────────────────────────────────────
 
 const shortcutsPath = join(app.getPath('userData'), 'shortcuts.json')
+
+// ─── 窗口位置持久化（多显示器支持）───────────────────────────────────────
+
+const layoutPath = join(app.getPath('userData'), 'window-position.json')
+
+/** 读取上次保存的窗口位置；坐标需落在某个显示器工作区内（显示器移除/分辨率变化时丢弃） */
+function readWindowPosition(): { x: number; y: number } | null {
+  try {
+    const raw = JSON.parse(readFileSync(layoutPath, 'utf-8'))
+    if (typeof raw.x === 'number' && typeof raw.y === 'number') {
+      const valid = screen.getAllDisplays().some((d) => {
+        const wa = d.workArea
+        return (
+          raw.x >= wa.x - 40 && raw.x < wa.x + wa.width - 40 &&
+          raw.y >= wa.y - 40 && raw.y < wa.y + wa.height - 40
+        )
+      })
+      if (valid) return { x: raw.x, y: raw.y }
+    }
+  } catch {}
+  return null
+}
 
 ipcMain.handle('load-shortcuts', () => {
   try {
@@ -590,6 +613,27 @@ const startedAtLogin = process.argv.includes('--autostart')
 
 // ─── IPC: launch an executable, URL, shell location, or open a folder ───────
 
+// 拆分启动参数：逐字符解析（引号内空格不算分隔，引号本身剥离）——行为贴近
+// CommandLineToArgvW。.lnk 的 Arguments 常常带引号（如 "E:\DSH\start-dsh.vbs"），
+// 原样的 split(' ') 会把字面引号传给目标（wscript 收到 "\"路径\"" 导致
+// "Windows Script Host 执行失败"）；同时支持含空格的带引号参数。
+function splitArgs(input: string): string[] {
+  const result: string[] = []
+  let cur = ''
+  let inQuotes = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (ch === '"') { inQuotes = !inQuotes; continue }
+    if (ch === ' ' && !inQuotes) {
+      if (cur) { result.push(cur); cur = '' }
+      continue
+    }
+    cur += ch
+  }
+  if (cur) result.push(cur)
+  return result
+}
+
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
@@ -624,7 +668,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   }
 
   // Executable
-  execFile(targetPath, args ? args.split(' ') : [], { cwd: workingDir || undefined }, (err) => {
+  execFile(targetPath, args ? splitArgs(args) : [], { cwd: workingDir || undefined }, (err) => {
     if (!err) return
     // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
     // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
@@ -639,6 +683,75 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     console.error('Failed to launch:', err)
   })
   return true
+})
+
+// ─── IPC: 右键菜单扩展（编辑图标 / 管理员运行 / 打开位置 / 复制路径） ───────
+
+// 为条目更换图标：选择 exe/dll/ico → SHDefExtractIcon 提取；png/jpg 直接读文件转 dataURL
+ipcMain.handle('pick-icon', async () => {
+  dialogOpen = true
+  mainWindow?.setAlwaysOnTop(true)
+  mainWindow?.moveTop()
+  let result: Electron.OpenDialogReturnValue
+  try {
+    result = await dialog.showOpenDialog(mainWindow!, {
+      title: '选择图标（exe / dll / ico / png）',
+      defaultPath: DEFAULT_DIALOG_PATH,
+      filters: [{ name: '图标文件', extensions: ['exe', 'dll', 'ico', 'png', 'jpg'] }],
+      properties: ['openFile']
+    })
+  } finally {
+    dialogOpen = false
+  }
+  const file = result.canceled ? '' : result.filePaths[0]
+  if (!file) return null
+  if (/\.(png|jpe?g)$/i.test(file)) {
+    try {
+      const b64 = readFileSync(file).toString('base64')
+      const mime = /\.png$/i.test(file) ? 'image/png' : 'image/jpeg'
+      return { path: file, iconDataUrl: `data:${mime};base64,${b64}` }
+    } catch { return null }
+  }
+  const iconDataUrl = await extractIcon(file, 0, 256)
+  return iconDataUrl ? { path: file, iconDataUrl } : null
+})
+
+// 以管理员身份运行（Start-Process -Verb RunAs → UAC 提权，与资源管理器「以管理员身份运行」一致）
+ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir: string) => {
+  if (!targetPath) return false
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    dockTrayHidden = true
+    mainWindow.hide()
+  }
+  const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Start-Process -FilePath '${targetPath.replace(/'/g, "''")}' -ArgumentList '${(args || '').replace(/'/g, "''")}' -WorkingDirectory '${(workingDir || '').replace(/'/g, "''")}' -Verb RunAs`
+  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 10000 }, (err) => {
+    if (err) console.error('[launcher] run-as-admin failed:', err.message)
+  })
+  return true
+})
+
+// 在资源管理器中定位目标（文件夹在父目录中选中该文件夹；文件直接选中）
+ipcMain.handle('open-file-location', (_e, targetPath: string) => {
+  if (!targetPath || targetPath.startsWith('shell:') || targetPath.startsWith('::')) return
+  try {
+    // explorer 的参数解析很挑剔：execFile 自动转义内嵌引号（\"）后 /select 会被
+    // Explorer 忽略并回退到默认位置（文档）。必须用 exec 传原始命令行
+    // （cmd 原样透传双引号）——与资源管理器地址栏手动输入完全一致。
+    exec(`explorer.exe /select,"${targetPath}"`, (err) => {
+      // explorer 成功打开窗口后也常以非零退出码结束（交接给已运行的实例），
+      // 只有 spawn 类失败（err.code 为字符串）才值得记录
+      if (err && typeof err.code === 'string') {
+        console.error('[launcher] open-file-location failed:', err.message)
+      }
+    })
+  } catch {}
+})
+
+// 复制文本到剪贴板（复制路径）
+ipcMain.handle('copy-text', (_e, text: unknown) => {
+  if (typeof text === 'string' && text) clipboard.writeText(text)
 })
 
 // ─── Window & tray ──────────────────────────────────────────────────────────
@@ -699,11 +812,19 @@ function createWindow(): void {
   const winW = Math.min(Math.round(screenW * 0.85), 1200)
   const winH = 300
 
+  // 多显示器支持：优先恢复上次拖拽到的位置（坐标需落在某显示器工作区内，
+  // 否则丢弃——显示器移除/分辨率变化后不至于跑到屏幕外），否则主屏居中
+  const savedPos = readWindowPosition()
+  const pos = savedPos ?? {
+    x: Math.round((screenW - winW) / 2),
+    y: Math.round((screenH - winH) / 2)
+  }
+
   mainWindow = new BrowserWindow({
     width: winW,
     height: winH,
-    x: Math.round((screenW - winW) / 2),
-    y: Math.round((screenH - winH) / 2),
+    x: pos.x,
+    y: pos.y,
     show: false,
     frame: false,
     transparent: true,
@@ -715,6 +836,21 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false
     }
+  })
+
+  // 拖拽移动 Dock 后记住位置（debounce 500ms 避免拖动过程高频写盘）
+  let posTimer: ReturnType<typeof setTimeout> | null = null
+  mainWindow.on('moved', () => {
+    if (posTimer) clearTimeout(posTimer)
+    posTimer = setTimeout(() => {
+      posTimer = null
+      try {
+        const b = mainWindow?.getBounds()
+        if (!b) return
+        const d = screen.getDisplayMatching(b)
+        writeFileSync(layoutPath, JSON.stringify({ x: b.x, y: b.y, displayId: d.id }), 'utf-8')
+      } catch {}
+    }, 500)
   })
 
   mainWindow.on('ready-to-show', () => {

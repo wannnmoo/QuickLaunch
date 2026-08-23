@@ -22,16 +22,21 @@ function App(): React.ReactElement {
   // 菜单渲染在 Dock 滚动容器之外（fixed 定位），否则会被滚动容器的 overflow 裁剪。
   const [menuPos, setMenuPos] = useState<{ cx: number; top: number } | null>(null)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; appId: number } | null>(null)
+  // 右键菜单编辑模式：editingId 非 null 时菜单切换为编辑表单（名称/参数/工作目录/图标）
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editFields, setEditFields] = useState({ description: '', arguments: '', workingDirectory: '' })
+  const [editIconUrl, setEditIconUrl] = useState('')
   // 横向滚动边界状态：true 表示该侧还有图标未显示，用于显示渐隐提示
   const [scrollState, setScrollState] = useState({ left: false, right: false })
   // 桌面图标当前是否隐藏（决定菜单项文案「隐藏/显示桌面图标」）
   const [desktopIconsHidden, setDesktopIconsHidden] = useState(false)
   // 开机自启动是否开启（注册表 Run 登录项，菜单打开时从主进程读取）
   const [autoStart, setAutoStart] = useState(false)
-  // 白天/黑夜主题：默认黑夜，偏好持久化到 localStorage（跟随 Electron 用户数据目录）
-  const [theme, setTheme] = useState<'dark' | 'light'>(() =>
-    localStorage.getItem('ql-theme') === 'light' ? 'light' : 'dark'
-  )
+  // 主题：黑夜（默认）/ 白天 / 透明（背景全透明，仅图标悬浮桌面），偏好持久化到 localStorage
+  const [theme, setTheme] = useState<'dark' | 'light' | 'transparent'>(() => {
+    const saved = localStorage.getItem('ql-theme')
+    return saved === 'light' || saved === 'transparent' ? saved : 'dark'
+  })
 
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
@@ -298,9 +303,9 @@ function App(): React.ReactElement {
       })
   }
 
-  // 切换白天/黑夜主题（偏好持久化到 localStorage）
+  // 切换主题（黑夜 → 白天 → 透明 → 黑夜 循环，偏好持久化到 localStorage）
   const toggleTheme = () => {
-    const next = theme === 'dark' ? 'light' : 'dark'
+    const next = theme === 'dark' ? 'light' : theme === 'light' ? 'transparent' : 'dark'
     localStorage.setItem('ql-theme', next)
     setTheme(next)
     setMenuPos(null)
@@ -379,12 +384,75 @@ function App(): React.ReactElement {
 
   const handleContextMenu = (e: React.MouseEvent, id: number) => {
     e.preventDefault()
+    setEditingId(null)
     setContextMenu({ x: e.clientX, y: e.clientY, appId: id })
   }
+
+  // 打开编辑表单：填入当前条目字段（名称/参数/工作目录/图标）
+  const handleEdit = (app: AppEntry) => {
+    setEditFields({
+      description: app.description,
+      arguments: app.arguments,
+      workingDirectory: app.workingDirectory
+    })
+    setEditIconUrl(app.iconDataUrl)
+    setEditingId(app.id)
+  }
+
+  // 更换图标：系统对话框选择 exe/dll/ico/png → 主进程提取图标 → 表单内预览
+  const handlePickIcon = async () => {
+    try {
+      const picked = await window.api.pickIcon()
+      if (picked && picked.iconDataUrl) setEditIconUrl(picked.iconDataUrl)
+    } catch { /* ignore */ }
+  }
+
+  const handleSaveEdit = () => {
+    if (editingId === null) return
+    const id = editingId
+    setApps((prev) => prev.map((a) =>
+      a.id === id
+        ? {
+            ...a,
+            description: editFields.description.trim() || a.description,
+            arguments: editFields.arguments,
+            workingDirectory: editFields.workingDirectory,
+            iconDataUrl: editIconUrl || a.iconDataUrl
+          }
+        : a
+    ))
+    setEditingId(null)
+    setContextMenu(null)
+  }
+
+  const handleCancelEdit = () => setEditingId(null)
 
   const handleDelete = (id: number) => {
     setContextMenu(null)
     setApps((prev) => prev.filter((a) => a.id !== id))
+  }
+
+  // 右键菜单（非编辑态）动作可见性判断
+  const isUrlTarget = (p: string): boolean => /^(https?|ftp|steam):\/\/|^mailto:/i.test(p)
+  const isFileSystemPath = (app: AppEntry): boolean =>
+    !!app.targetPath &&
+    !app.targetPath.startsWith('shell:') &&
+    !app.targetPath.startsWith('::') &&
+    !isUrlTarget(app.targetPath)
+
+  const handleRunAdmin = (app: AppEntry) => {
+    setContextMenu(null)
+    window.api.runAsAdmin(app.targetPath, app.arguments, app.workingDirectory)
+  }
+
+  const handleOpenLocation = (app: AppEntry) => {
+    setContextMenu(null)
+    window.api.openFileLocation(app.targetPath)
+  }
+
+  const handleCopyPath = (app: AppEntry) => {
+    setContextMenu(null)
+    window.api.copyText(app.targetPath)
   }
 
   // ─── Persistence ──────────────────────────────────────────────────────
@@ -533,9 +601,12 @@ function App(): React.ReactElement {
     return cls
   }
 
+  // 右键菜单对应的条目（编辑表单与菜单动作共用）
+  const ctxApp = contextMenu ? apps.find((a) => a.id === contextMenu.appId) : undefined
+
   return (
     <div
-      className={theme === 'light' ? 'app theme-light' : 'app'}
+      className={theme === 'light' ? 'app theme-light' : theme === 'transparent' ? 'app theme-transparent' : 'app'}
       onMouseEnter={() => window.api.dockPointer(true)}
     >
       <div
@@ -632,7 +703,7 @@ function App(): React.ReactElement {
           </button>
           <div className="dropdown-divider" />
           <button className="dropdown-item" onClick={toggleTheme}>
-            {theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'}
+            {theme === 'dark' ? '切换到白天模式' : theme === 'light' ? '切换到透明风格' : '切换到黑夜模式'}
           </button>
         </div>
       )}
@@ -644,12 +715,70 @@ function App(): React.ReactElement {
           style={{
             // 同样钳制在窗口内，防止右缘被裁掉圆角
             left: Math.min(Math.max(contextMenu.x + 4, 60), window.innerWidth - 60),
-            top: contextMenu.y - 8
+            // 参考「+」按钮下拉菜单：向上弹出（bottom 对齐光标上方 8px）——
+            // 300px 窗口内 Dock 在底部，向下弹会被窗口下边界裁掉
+            bottom: window.innerHeight - contextMenu.y + 8,
+            // 菜单不超过光标上方空间，超出时内部滚动
+            maxHeight: contextMenu.y - 8
           }}
         >
-          <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId)}>
-            删除
-          </button>
+          {editingId === contextMenu.appId && ctxApp ? (
+            <>
+              <div className="edit-fields">
+                <label className="edit-label">
+                  名称
+                  <input
+                    className="edit-input"
+                    value={editFields.description}
+                    onChange={(e) => setEditFields({ ...editFields, description: e.target.value })}
+                    placeholder={ctxApp.description || '名称'}
+                  />
+                </label>
+                <label className="edit-label">
+                  参数
+                  <input
+                    className="edit-input"
+                    value={editFields.arguments}
+                    onChange={(e) => setEditFields({ ...editFields, arguments: e.target.value })}
+                    placeholder="启动参数（可留空）"
+                  />
+                </label>
+                <label className="edit-label">
+                  工作目录
+                  <input
+                    className="edit-input"
+                    value={editFields.workingDirectory}
+                    onChange={(e) => setEditFields({ ...editFields, workingDirectory: e.target.value })}
+                    placeholder="工作目录（可留空）"
+                  />
+                </label>
+              </div>
+              <div className="edit-actions">
+                <button className="context-menu-item edit-action" onClick={handlePickIcon}>更换图标</button>
+                <button className="context-menu-item edit-action" onClick={handleSaveEdit}>保存</button>
+                <button className="context-menu-item edit-action" onClick={handleCancelEdit}>取消</button>
+              </div>
+            </>
+          ) : (
+            <>
+              {ctxApp && (
+                <>
+                  <button className="context-menu-item" onClick={() => handleEdit(ctxApp)}>编辑</button>
+                  {isFileSystemPath(ctxApp) && (
+                    <button className="context-menu-item" onClick={() => handleOpenLocation(ctxApp)}>打开文件位置</button>
+                  )}
+                  {!ctxApp.isFolder && !ctxApp.specialType && isFileSystemPath(ctxApp) && (
+                    <button className="context-menu-item" onClick={() => handleRunAdmin(ctxApp)}>以管理员身份运行</button>
+                  )}
+                  {ctxApp.targetPath && (
+                    <button className="context-menu-item" onClick={() => handleCopyPath(ctxApp)}>复制路径</button>
+                  )}
+                  <div className="context-menu-divider" />
+                </>
+              )}
+              <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId)}>删除</button>
+            </>
+          )}
         </div>
       )}
     </div>

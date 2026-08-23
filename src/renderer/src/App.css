@@ -53,8 +53,10 @@ html, body {
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
   --add-btn-color: rgba(255, 255, 255, 0.25);
   --add-btn-hover-color: rgba(255, 255, 255, 0.7);
-  --menu-bg: rgba(22, 27, 40, 0.92);
-  --menu-border: rgba(255, 255, 255, 0.1);
+  /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度），
+     仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层 */
+  --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
+  --menu-border: rgba(255, 255, 255, 0.12);
   --menu-text: #c0c0d0;
   --menu-hover-bg: rgba(58, 123, 213, 0.35);
   --menu-hover-text: #fff;
@@ -83,8 +85,9 @@ html, body {
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.04) 100%);
   --add-btn-color: rgba(0, 0, 0, 0.4);
   --add-btn-hover-color: rgba(0, 0, 0, 0.75);
-  --menu-bg: rgba(255, 255, 255, 0.92);
-  --menu-border: rgba(0, 0, 0, 0.1);
+  /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
+  --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
+  --menu-border: rgba(0, 0, 0, 0.12);
   --menu-text: #333;
   --menu-hover-bg: rgba(58, 123, 213, 0.22);
   --menu-hover-text: #1659b0;
@@ -116,10 +119,10 @@ html, body {
   bottom: 0; /* 图标底下方留 8px（图标底 131，dock 底 139） */
   z-index: 0;
   background: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
-  backdrop-filter: blur(32px) saturate(1.6);
-  -webkit-backdrop-filter: blur(32px) saturate(1.6);
+  backdrop-filter: blur(36px) saturate(1.7);
+  -webkit-backdrop-filter: blur(36px) saturate(1.7);
   border: 1px solid var(--dock-border);
-  border-radius: 22px;
+  border-radius: 24px;
   box-shadow: var(--dock-shadow);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
@@ -186,6 +189,7 @@ html, body {
   align-items: center;
   gap: 5px;
   cursor: pointer;
+  /* 放大缓动：标准 ease（果冻曲线/按压反馈/入场动画实测手感不佳，已全部回退） */
   transition: transform 0.12s cubic-bezier(0.25, 0.1, 0.25, 1);
   will-change: transform;
   transform-origin: center bottom; /* 放大从底部升起，贴合 macOS Dock */
@@ -199,7 +203,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 16px;
+  border-radius: 18px;
   background: var(--icon-wrap-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   transition: background 0.2s, box-shadow 0.2s;
@@ -215,7 +219,7 @@ html, body {
 .dock-icon {
   width: 44px;
   height: 44px;
-  border-radius: 10px;
+  border-radius: 12px;
   pointer-events: none;
   image-rendering: auto;
   filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35));
@@ -223,6 +227,8 @@ html, body {
 
 .dock-label {
   font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
   color: var(--label-color);
   white-space: nowrap;
   max-width: 72px;
@@ -230,7 +236,7 @@ html, body {
   text-overflow: ellipsis;
   text-align: center;
   pointer-events: none;
-  text-shadow: var(--label-shadow);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 8px rgba(0, 0, 0, 0.2);
   transition: color 0.2s;
 }
 
@@ -309,8 +315,11 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  width: 100%;
-  padding: 7px 16px;
+  /* 胶囊悬停：两侧留 8px 边距 + 圆角，悬浮高亮更现代 */
+  width: calc(100% - 16px);
+  margin: 0 8px;
+  border-radius: 10px;
+  padding: 7px 12px;
   font-size: 0.84rem;
   color: var(--menu-text);
   background: none;
@@ -399,13 +408,17 @@ html, body {
   z-index: 200;
   box-shadow: var(--menu-shadow);
   overflow: hidden;
+  overflow-y: auto; /* 向上弹出 + maxHeight 钳制：空间不足时内部滚动（与下拉菜单一致） */
   animation: context-in 0.14s ease-out;
 }
 
 .context-menu-item {
   display: block;
-  width: 100%;
-  padding: 9px 20px;
+  /* 胶囊悬停：与下拉菜单项一致的边距 + 圆角 */
+  width: calc(100% - 16px);
+  margin: 0 8px;
+  border-radius: 10px;
+  padding: 9px 12px;
   font-size: 0.85rem;
   color: var(--menu-text);
   background: none;
@@ -420,6 +433,63 @@ html, body {
 .context-menu-item:hover {
   background: var(--context-hover-bg);
   color: var(--menu-hover-text);
+}
+
+/* ─── 右键菜单编辑表单（名称/参数/工作目录/更换图标） ────────────────── */
+
+.edit-fields {
+  padding: 8px 10px 4px;
+}
+
+.edit-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+  font-size: 0.72rem;
+  color: var(--menu-text);
+  opacity: 0.85;
+  text-align: left;
+}
+
+.edit-input {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 0.8rem;
+  color: var(--menu-text);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--menu-border);
+  border-radius: 8px;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.app.theme-light .edit-input {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.edit-input:focus {
+  border-color: #3a7bd5;
+}
+
+.edit-actions {
+  display: flex;
+  gap: 4px;
+  padding: 4px 10px 8px;
+}
+
+.edit-action {
+  flex: 1;
+  text-align: center;
+  padding: 7px 8px;
+  font-size: 0.8rem;
+}
+
+.context-menu-divider {
+  height: 1px;
+  margin: 6px 12px;
+  background: var(--divider-bg);
 }
 
 /* ─── 菜单入场动画 ────────────────────────────────────────────────────── */
@@ -445,4 +515,67 @@ html, body {
     opacity: 1;
     transform: scale(1);
   }
+}
+
+/* ─── 透明风格主题（theme-transparent）───────────────────────────────── */
+/* 背景完全透明：毛玻璃层/边框/阴影/两端渐隐全部不渲染，图标直接悬浮桌面。
+   图标底衬与标签继承黑夜主题配色（白色 + 深阴影），在任意壁纸上保持可读。
+   落在文件末尾：与 .dock:hover .dock-bg 同等优先级时靠后胜出，覆盖边框高亮。 */
+
+.app.theme-transparent {
+  --icon-wrap-bg: transparent;
+  --icon-wrap-hover-bg: rgba(255, 255, 255, 0.12);
+  --add-btn-color: rgba(255, 255, 255, 0.55);
+  --add-btn-hover-color: #fff;
+  /* 两端渐隐遮罩在透明背景上没有可渐隐的底，直接隐藏（滚动仍可用） */
+  --dock-edge: transparent;
+}
+
+.app.theme-transparent .dock-bg {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.app.theme-transparent .dock-icon-wrap {
+  background: var(--icon-wrap-bg);
+  box-shadow: none;
+}
+
+/* 悬停图标时给轻微底衬 + 外阴影，增强「可点击」的可感知性 */
+.app.theme-transparent .dock-item:hover .dock-icon-wrap {
+  background: var(--icon-wrap-hover-bg);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+
+.app.theme-transparent .dock-icon {
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.45));
+}
+
+.app.theme-transparent .dock-add-btn,
+.app.theme-transparent .dock-add-btn:hover {
+  background: transparent !important;
+}
+
+/* 添加按钮在白底壁纸上不可见时，用阴影与图标区分 */
+.app.theme-transparent .dock-add-btn svg {
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+}
+
+/* 菜单与软件背景同步：透明风格下菜单同样全透明（无毛玻璃/边框，
+   仅保留悬浮投影 + 文字投影保证任意壁纸下的可读性） */
+.app.theme-transparent .dropdown-menu,
+.app.theme-transparent .context-menu {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-color: transparent;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.app.theme-transparent .dropdown-item,
+.app.theme-transparent .context-menu-item {
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
 }

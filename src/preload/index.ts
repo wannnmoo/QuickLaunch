@@ -31,6 +31,18 @@ const api = {
   /** Launch an executable with optional args and working directory. */
   runApp: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
     ipcRenderer.invoke('run-app', targetPath, args, workingDir),
+  /** 为条目更换图标：选择 exe/dll/ico/png 并提取图标，返回 { path, iconDataUrl } 或 null（取消）。 */
+  pickIcon: (): Promise<{ path: string; iconDataUrl: string } | null> =>
+    ipcRenderer.invoke('pick-icon'),
+  /** 以管理员身份运行目标（Start-Process -Verb RunAs → UAC 提权）。 */
+  runAsAdmin: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
+    ipcRenderer.invoke('run-as-admin', targetPath, args, workingDir),
+  /** 在资源管理器中定位目标文件/文件夹。 */
+  openFileLocation: (targetPath: string): Promise<void> =>
+    ipcRenderer.invoke('open-file-location', targetPath),
+  /** 复制文本到剪贴板（如条目路径）。 */
+  copyText: (text: string): Promise<void> =>
+    ipcRenderer.invoke('copy-text', text),
   /** Load persisted shortcuts from disk. */
   loadShortcuts: (): Promise<AppEntry[]> =>
     ipcRenderer.invoke('load-shortcuts'),

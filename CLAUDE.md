@@ -49,6 +49,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
 - Dock 栏在窗口底部。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中，上下各 8px），`blur(32px) saturate(1.6)` 圆角阴影
 - Dock 空白区域可拖拽移动窗口（`-webkit-app-region: drag`）
+- **多显示器 + 位置记忆**：`moved` 事件（debounce 500ms）把窗口坐标写入 `{userData}/window-position.json`（含 displayId）；`createWindow` 启动时读取，坐标需落在某显示器工作区内（`readWindowPosition()` 校验，显示器移除/分辨率变化时回退主屏居中）
 - 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，最大放大 1.4×，上浮 8px，影响半径 140px）。放大图标从背景顶部**透明区顶出**（类似 macOS）——`.dock-inner` 顶部有 44px 透明 padding 作为放大显示区，否则 `overflow` 会把放大溢出裁掉
 - 图标放不下时**横向滚动**：`.dock-inner` 是滚动容器（`overflow-x: auto`，隐藏滚动条），滚轮/触控板转水平滚动（`handleDockWheel`）；两端 `dock-edge` 渐隐遮罩提示「还有更多」，仅可滚动侧显示（`scrollState`）
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）
@@ -91,6 +92,10 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `get-auto-start` | Renderer → Main | 读取开机自启动是否开启（`getLoginItemSettings`，传与 set 相同的 path/args 匹配注册表项） |
 | `set-auto-start` | Renderer → Main | 开启/关闭开机自启动（`setLoginItemSettings` 写 `HKCU\...\Run`），返回切换后实际状态 |
 | `dock-pointer` | Renderer → Main | 通知主进程鼠标进入 Dock 窗口恢复置顶（`inside=true`；离开不再沉底——沉底仅由点击其他软件 `blur` 触发）。用 `ipcRenderer.send` 单向，非 invoke；高频进出不阻塞 renderer |
+| `pick-icon` | Renderer → Main | 为条目更换图标：系统对话框选 exe/dll/ico（`SHDefExtractIcon` 提取）或 png/jpg（直接读文件转 dataURL），返回 `{path, iconDataUrl}` 或 null |
+| `run-as-admin` | Renderer → Main | 以管理员身份运行：PowerShell `Start-Process -Verb RunAs`（UAC 提权，保留参数/工作目录）；启动后 Dock 隐藏到托盘 |
+| `open-file-location` | Renderer → Main | 在资源管理器中定位目标：`explorer /select,"path"`（整段单参数，支持空格路径）；`shell:`/URL 忽略 |
+| `copy-text` | Renderer → Main | 复制文本到剪贴板（`clipboard.writeText`，用于「复制路径」） |
 
 ### React UI
 
@@ -104,9 +109,9 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **开机自启动开关**：菜单打开时 `getAutoStart()` 读取注册表状态决定开关开/关（`.item-switch`），点击 `setAutoStart()` 乐观更新（先切开关，IPC 返回后校正，**不关闭菜单**）；写注册表 `HKCU\...\Run` 登录项
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
-- **白天/黑夜主题**：`theme` state（`'dark' | 'light'`），根元素加 `theme-light` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）
+- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，三态循环切换），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。**菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步透明**（背景/毛玻璃/边框置空，保留悬浮投影 + 菜单项文字投影保证可读），标签/菜单沿用黑夜主题配色（白色标签 + 深阴影，任意壁纸可读）；添加按钮 svg 加 drop-shadow 防白底壁纸不可见
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
-- **右键菜单**：自定义右键菜单（删除选项），fixed 定位在光标右侧
+- **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/删除），fixed 定位在光标右侧、**向上弹出**（`bottom: innerHeight - y + 8` + `maxHeight: y - 8` + `overflow-y: auto`，与「+」下拉菜单一致——300px 窗口内 Dock 在底部，向下弹会被窗口下边界裁掉）。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
 - **放大效果**：`handleDockMouseMove` 计算鼠标到每个图标的距离，< 140px 时缩放 + 上浮（拖拽时暂停）
 - **持久化**：`apps` 变化时 `useEffect` 自动保存，启动时 `useEffect` 自动恢复
@@ -201,7 +206,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - `webPreferences.sandbox: false`：preload 依赖 `process.contextIsolated` 分支和 `@electron-toolkit/preload`，改成 `true` 会破坏 contextBridge
 - 关闭 → 隐藏托盘通过 `forceQuit` 标志区分：普通关闭 `preventDefault()` + `hide()`；托盘「退出」置 `forceQuit=true` 后 `app.quit()`。新增退出路径需同步设置该标志
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
-- `run-app` 用 `execFile(targetPath, args.split(' '))` 按空格拆分参数，不支持含空格的参数——已知限制
+- `run-app` 用 `execFile(targetPath, splitArgs(args))` 拆分参数——`splitArgs` 按空格切分但把双引号包裹段作为整体并剥引号（.lnk 的 Arguments 常带引号，如 `"E:\DSH\start-dsh.vbs"`；原样拆分会把字面引号传给 wscript 等宿主导致「Windows Script Host 执行失败」，顺带支持含空格的带引号参数）；含空格且无引号的参数仍不支持——已知限制
 - `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.7.1`，每次发布需手动更新）
