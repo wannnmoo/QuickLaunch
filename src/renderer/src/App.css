@@ -48,7 +48,7 @@ html, body {
   --dock-edge: rgba(18, 22, 34, 0.75);
   --label-color: rgba(255, 255, 255, 0.62);
   --label-color-hover: #fff;
-  --label-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  --label-pill-bg: rgba(12, 16, 28, 0.55); /* 黑夜：深藏青药丸衬底（悬停显示标签） */
   --icon-wrap-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.03) 100%);
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
   --add-btn-color: rgba(255, 255, 255, 0.25);
@@ -57,6 +57,11 @@ html, body {
      仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层 */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(255, 255, 255, 0.12);
+  /* 主题嵌套选择器配色（黑夜） */
+  --nt-ink: rgba(255, 255, 255, 0.9);
+  --nt-ink-on: #1f2430;
+  --nt-shell: rgba(255, 255, 255, 0.08);
+  --nt-sub-bg: rgba(30, 36, 52, 0.85);
   --menu-text: #c0c0d0;
   --menu-hover-bg: rgba(58, 123, 213, 0.35);
   --menu-hover-text: #fff;
@@ -64,6 +69,9 @@ html, body {
   --divider-bg: rgba(255, 255, 255, 0.1);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
   --switch-off-bg: rgba(255, 255, 255, 0.22);
+  /* 开机自启动开关配色（与分段选择器强调色统一） */
+  --switch-on-bg: rgba(255, 255, 255, 0.9);
+  --switch-on-knob: #1f2430;
 }
 
 .app.theme-light {
@@ -80,7 +88,7 @@ html, body {
   --dock-edge: rgba(238, 241, 247, 0.88);
   --label-color: rgba(0, 0, 0, 0.6);
   --label-color-hover: #111;
-  --label-shadow: 0 1px 2px rgba(255, 255, 255, 0.7);
+  --label-pill-bg: rgba(255, 255, 255, 0.75); /* 白天：浅白玻璃药丸衬底（悬停显示标签，深色文字） */
   --icon-wrap-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.05) 0%, rgba(0, 0, 0, 0.02) 100%);
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.04) 100%);
   --add-btn-color: rgba(0, 0, 0, 0.4);
@@ -88,6 +96,11 @@ html, body {
   /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(0, 0, 0, 0.12);
+  /* 主题嵌套选择器配色（白天） */
+  --nt-ink: #1f2430;
+  --nt-ink-on: #fff;
+  --nt-shell: rgba(0, 0, 0, 0.07);
+  --nt-sub-bg: #fff;
   --menu-text: #333;
   --menu-hover-bg: rgba(58, 123, 213, 0.22);
   --menu-hover-text: #1659b0;
@@ -95,6 +108,9 @@ html, body {
   --divider-bg: rgba(0, 0, 0, 0.1);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
   --switch-off-bg: rgba(0, 0, 0, 0.2);
+  /* 开机自启动开关配色（与分段选择器强调色统一） */
+  --switch-on-bg: #1f2430;
+  --switch-on-knob: #fff;
 }
 
 /* ─── Dock ──────────────────────────────────────────────────────────── */
@@ -110,13 +126,13 @@ html, body {
 }
 
 /* 毛玻璃背景：独立层，只覆盖图标区（图标在其中垂直居中，上下各 8px 小间距）。
-   顶部 44px 放大区是透明的，hover 放大时图标会顶出背景之上——macOS Dock 观感。 */
+   顶部 70px 放大区是透明的，hover 放大时图标和悬浮标签会顶出背景之上——macOS Dock 观感。 */
 .dock-bg {
   position: absolute;
   left: 24px;
   right: 24px;
-  top: 44px; /* 图标顶上方留 8px */
-  bottom: 0; /* 图标底下方留 8px（图标底 131，dock 底 139） */
+  top: 70px; /* 图标顶上方留 8px（与 .dock-inner 的 70px 透明区一致） */
+  bottom: 0; /* 图标底下方留 8px（图标底 139，dock 底 146） */
   z-index: 0;
   background: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   backdrop-filter: blur(36px) saturate(1.7);
@@ -137,9 +153,10 @@ html, body {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  /* 图标放不下时横向滚动查看。顶部 44px 为透明放大区：hover 放大（1.4× + 8px 上浮，
-     图标列含 label 约 79px → 放大后上移约 40px）的图标在这里顶出背景，不被 overflow 裁剪 */
-  padding: 44px 16px 0;
+  /* 图标放不下时横向滚动查看。顶部 70px 为透明放大区：hover 放大（1.4× + 8px 上浮）
+     的图标在这里顶出背景，不被 overflow 裁剪；同时容纳悬浮在图标上方的标签
+     （标签随放大一起上移，44px 区会越界被裁，故加高到 70px） */
+  padding: 70px 16px 0;
   max-width: 100%;
   min-width: 0;
   overflow-x: auto;
@@ -156,7 +173,7 @@ html, body {
 
 .dock-edge {
   position: absolute;
-  top: 44px; /* 对齐 .dock-bg 背景区 */
+  top: 70px; /* 对齐 .dock-bg 背景区 */
   bottom: 0;
   width: 48px;
   pointer-events: none;
@@ -225,19 +242,36 @@ html, body {
   filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35));
 }
 
+/* macOS 式悬停标签：绝对定位悬浮在图标上方（不再占用图标下方的布局行，
+   玻璃条紧凑贴合图标，下方不留空白）；默认隐藏，悬停淡入；显示完整名称不截断 */
 .dock-label {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
   font-size: 0.68rem;
   font-weight: 500;
   letter-spacing: 0.02em;
   color: var(--label-color);
   white-space: nowrap;
-  max-width: 72px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   text-align: center;
   pointer-events: none;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 8px rgba(0, 0, 0, 0.2);
-  transition: color 0.2s;
+  opacity: 0;
+  background: var(--label-pill-bg);
+  padding: 2px 8px;
+  border-radius: 7px;
+  transition: opacity 0.16s ease, color 0.2s;
+}
+
+.dock-item:hover .dock-label {
+  opacity: 1;
+}
+
+/* 「+」添加按钮不显示悬浮标签（图标本身已足够自明） */
+.dock-add .dock-label,
+.dock-add.dock-item:hover .dock-label {
+  display: none;
 }
 
 .dock-item:hover .dock-label {
@@ -338,8 +372,9 @@ html, body {
   color: var(--menu-hover-text);
 }
 
-/* 开机自启动开关指示器（iOS 风格）：靠菜单项右侧显示（space-between 推右），
-   开=绿色轨道+圆球在右，关=灰色轨道+圆球在左；纯展示，点击整个菜单项切换 */
+/* 开机自启动开关指示器：靠菜单项右侧显示（space-between 推右）。
+   配色与主题分段选择器统一（--switch-on-bg = --nt-ink 同源强调色，
+   各主题定义自己的开/关配色），关=弱轨道+白球在左，开=强调底+对比球在右 */
 .item-switch {
   position: relative;
   width: 30px;
@@ -360,21 +395,96 @@ html, body {
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
-  transition: left 0.2s;
+  transition: left 0.2s, background 0.2s;
 }
 
 .item-switch.on {
-  background: #34c759;
+  background: var(--switch-on-bg);
 }
 
 .item-switch.on::after {
   left: 15px;
+  background: var(--switch-on-knob);
 }
 
 .dropdown-divider {
   height: 1px;
   margin: 6px 12px;
   background: var(--divider-bg);
+}
+
+/* ─── 主题分段选择器（纯 flex，无绝对定位，不可能错位）─────────────────
+   主行：透明 | 毛玻璃（激活项自带滑块底色高亮）；
+   毛玻璃激活时下方展开子行：黑夜 | 白天。
+   配色：--nt-ink 激活项底色、--nt-ink-on 激活项文字、--nt-shell 轨道底 */
+.theme-seg {
+  display: flex;
+  width: calc(100% - 16px);
+  margin: 0 8px 6px;
+  height: 34px;
+  padding: 3px;
+  background: var(--nt-shell);
+  border-radius: 999px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
+  -webkit-app-region: no-drag;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.theme-seg-btn {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--menu-text);
+  opacity: 0.5;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, opacity 0.2s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.theme-seg-btn:hover {
+  opacity: 0.8;
+}
+
+.theme-seg-btn.active {
+  opacity: 1;
+  color: var(--nt-ink-on);
+  background: var(--nt-ink);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+/* 子行：毛玻璃激活时展开（黑夜 | 白天），透明态隐藏 */
+.theme-seg-sub {
+  display: flex;
+  width: calc(100% - 16px);
+  margin: 0 8px 6px;
+  height: 26px;
+  padding: 2px;
+  background: var(--nt-shell);
+  border-radius: 999px;
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+
+.theme-seg-sub.hidden {
+  display: none;
+}
+
+.theme-seg-sub .theme-seg-btn {
+  height: auto;
+  font-size: 0.76rem;
+}
+
+.theme-seg-sub .theme-seg-btn.active {
+  color: var(--nt-ink);
+  background: var(--nt-sub-bg);
 }
 
 /* ─── 菜单滚动条：隐藏 ──────────────────────────────────────────────────── */
@@ -525,8 +635,23 @@ html, body {
 .app.theme-transparent {
   --icon-wrap-bg: transparent;
   --icon-wrap-hover-bg: rgba(255, 255, 255, 0.12);
-  --add-btn-color: rgba(255, 255, 255, 0.55);
+  --add-btn-color: rgba(255, 255, 255, 0.92); /* 纯白高不透明度：浅色壁纸上加号仍可见 */
   --add-btn-hover-color: #fff;
+  /* 菜单文字近黑（浅色壁纸上最清晰），悬停/分隔线同步浅色系；
+     深色壁纸下靠白色光晕托住黑字 */
+  --menu-text: #1f2430;
+  --menu-hover-text: #1659b0;
+  --menu-hover-bg: rgba(58, 123, 213, 0.22);
+  --context-hover-bg: rgba(58, 123, 213, 0.18);
+  --divider-bg: rgba(0, 0, 0, 0.15);
+  --label-pill-bg: rgba(0, 0, 0, 0.30); /* 透明：中性深灰药丸衬底（悬停显示标签） */
+  --switch-on-bg: rgba(0, 0, 0, 0.75); /* 透明：深色轨道（与近黑菜单文字统一） */
+  --switch-on-knob: #fff;
+  /* 主题嵌套选择器配色（透明，浅色壁纸） */
+  --nt-ink: #1f2430;
+  --nt-ink-on: #fff;
+  --nt-shell: rgba(0, 0, 0, 0.12);
+  --nt-sub-bg: rgba(255, 255, 255, 0.6);
   /* 两端渐隐遮罩在透明背景上没有可渐隐的底，直接隐藏（滚动仍可用） */
   --dock-edge: transparent;
 }
@@ -559,13 +684,12 @@ html, body {
   background: transparent !important;
 }
 
-/* 添加按钮在白底壁纸上不可见时，用阴影与图标区分 */
+/* 添加按钮在白底壁纸上不可见时，用双层深投影勾出轮廓 */
 .app.theme-transparent .dock-add-btn svg {
-  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.9)) drop-shadow(0 0 8px rgba(0, 0, 0, 0.45));
 }
 
-/* 菜单与软件背景同步：透明风格下菜单同样全透明（无毛玻璃/边框，
-   仅保留悬浮投影 + 文字投影保证任意壁纸下的可读性） */
+/* 菜单与软件背景同步：透明风格下菜单全透明，文字用近黑（配白色光晕托底） */
 .app.theme-transparent .dropdown-menu,
 .app.theme-transparent .context-menu {
   background: transparent;
@@ -576,6 +700,15 @@ html, body {
 }
 
 .app.theme-transparent .dropdown-item,
-.app.theme-transparent .context-menu-item {
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+.app.theme-transparent .context-menu-item,
+.app.theme-transparent .edit-label {
+  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.55), 0 0 6px rgba(255, 255, 255, 0.3);
 }
+
+/* 编辑输入框浅色底 + 深色文字（与菜单黑字风格一致） */
+.app.theme-transparent .edit-input {
+  background: rgba(255, 255, 255, 0.6);
+  color: #1f2430;
+}
+/* 透明风格的标签底衬（--label-pill-bg: rgba(0,0,0,0.30)）已在上方变量块定义；
+   悬停显示/淡入由基础 .dock-label 规则统一处理（三主题一致） */

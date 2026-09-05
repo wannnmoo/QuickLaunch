@@ -304,11 +304,22 @@ function App(): React.ReactElement {
   }
 
   // 切换主题（黑夜 → 白天 → 透明 → 黑夜 循环，偏好持久化到 localStorage）
-  const toggleTheme = () => {
-    const next = theme === 'dark' ? 'light' : theme === 'light' ? 'transparent' : 'dark'
+  const applyTheme = (next: 'dark' | 'light' | 'transparent') => {
     localStorage.setItem('ql-theme', next)
     setTheme(next)
-    setMenuPos(null)
+  }
+  // 毛玻璃态下记忆所选子主题（黑夜/白天）：切去透明再切回时保持原选择
+  const [glassPlan, setGlassPlan] = useState<'dark' | 'light'>(() =>
+    localStorage.getItem('ql-theme') === 'light' ? 'light' : 'dark'
+  )
+  // 嵌套选择器选主题：菜单保持打开，可连续切换预览
+  const handleThemePick = (next: 'dark' | 'light' | 'transparent') => {
+    if (next === 'transparent') {
+      applyTheme('transparent')
+      return
+    }
+    setGlassPlan(next)
+    applyTheme(next)
   }
 
   // 切换开机自启动（乐观更新：先切开关，IPC 返回后校正；写注册表 Run 登录项）。
@@ -702,9 +713,44 @@ function App(): React.ReactElement {
             <span className={`item-switch${autoStart ? ' on' : ''}`} />
           </button>
           <div className="dropdown-divider" />
-          <button className="dropdown-item" onClick={toggleTheme}>
-            {theme === 'dark' ? '切换到白天模式' : theme === 'light' ? '切换到透明风格' : '切换到黑夜模式'}
-          </button>
+          {/* 主题分段选择器（纯 flex 分段控件，无绝对定位）：主行 透明|毛玻璃，
+              毛玻璃激活时下方展开 黑夜|白天 子行；选择后菜单保持打开可连续预览 */}
+          <div className="theme-seg" role="group" aria-label="主题背景">
+            <button
+              type="button"
+              className={'theme-seg-btn' + (theme === 'transparent' ? ' active' : '')}
+              onClick={() => handleThemePick('transparent')}
+            >
+              透明
+            </button>
+            <button
+              type="button"
+              className={'theme-seg-btn' + (theme !== 'transparent' ? ' active' : '')}
+              onClick={() => handleThemePick(glassPlan)}
+            >
+              毛玻璃
+            </button>
+          </div>
+          <div
+            className={'theme-seg-sub' + (theme === 'transparent' ? ' hidden' : '')}
+            role="radiogroup"
+            aria-label="毛玻璃子主题"
+          >
+            <button
+              type="button"
+              className={'theme-seg-btn' + (glassPlan === 'dark' ? ' active' : '')}
+              onClick={() => handleThemePick('dark')}
+            >
+              黑夜
+            </button>
+            <button
+              type="button"
+              className={'theme-seg-btn' + (glassPlan === 'light' ? ' active' : '')}
+              onClick={() => handleThemePick('light')}
+            >
+              白天
+            </button>
+          </div>
         </div>
       )}
 
