@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
 export interface LnkInfo {
@@ -21,6 +21,12 @@ export interface AppEntry {
   description: string
   isFolder?: boolean
   specialType?: 'this-pc' | 'recycle-bin'
+  /** 分组（Stack）：点击展开面板而不启动；targetPath 为空 */
+  isGroup?: boolean
+  /** 所属分组的 id（无此字段 = Dock 顶层图标） */
+  groupId?: number
+  /** 分隔线：不启动、不参与统计与桌面扫描；靠右键图标「在此之前插入分隔线」创建 */
+  isSeparator?: boolean
 }
 
 // Custom APIs for renderer
@@ -34,6 +40,17 @@ const api = {
   /** 为条目更换图标：选择 exe/dll/ico/png 并提取图标，返回 { path, iconDataUrl } 或 null（取消）。 */
   pickIcon: (): Promise<{ path: string; iconDataUrl: string } | null> =>
     ipcRenderer.invoke('pick-icon'),
+  /** 拖放添加：把 DataTransfer 里的 File 转成真实文件路径（Electron 32+ 已移除 File.path）。 */
+  getPathForFile: (file: unknown): string => {
+    try {
+      return webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0])
+    } catch { return '' }
+  },
+  /** 拖放添加：解析拖入的文件路径，返回可添加的条目与不支持的路径。 */
+  describePaths: (paths: string[]): Promise<{
+    accepted: { targetPath: string; arguments: string; workingDirectory: string; description: string; iconDataUrl: string }[]
+    rejected: string[]
+  }> => ipcRenderer.invoke('describe-paths', paths),
   /** 以管理员身份运行目标（Start-Process -Verb RunAs → UAC 提权）。 */
   runAsAdmin: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
     ipcRenderer.invoke('run-as-admin', targetPath, args, workingDir),
@@ -63,6 +80,12 @@ const api = {
     const listener = (): void => callback()
     ipcRenderer.on('desktop-changed', listener)
     return () => { ipcRenderer.removeListener('desktop-changed', listener) }
+  },
+  /** 订阅「进入键盘导航」事件（Alt+Space 唤出 Dock 时由主进程推送），返回取消订阅函数。 */
+  onNavEnter: (callback: () => void): (() => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('nav-enter', listener)
+    return () => { ipcRenderer.removeListener('nav-enter', listener) }
   },
   /** Get whether desktop icons are currently hidden (registry HideIcons). */
   getDesktopIconsHidden: (): Promise<boolean> =>

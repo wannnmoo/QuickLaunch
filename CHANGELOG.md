@@ -57,6 +57,12 @@
 - **EACCES/EPERM 回退**：直接 spawn 被拒（程序需管理员权限或杀软拦截）时回退 `shell.openPath()`——与资源管理器双击一致，自动弹 UAC 提权
 - **URL / 系统位置**：URL 用 `shell.openExternal`，`shell:` CLSID 用 `explorer` 打开
 
+### 分组 / 分隔线 / 键盘导航（v1.9.0）
+- **分组堆叠**：图标右键「新建分组」；拖图标到分组图标上归组、从面板拖回 Dock 移出；分组图标显示组内前 4 个成员缩略拼图 + 数量徽标；点开是主 Dock 同构的迷你面板（宽度随内容、超出才滚动，高度固定）
+- **分隔线**：图标右键「在此之前插入分隔线」，可拖拽调位置；不启动、不参与扫描与键盘导航
+- **键盘导航**：`Alt+Space` 唤出即选中（记住上次位置）；`←/→` 移动、`Enter` 启动、`Esc` 退出；分组上 `→` 进面板、`←` 返回；方向键随时可唤醒选中框
+- **拖入即添加**：从资源管理器拖快捷方式/exe 到 Dock 栏即入 Dock（按落点插入、重复跳过并提示）
+
 ### 持久化 + 系统托盘
 - **自动保存**：所有图标实时保存到 `userData/shortcuts.json`，重启自动恢复
 - **系统托盘**：关闭窗口最小化到托盘，左键单击托盘图标切换显隐，右键菜单「显示窗口」/「退出」
@@ -72,15 +78,24 @@
 
 | Channel | 方向 | 说明 |
 |---|---|---|
-| `parse-lnk` | Renderer → Main | 解析快捷方式文件，返回 `LnkInfo`，不传路径则弹出系统文件对话框 |
-| `select-folder` | Renderer → Main | 选择文件夹，返回路径/名称/系统文件夹图标 (shell32.dll index 4) |
-| `add-special-item` | Renderer → Main | 添加系统位置（此电脑/回收站），从注册表解析图标 |
+| `parse-lnk` | Renderer → Main | 解析快捷方式文件，返回 `LnkInfo`，不传路径则弹出系统文件对话框（支持多选） |
+| `select-folder` | Renderer → Main | 选择文件夹（支持多选），返回路径/名称/系统文件夹图标 (shell32.dll index 4) |
+| `scan-desktop-folders` | Renderer → Main | 扫描桌面文件夹与指向文件夹的 .lnk，并固定附加「此电脑」「回收站」；单次 PowerShell 完成枚举 + 图标提取 |
+| `check-folders-missing` | Renderer → Main | 返回传入路径中已不存在的子集（主进程纯 `fs.existsSync`），用于清理被删除的桌面文件夹 |
+| `desktop-changed` | Main → Renderer | 桌面目录 `fs.watch`（非递归 + debounce 1s）变化推送，renderer 重新执行清理 + 扫描合并 |
+| `describe-paths` | Renderer → Main | 拖放添加：解析拖入的路径数组，返回 `{ accepted, rejected }` |
+| `nav-enter` | Main → Renderer | Alt+Space 唤出 Dock 时推送，renderer 进入键盘导航模式并恢复上次选中位置 |
 | `run-app` | Renderer → Main | 启动目标程序（exe/URL/`shell:` 位置），或通过 `shell.openPath` 打开文件夹 |
-| `load-shortcuts` | Renderer → Main | 从 `userData/shortcuts.json` 加载已保存的快捷方式 |
+| `load-shortcuts` | Renderer → Main | 从 `userData/shortcuts.json` 加载已保存的快捷方式（含形状归一化与旧字段迁移） |
 | `save-shortcuts` | Renderer → Main | 保存快捷方式数据到 `userData/shortcuts.json` |
 | `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，回退注册表） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
-| `dock-pointer` | Renderer → Main | 通知主进程鼠标进入/离开 Dock 窗口（`ipcRenderer.send`，单向） |
+| `get-auto-start` / `set-auto-start` | Renderer → Main | 读取 / 切换开机自启动（注册表 Run 登录项） |
+| `pick-icon` | Renderer → Main | 更换条目图标：选 exe/dll/ico（`SHDefExtractIcon`）或 png/jpg（直读转 dataURL） |
+| `run-as-admin` | Renderer → Main | 以管理员身份运行（`Start-Process -Verb RunAs` → UAC 提权） |
+| `open-file-location` | Renderer → Main | 在资源管理器中定位目标（`explorer /select`） |
+| `copy-text` | Renderer → Main | 复制文本到剪贴板（「复制路径」用） |
+| `dock-pointer` | Renderer → Main | 通知主进程鼠标进入 Dock 窗口恢复置顶（`ipcRenderer.send`，单向） |
 
 ### LnkInfo 结构
 
@@ -143,6 +158,25 @@ npm run package    # 构建并打包为可执行安装包
 ---
 
 ## 更新日志
+
+### v1.9.0 (2026-09-11)
+
+- **拖入文件即添加**：从资源管理器把 `.lnk`/`.url`/`.pif`/`.exe`/`.com` 拖到 Dock 栏即入 Dock——按落点插入（蓝色插入线预览）、按路径去重（重复或格式不支持则跳过并用提示胶囊汇报数量）。Electron 32+ 已移除 `File.path`，路径改由 preload 的 `webUtils.getPathForFile` 提供；新增 IPC `describe-paths`（快捷方式复用 `parseLnkFile`，exe 走**单次 PowerShell 批量**取 FileDescription + 图标，提取失败回退 shell32 通用图标，工作目录取 exe 所在目录）。仅 Dock 栏区域响应拖放，其余位置显示禁止光标；整窗拦截 `dragover`/`drop` 默认行为，避免 Chromium 把窗口导航到 `file://` 白屏
+- **分组堆叠（Stack）**：新增 `isGroup` / `groupId` 字段（**扁平模型**，桌面扫描/缺失清理/持久化全部沿用原逻辑）。图标右键「新建分组」创建空组并自动横向滚到末尾；**分组图标默认渲染组内前 4 个成员的缩略拼图**（0 个成员回退 2×2 网格图标、1 个放大单图，用户换过图标则用自定义图标），右下角显示成员数徽标；把图标拖到分组图标上即归组、从面板拖回 Dock 条内即移出、删除分组＝解散（成员回顶层并保留相对位置）；分组编辑表单只留名称 + 图标。**面板是与主 Dock 同构的迷你 Dock**——条目直接复用 `.dock-item` 系列样式、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听，宽度随内容伸缩（超出窗口宽度才滚动）、高度固定
+- **键盘导航**：`Alt+Space` 唤出 Dock 时进入导航模式（主进程推送 `nav-enter`）；`←/→` 不循环移动、`Enter` 启动、`Esc` 退出；分组上 `→`/`Enter` 展开面板并把选中移入第一个成员、`←`/`Esc` 返回主 Dock；可导航到末尾的「+」按钮（Enter 打开菜单）。**选中位置持久化到 localStorage**（`ql-nav-last`）——启动、Alt+Space 唤出、方向键「唤醒」都恢复到上次位置，条目失效则回落第一个。选中态为左右两条渐变竖框，并加 `scroll-margin` 保证从最右移回最左时左框不被裁
+- **分隔线**：图标右键「在此之前插入分隔线」把 Dock 分成逻辑区段；`isSeparator` 条目可拖拽排序、随 `shortcuts.json` 持久化，不启动、不参与桌面扫描去重/清理/键盘导航/悬停放大。样式为 1px 渐变柔线（两端淡出、随主题变色），命中区 9px + `z-index: 20` 保证旁边图标放大时也能点中（右键→删除）
+- **菜单交互重做**：菜单底边统一锚在**实测的** Dock 毛玻璃条上方 8px（右键菜单不再压进 Dock 栏）；水平锚点让光标落在菜单内侧 8px，垂直上移即可进入菜单；「移出即关」加三道防误关（必须先真正进过菜单本体、进入后 150ms 内的掠过不算离开、菜单外扩 24px 宽容区）；「+」菜单高度上限提升到 208px，内部滚动明显减少；**Dock 空白处右键不再弹菜单**
+- **取消窗口 resize（根治透明窗口白闪）**：分组面板与菜单都改成固定高度的浮层后，删除了整套「窗口临时加高」机制（`set-panel-extra` IPC、`setWindowExtra()`、`baseBounds`/`panelExtra`、`moved` 守卫），并显式设置 `backgroundColor: '#00000000'`——应用运行期间不再有任何程序化窗口缩放，白闪从根上消失
+- **修复（代码审查发现）**：
+  - 启动时的「记住选中位置」从未生效——初始化 effect 读的是尚未镜像本轮的 `appsRef`，现改为显式传入当前列表
+  - 拖入文件的落点插入混用了下标空间（顶层下标当扁平下标），存在分组成员时插入位置会偏「成员数」个槽位并破坏「成员紧跟分组」的区块结构
+  - 键盘导航进入分组时可能选中分隔线（选中框无处渲染、`←` 变死键），记忆位置命中分隔线时同样会落到不可见选中
+  - 分组缩略拼图与数量徽标把分隔线算了进去（空破图格 + 计数偏大）
+  - 成员数徽标下沿被滚动容器裁掉 3px
+  - 面板经鼠标移出/失焦关闭后，导航选中仍停在不可见的组内成员上
+  - `load-shortcuts` 增加形状归一化：非数组返回 `[]`（否则 renderer 会抛未处理 rejection 并中断本轮桌面扫描），并把早期开发版的 `separator` 字段就地迁移为 `isSeparator`
+  - `open-file-location` 的 `exec` 拼接前拒绝含 cmd 元字符的路径
+  - `npm run typecheck` 修复为逐子项目检查（原 solution-style 配置下 `tsc --noEmit` 什么都不检查），并修掉被它掩盖的 3 个类型错误；`handleDockWheel` 改原生非被动 wheel 监听（React 在 root 上以 passive 注册，`preventDefault()` 原本是空操作）
 
 ### v1.8.1 (2026-08-23)
 

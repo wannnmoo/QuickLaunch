@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
-import { join, basename } from 'path'
+import { join, basename, extname, dirname } from 'path'
 import { readFileSync, writeFileSync, existsSync, statSync, watch, type FSWatcher } from 'fs'
 import { execFile, exec } from 'child_process'
 
@@ -35,7 +35,11 @@ if (!gotSingleInstanceLock) {
 // 「显示→被压底→再次显示→再次被压底」的死循环，Alt+Space 永远无法隐藏（v1.7.1 修复）。
 let dockTrayHidden = false
 
-function toggleWindow(): void {
+/**
+ * 显示/隐藏 Dock。fromKeyboard=true（Alt+Space）时，显示后额外通知 renderer 进入
+ * 键盘导航模式（恢复到上次选中的位置，没有记忆则第一个图标）；托盘点击等鼠标路径不进入导航。
+ */
+function toggleWindow(fromKeyboard = false): void {
   if (!mainWindow) return
   if (dockTrayHidden || !mainWindow.isVisible()) {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
@@ -44,6 +48,9 @@ function toggleWindow(): void {
     mainWindow.setAlwaysOnTop(true)
     mainWindow.moveTop()
     mainWindow.focus()
+    if (fromKeyboard && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('nav-enter')
+    }
   } else {
     // 可见（置顶或被沉底）→ 隐藏到托盘
     dockTrayHidden = true
@@ -328,7 +335,21 @@ function readWindowPosition(): { x: number; y: number } | null {
 
 ipcMain.handle('load-shortcuts', () => {
   try {
-    return existsSync(shortcutsPath) ? JSON.parse(readFileSync(shortcutsPath, 'utf-8')) : []
+    if (!existsSync(shortcutsPath)) return []
+    const raw: unknown = JSON.parse(readFileSync(shortcutsPath, 'utf-8'))
+    // 形状校验：文件被外部改坏（合法 JSON 但不是数组）时返回空数组，
+    // 否则 renderer 的 baseline.filter 会抛错并中断整轮加载/桌面扫描
+    if (!Array.isArray(raw)) return []
+    return raw.map((entry) => {
+      if (!entry || typeof entry !== 'object') return entry
+      const e = entry as Record<string, unknown>
+      // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
+      if (e.separator) {
+        const { separator: _legacy, ...rest } = e
+        return { ...rest, isSeparator: true }
+      }
+      return entry
+    })
   } catch {
     return []
   }
@@ -441,7 +462,8 @@ if ($results.Count -gt 0) {
     execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 20000 }, (err, stdout) => {
       if (err || !stdout.trim()) { resolve([]); return }
       try {
-        const items = JSON.parse(stdout.trim())
+        const items: { path: string; name: string; iconBase64?: string; specialType?: 'this-pc' | 'recycle-bin' }[] =
+          JSON.parse(stdout.trim())
         resolve(items.map((it) => ({
           path: it.path,
           name: it.name,
@@ -716,6 +738,112 @@ ipcMain.handle('pick-icon', async () => {
   return iconDataUrl ? { path: file, iconDataUrl } : null
 })
 
+// ─── IPC: 拖放添加（解析拖入的文件路径） ────────────────────────────────────
+// renderer 用 webUtils.getPathForFile 拿到拖入文件的真实路径（Electron 32+ 已移除
+// File.path），这里按类型分派成可持久化的条目：
+//   .lnk/.url/.pif → parseLnkFile（与「添加快捷方式」同一套解析 + 图标兜底链）
+//   .exe/.com      → 单次 PowerShell 调用批量取 FileDescription + 图标（避免 N 个进程）
+// 其余（文件夹、文档、其它扩展名、目标为空的坏快捷方式）归入 rejected，
+// 由 renderer 汇总成「已跳过 N 个」提示。
+
+const SHORTCUT_EXTS = new Set(['.lnk', '.url', '.pif'])
+const EXEC_EXTS = new Set(['.exe', '.com'])
+
+interface DroppedEntry {
+  targetPath: string
+  arguments: string
+  workingDirectory: string
+  description: string
+  iconDataUrl: string
+}
+
+/** 批量取 exe/com 的显示名（FileDescription → 文件名）、图标与工作目录，单次 PowerShell 调用。 */
+function describeExecutables(paths: string[]): Promise<{ path: string; name: string; iconDataUrl: string }[]> {
+  return new Promise((resolve) => {
+    // 路径统一单引号包裹（'' 转义），含空格/中文的路径不会被拆断
+    const psList = paths.map((p) => `'${p.replace(/'/g, "''")}'`).join(', ')
+    const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+${ICON_EXTRACTOR_CS}
+$out = @()
+foreach ($p in @(${psList})) {
+  $name = ''
+  try { $name = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($p).FileDescription } catch {}
+  if (-not $name) { $name = [System.IO.Path]::GetFileNameWithoutExtension($p) }
+  $b64 = [IconExtractor]::GetIconBase64($p, 0, 256)
+  # 提取不到图标时回退通用文档图标（shell32 index 1），避免 <img src=""> 出现破图
+  if (-not $b64) { $b64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256) }
+  $out += @{ path = $p; name = $name; iconBase64 = $b64 }
+}
+if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
+    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 15000 }, (err, stdout) => {
+      if (err || !stdout.trim()) { resolve([]); return }
+      try {
+        const parsed = JSON.parse(stdout.trim())
+        // 只有一个元素时 ConvertTo-Json 输出对象而非数组，这里统一成数组
+        const items: { path: string; name: string; iconBase64?: string }[] =
+          Array.isArray(parsed) ? parsed : [parsed]
+        resolve(items.map((it) => ({
+          path: it.path,
+          name: it.name,
+          iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : ''
+        })))
+      } catch { resolve([]) }
+    })
+  })
+}
+
+ipcMain.handle('describe-paths', async (_e, paths: unknown) => {
+  if (!Array.isArray(paths)) return { accepted: [], rejected: [] }
+  const list = paths.filter((p): p is string => typeof p === 'string' && !!p)
+  // 按输入下标占位，保证添加顺序与拖入顺序一致（快捷方式解析较慢也不会乱序）
+  const slots: (DroppedEntry | null)[] = new Array(list.length).fill(null)
+  const rejected: string[] = []
+  const execIdx: number[] = []
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i]
+    const ext = extname(p).toLowerCase()
+    if (SHORTCUT_EXTS.has(ext)) {
+      try {
+        const info = await parseLnkFile(p)
+        // 目标为空的坏快捷方式不入 Dock（点了也启动不了）
+        if (!info.targetPath) { rejected.push(p); continue }
+        slots[i] = {
+          targetPath: info.targetPath,
+          arguments: info.arguments || '',
+          workingDirectory: info.workingDirectory || '',
+          description: info.description || basename(p, ext),
+          iconDataUrl: info.iconDataUrl || ''
+        }
+      } catch { rejected.push(p) }
+    } else if (EXEC_EXTS.has(ext) && existsSync(p)) {
+      execIdx.push(i)
+    } else {
+      rejected.push(p)
+    }
+  }
+
+  if (execIdx.length > 0) {
+    const metas = await describeExecutables(execIdx.map((i) => list[i]))
+    for (const i of execIdx) {
+      const m = metas.find((x) => x.path.toLowerCase() === list[i].toLowerCase())
+      if (!m) { rejected.push(list[i]); continue }
+      slots[i] = {
+        targetPath: list[i],
+        arguments: '',
+        // 工作目录取 exe 所在目录：留空会让子进程继承本应用的 cwd（仓库目录），
+        // 与资源管理器双击（用 exe 所在目录）不一致，依赖相对路径找配置的程序会起不来
+        workingDirectory: dirname(list[i]),
+        description: m.name,
+        iconDataUrl: m.iconDataUrl
+      }
+    }
+  }
+
+  return { accepted: slots.filter((s): s is DroppedEntry => s !== null), rejected }
+})
+
 // 以管理员身份运行（Start-Process -Verb RunAs → UAC 提权，与资源管理器「以管理员身份运行」一致）
 ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
@@ -735,6 +863,12 @@ Start-Process -FilePath '${targetPath.replace(/'/g, "''")}' -ArgumentList '${(ar
 // 在资源管理器中定位目标（文件夹在父目录中选中该文件夹；文件直接选中）
 ipcMain.handle('open-file-location', (_e, targetPath: string) => {
   if (!targetPath || targetPath.startsWith('shell:') || targetPath.startsWith('::')) return
+  // 这条走的是 exec（拼接命令行，见下方原因），因此必须先挡掉 cmd 元字符：
+  // 真实路径不含这些字符，但 shortcuts.json 可手改、IPC 也能传任意串
+  if (/["&|^<>%\r\n]/.test(targetPath)) {
+    console.error('[launcher] open-file-location: refused path with cmd metacharacters')
+    return
+  }
   try {
     // explorer 的参数解析很挑剔：execFile 自动转义内嵌引号（\"）后 /select 会被
     // Explorer 忽略并回退到默认位置（文档）。必须用 exec 传原始命令行
@@ -828,6 +962,10 @@ function createWindow(): void {
     show: false,
     frame: false,
     transparent: true,
+    // 显式给全透明背景色：Electron 默认背景是白色（#FFF），透明窗口一旦发生
+    // setBounds 重绘就会先糊一层白底（表现为整窗白闪）。当前已取消所有程序化
+    // resize（面板/菜单都改成固定高度浮层），保留此项作为兜底。
+    backgroundColor: '#00000000',
     alwaysOnTop: true,
     resizable: false,
     skipTaskbar: true,
@@ -947,7 +1085,7 @@ app.whenReady().then(() => {
   // which is why Alt+Space is tried first.
   let shortcutRegistered = false
   for (const combo of ['Alt+Space', 'Ctrl+Alt+Space']) {
-    if (globalShortcut.register(combo, () => toggleWindow())) {
+    if (globalShortcut.register(combo, () => toggleWindow(true))) {
       shortcutRegistered = true
       console.log(`Registered global shortcut: ${combo}`)
       break

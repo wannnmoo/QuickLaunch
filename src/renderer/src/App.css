@@ -39,6 +39,7 @@ html, body {
   --dock-bg-top: rgba(44, 50, 70, 0.68);
   --dock-bg-bottom: rgba(27, 32, 46, 0.6);
   --dock-border: rgba(255, 255, 255, 0.12);
+  --sep-color: rgba(255, 255, 255, 0.34); /* 分隔线竖线中段色（黑夜） */
   --dock-border-hover: rgba(255, 255, 255, 0.2);
   --dock-shadow:
     0 12px 32px rgba(0, 0, 0, 0.45),
@@ -79,6 +80,7 @@ html, body {
   --dock-bg-top: rgba(255, 255, 255, 0.75);
   --dock-bg-bottom: rgba(240, 242, 248, 0.65);
   --dock-border: rgba(0, 0, 0, 0.12);
+  --sep-color: rgba(0, 0, 0, 0.26); /* 分隔线竖线中段色（白天） */
   --dock-border-hover: rgba(0, 0, 0, 0.22);
   --dock-shadow:
     0 12px 32px rgba(0, 0, 0, 0.16),
@@ -212,6 +214,10 @@ html, body {
   transform-origin: center bottom; /* 放大从底部升起，贴合 macOS Dock */
   position: relative;
   -webkit-app-region: no-drag;
+  /* 键盘导航用 scrollIntoView({inline:'nearest'}) 把选中项带入可视区，而「刚好可见」
+     会把容器内边距也滚掉：第一个图标的框左缘正好贴住容器左缘，缩放后还溢出 1.5px，
+     竖框就被裁掉（表现为「移到最左边时左框不显示」）。留出余量即可。 */
+  scroll-margin-inline: 14px;
 }
 
 .dock-icon-wrap {
@@ -220,10 +226,11 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative; /* 分组数量徽标（.dock-badge）定位参照 */
   border-radius: 18px;
   background: var(--icon-wrap-bg);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  transition: background 0.2s, box-shadow 0.2s;
+  transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
 }
 
 .dock-item:hover .dock-icon-wrap {
@@ -508,6 +515,8 @@ html, body {
 .context-menu {
   position: fixed;
   min-width: 100px;
+  /* 宽度上限：超长名称也不至于顶出窗口；菜单项 nowrap，正常文案都占一行不折行 */
+  max-width: 280px;
   -webkit-app-region: no-drag;
   background: var(--menu-bg);
   backdrop-filter: blur(20px);
@@ -531,6 +540,7 @@ html, body {
   padding: 9px 12px;
   font-size: 0.85rem;
   color: var(--menu-text);
+  white-space: nowrap; /* 菜单项文案不折行（靠右弹出被挤窄时会出现折行） */
   background: none;
   border: none;
   cursor: pointer;
@@ -654,6 +664,8 @@ html, body {
   --nt-sub-bg: rgba(255, 255, 255, 0.6);
   /* 两端渐隐遮罩在透明背景上没有可渐隐的底，直接隐藏（滚动仍可用） */
   --dock-edge: transparent;
+  /* 分隔符竖线（透明风格）：中性灰，浅/深壁纸上都看得见 */
+  --sep-color: rgba(120, 130, 145, 0.85);
 }
 
 .app.theme-transparent .dock-bg {
@@ -712,3 +724,252 @@ html, body {
 }
 /* 透明风格的标签底衬（--label-pill-bg: rgba(0,0,0,0.30)）已在上方变量块定义；
    悬停显示/淡入由基础 .dock-label 规则统一处理（三主题一致） */
+
+/* ─── 分组（Stack）──────────────────────────────────────────────────── */
+
+/* 分组默认图标（2×2 网格）：颜色跟随主题标签色，一眼区分「这是分组不是程序」 */
+.dock-icon.group-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--label-color);
+  background: transparent;
+}
+
+/* 分组图标预览：组内前 4 个图标的缩略拼图（macOS 堆叠观感）。
+   容器 54×54，两个一行（26 + 2 间隙）；成员 3 个时第二行单个自动居中，
+   成员 1 个时用 .single 放大单图。 */
+.dock-group-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  justify-content: center;
+  gap: 2px;
+  width: 54px;
+  height: 54px;
+}
+
+.dock-group-preview img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+
+.dock-group-preview.single img {
+  width: 40px;
+  height: 40px;
+}
+
+/* 成员数量徽标（贴在图标框内侧：bottom/right 用 0 —— 负值会被滚动容器的
+   overflow: hidden 裁掉下沿，图标框本身已足够容纳） */
+.dock-badge {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #3a7bd5;
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  font-weight: 600;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+/* 键盘导航选中态 / 拖拽归组高亮：左右两条竖直蓝框（❲ ❳ 括注式）。
+   刻意不用整圈描边——容器为了横向滚动必须 overflow: hidden，且底边紧贴图标框，
+   整圈描边（无论内描边还是外描边）的上下总会被裁掉一截；左右竖框天生不受影响。
+   观感上走「渐变柔和」路线：两端透明淡出（不生硬收口）、中间提亮、外缘用极轻的
+   投影代替硬描边，竖框只占中间 52% 高度（落在图标框圆角直线段上不飘出去）。 */
+.dock-item.drop-target .dock-icon-wrap,
+.dock-item.selected .dock-icon-wrap {
+  transform: scale(1.05);
+  /* 从底边放大：默认从中心放大时会向下溢出 1.8px 被滚动容器裁掉 */
+  transform-origin: center bottom;
+}
+
+.dock-item.drop-target .dock-icon-wrap::before,
+.dock-item.drop-target .dock-icon-wrap::after,
+.dock-item.selected .dock-icon-wrap::before,
+.dock-item.selected .dock-icon-wrap::after {
+  content: '';
+  position: absolute;
+  /* 高度 76%：比图标（44px/60px≈73%）略高一点，形成轻微包裹感 */
+  top: 12%;
+  bottom: 12%;
+  width: 3px;
+  /* 渐变：两端淡出（不生硬），中段实色（保证对比度） */
+  background: linear-gradient(
+    180deg,
+    rgba(58, 123, 213, 0) 0%,
+    rgba(58, 123, 213, 0.55) 14%,
+    rgba(96, 165, 238, 1) 42%,
+    rgba(96, 165, 238, 1) 58%,
+    rgba(58, 123, 213, 0.55) 86%,
+    rgba(58, 123, 213, 0) 100%
+  );
+  /* 取代外发光：极轻柔光，避免「一圈硬边」的突兀感 */
+  filter: drop-shadow(0 0 4px rgba(58, 123, 213, 0.55));
+}
+
+/* 向内缩 3px：贴着图标框最外缘时正好压在瓷砖边缘/壁纸交界上，
+   蓝色叠蓝色对比度极低（第一列图标尤其明显，看着像「左边那条没显示」） */
+.dock-item.drop-target .dock-icon-wrap::before,
+.dock-item.selected .dock-icon-wrap::before {
+  left: 3px;
+  border-radius: 3px 1px 1px 3px;
+}
+
+.dock-item.drop-target .dock-icon-wrap::after,
+.dock-item.selected .dock-icon-wrap::after {
+  right: 3px;
+  border-radius: 1px 3px 3px 1px;
+}
+
+/* 分组面板：主 Dock 同构的迷你 Dock。
+   结构对应关系 —— .group-panel-inner ↔ .dock-inner，.group-panel-bg ↔ .dock-bg，
+   面板内的条目直接复用 .dock-item / .dock-icon-wrap / .dock-icon / .dock-label，
+   所以图标大小、悬停放大、悬浮标签与主 Dock 完全一致。
+   宽度 max-content（有几个图标就多宽），超出窗口宽度时横向滚动；高度固定 132px。 */
+.group-panel {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  /* bottom 由 JS 按实测的 Dock 毛玻璃条位置设置（默认 154px） */
+  bottom: 154px;
+  z-index: 150;
+  width: max-content;
+  max-width: calc(100vw - 32px);
+  -webkit-app-region: no-drag;
+}
+
+/* 玻璃底：只覆盖图标区（顶部 56px 是透明区，供悬停放大 + 悬浮标签顶出） */
+.group-panel-bg {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 56px;
+  bottom: 0;
+  z-index: 0;
+  border-radius: 24px;
+  background: var(--menu-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--dock-border);
+  box-shadow: var(--dock-shadow);
+}
+
+.group-panel-inner {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  /* 顶部 56px 透明放大区 + 图标区上下各 8px（与 .dock-bg 的 76px 玻璃条一致） */
+  padding: 64px 12px 8px;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.group-panel-inner::-webkit-scrollbar {
+  display: none;
+}
+
+/* 空分组提示（作为唯一 flex 项，面板宽度随之收缩） */
+.group-panel-empty {
+  padding: 0 8px 14px;
+  font-size: 12px;
+  color: var(--label-color);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+/* 透明主题：面板同步全透明（与下拉/右键菜单一致） */
+.app.theme-transparent .group-panel-bg {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* ─── 分隔符 / 空白占位 ─────────────────────────────────────────────── */
+
+/* 1px 细竖线：比图标矮（40px），上下居中，颜色随主题（--sep-color）。
+   与软件整体风格一致：两端渐变淡出（不生硬收口）+ 圆头，像一条柔和的区段提示线。
+   命中区故意做成 9px（可视竖线只有中间 1px，用 ::before 画）—— 竖线太细时，旁边图标
+   悬停放大（magnify 会给图标设 z-index:10）会盖住它，右键落在图标上而不是分隔线上。 */
+.dock-sep {
+  position: relative;
+  z-index: 20; /* 高于放大中的图标（10），保证 1px 竖线始终可点 */
+  width: 9px;
+  height: 40px;
+  margin: 0 4px;
+  align-self: center;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+}
+
+.dock-sep::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  border-radius: 1px;
+  transform: translateX(-50%);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0) 0%,
+    var(--sep-color) 28%,
+    var(--sep-color) 72%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
+/* 拖拽中：与图标一致的淡化反馈 */
+.dock-sep.dragging {
+  opacity: 0.25;
+}
+
+/* ─── 拖入文件添加（外部拖放） ──────────────────────────────────────── */
+/* 放在文件末尾：与 .app.theme-transparent .dock-bg 优先级相同时后者先出现，
+   高亮规则写在后面才能在三主题下都生效（透明风格平时无边框，拖入时临时描边提示）。 */
+
+.dock.drop-active .dock-bg {
+  border-color: #3a7bd5;
+  box-shadow: 0 0 0 2px rgba(58, 123, 213, 0.45), var(--dock-shadow);
+}
+
+/* 拖入中「松开即添加」/ 拖放结果提示：悬浮在 Dock 上方的胶囊，配色随主题复用标签变量 */
+.drop-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 156px; /* Dock 高 146px，留 10px 间隙 */
+  transform: translateX(-50%);
+  z-index: 200;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--label-pill-bg);
+  color: var(--label-color-hover, var(--label-color));
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 8px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+}
+
+/* 拖入进行中：蓝色描边呼应插入指示线 */
+.drop-hint.active {
+  border: 1px solid rgba(58, 123, 213, 0.9);
+  box-shadow: 0 0 0 3px rgba(58, 123, 213, 0.25), 0 6px 18px rgba(0, 0, 0, 0.2);
+}

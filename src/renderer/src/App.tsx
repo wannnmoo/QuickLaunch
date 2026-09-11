@@ -9,12 +9,40 @@ interface AppEntry {
   description: string
   isFolder?: boolean
   specialType?: 'this-pc' | 'recycle-bin'
+  /** 分组（Stack）：点击展开面板而不启动；targetPath 为空 */
+  isGroup?: boolean
+  /** 所属分组的 id（无此字段 = Dock 顶层图标） */
+  groupId?: number
+  /** 分隔线：不启动、不参与统计与桌面扫描；靠右键图标「在此之前插入分隔线」创建 */
+  isSeparator?: boolean
 }
 
 let nextId = 0
 
 // 桌面扫描去重：路径规范化（去尾部反斜杠 + 小写），Windows 路径大小写不敏感
 const normPath = (p: string): string => (p || '').trim().replace(/\\+$/, '').toLowerCase()
+
+// 顶层下标 → 扁平数组里的锚点 id（null = 追加到末尾）
+// 拖拽排序的 dropIdx 是「顶层图标」下标空间，而 apps 是扁平数组（含组内成员），两者需要换算
+const topAnchorId = (list: AppEntry[], idx: number | null): number | null => {
+  const top = list.filter((a) => !a.groupId)
+  if (idx === null || idx >= top.length) return null
+  return top[idx].id
+}
+
+// 无归属（顶层）条目的合成 id：键盘导航能落到 Dock 末尾的「+」新增按钮上
+// 它不属于 apps 列表，用一个负数哨兵 id 表示（nextId 从 0 起单调递增，不会冲突）
+const ADD_BTN_ID = -1
+
+// 分组面板底部间距：Dock 高度 146 + 8px 间隙
+const PANEL_BOTTOM = 154
+// 窗口高度（与主进程 createWindow 的 300 一致）。右键菜单不改变窗口尺寸
+// 高度上限按这个基准算，超出时内部滚动——避免透明窗口 resize 的白闪
+const BASE_WINDOW_H = 300
+
+// 外部拖入的是「文件」而非页面内元素/文本：DataTransfer.types 里含 'Files'
+const isFileDragEvent = (e: React.DragEvent): boolean =>
+  Array.from(e.dataTransfer?.types ?? []).includes('Files')
 
 function App(): React.ReactElement {
   const [apps, setApps] = useState<AppEntry[]>([])
@@ -41,6 +69,7 @@ function App(): React.ReactElement {
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
   const dockRef = useRef<HTMLDivElement>(null)
+  const dockBgRef = useRef<HTMLDivElement>(null)
   const dockInnerRef = useRef<HTMLDivElement>(null)
   const addBtnRef = useRef<HTMLDivElement>(null)
   const iconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
@@ -51,82 +80,206 @@ function App(): React.ReactElement {
 
   // ─── Custom drag & drop ───────────────────────────────────────────────
 
-  const dragRef = useRef<{ id: number; idx: number; startX: number; startY: number } | null>(null)
+  const dragRef = useRef<{ id: number; startX: number; startY: number } | null>(null)
   // 本次交互是否已越过 5px 阈值成为真实拖拽（同步 ref，不依赖 state 时序）
   const dragStartedRef = useRef(false)
   // 拖拽结束后吞掉紧随其后的 click，防止误启动图标
   const suppressClickRef = useRef(false)
   const [dragId, setDragId] = useState<number | null>(null)
   const [dropIdx, setDropIdx] = useState<number | null>(null)
+  // 拖拽中命中的分组图标（高亮提示「松手即归入该组」）
+  const [dragOverGroupId, setDragOverGroupId] = useState<number | null>(null)
+  // mouseup 需要最新值：放 ref 里，避免把 dropIdx/dragOverGroupId 塞进 effect 依赖
+  // 导致拖拽中每个 mousemove 都重挂 window 监听器
+  const dropIdxRef = useRef<number | null>(null)
+  const dragOverGroupRef = useRef<number | null>(null)
+
+  // ─── 分组（Stack）─────────────────────────────────────────────────────
+  // openGroupId 非 null 时在 Dock 上方弹出该分组的面板（迷你 Dock，宽度随内容伸缩
+  // 高度固定 —— 所以完全不需要改变窗口尺寸，也就没有透明窗口 resize 的白闪）
+  const [openGroupId, setOpenGroupId] = useState<number | null>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  // 面板滚动容器 + 面板内图标的 ref（悬停放大与主 Dock 共用同一套算法）
+  const panelInnerRef = useRef<HTMLDivElement>(null)
+  const panelIconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
+  // 新建分组后需要把 Dock 横向滚到末尾（待 apps 渲染完再执行）
+  const scrollDockToEndRef = useRef(false)
+
+  // ─── 键盘导航 ─────────────────────────────────────────────────────────
+  // navId 非 null 表示处于导航模式：Alt+Space 唤出 Dock 时由主进程通知进入（自动选中
+  // 第一个图标）；鼠标按下图标、启动条目、Esc 于主 Dock 层都会退出
+  const [navId, setNavId] = useState<number | null>(null)
+  // 上次的选中位置（持久化到 localStorage）：启动、Alt+Space 唤出、方向键唤醒都恢复到
+  // 这里，而不是每次都跳回第一个图标。null = 还没有记忆，回落到第一个图标
+  const navLastRef = useRef<number | null>((() => {
+    const raw = localStorage.getItem('ql-nav-last')
+    if (raw === null) return null
+    const v = Number(raw)
+    return Number.isFinite(v) ? v : null
+  })())
+
+  // ─── 从资源管理器拖入文件添加 ─────────────────────────────────────────
+  // 仅 Dock 栏区域响应（.dock 上挂事件，子元素冒泡上来）；透明区/菜单上不接受
+  // 但整窗都拦截默认行为（见下方 document 级 preventDefault），否则 Chromium
+  // 会把窗口导航到 file:// 变成白屏
+  const [fileDragOver, setFileDragOver] = useState(false)
+  // 拖放结果提示（「已添加 2 个，跳过 1 个」等），2.4s 后自动消失
+  const [dropHint, setDropHint] = useState<string | null>(null)
+  const dropHintTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const showDropHint = useCallback((msg: string) => {
+    if (dropHintTimer.current) clearTimeout(dropHintTimer.current)
+    setDropHint(msg)
+    dropHintTimer.current = setTimeout(() => {
+      dropHintTimer.current = null
+      setDropHint(null)
+    }, 2400)
+  }, [])
+
+  useEffect(() => () => {
+    if (dropHintTimer.current) clearTimeout(dropHintTimer.current)
+  }, [])
+
+  // 兜底：拖到透明区/菜单上时不让 Chromium 执行「导航到文件」的默认行为（会白屏）
+  // 同时把非 Dock 区域的 dropEffect 置 none —— 光标显示「禁止」，明确「只有 Dock 栏能放」
+  useEffect(() => {
+    const prevent = (e: DragEvent) => {
+      e.preventDefault()
+      const dock = dockRef.current
+      if (e.dataTransfer && !(dock && dock.contains(e.target as Node))) {
+        e.dataTransfer.dropEffect = 'none'
+      }
+    }
+    document.addEventListener('dragover', prevent)
+    document.addEventListener('drop', prevent)
+    return () => {
+      document.removeEventListener('dragover', prevent)
+      document.removeEventListener('drop', prevent)
+    }
+  }, [])
 
   // Calculate which insertion index the cursor is closest to
+  // 返回的是「位置」（在渲染出来的顶层图标中排序后的下标），不是数组下标
+  // 组内成员不在 Dock 里渲染，所以这里与 topAnchorId 的下标空间一致
   const calcDropIndex = useCallback((clientX: number): number => {
     const dock = dockRef.current
-    if (!dock) return apps.length
+    if (!dock) return iconRefs.current.size
     const dockRect = dock.getBoundingClientRect()
     const mx = clientX - dockRect.left
 
-    // Build sorted list of icon centers paired with their array index
-    const centers: { idx: number; cx: number }[] = []
-    iconRefs.current.forEach((el, id) => {
+    const centers: number[] = []
+    iconRefs.current.forEach((el) => {
       const rect = el.getBoundingClientRect()
-      const cx = rect.left - dockRect.left + rect.width / 2
-      const found = apps.findIndex((a) => a.id === id)
-      if (found !== -1) centers.push({ idx: found, cx })
+      centers.push(rect.left - dockRect.left + rect.width / 2)
     })
-    centers.sort((a, b) => a.cx - b.cx)
+    centers.sort((a, b) => a - b)
 
     // Find where the cursor falls between/around icon centers
     for (let i = 0; i < centers.length; i++) {
-      if (mx < centers[i].cx) return i
+      if (mx < centers[i]) return i
     }
     return centers.length
-  }, [apps])
+  }, [])
+
+  // 命中测试：坐标落在哪个「分组图标」上（排除被拖拽项自身；分组不能嵌套）
+  const hitTestGroup = useCallback((x: number, y: number, excludeId: number): number | null => {
+    for (const [id, el] of iconRefs.current) {
+      if (id === excludeId) continue
+      const app = appsRef.current.find((a) => a.id === id)
+      if (!app?.isGroup) continue
+      const r = el.getBoundingClientRect()
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id
+    }
+    return null
+  }, [])
 
   // Global mouseup to finalize drop (fires even outside the window)
   useEffect(() => {
-    const handleMouseUp = () => {
+    const handleMouseUp = (e: MouseEvent) => {
       const drag = dragRef.current
       dragRef.current = null
       if (!drag) return
 
       // 真实拖拽结束时，吞掉紧随其后的 click——click 在 mouseup 之后派发，
       // 此时 setDragId(null) 已生效，handleRun 的 dragId 判断不再可靠
-      if (dragStartedRef.current) {
-        suppressClickRef.current = true
-        dragStartedRef.current = false
-      }
+      const wasDrag = dragStartedRef.current
+      dragStartedRef.current = false
+      if (wasDrag) suppressClickRef.current = true
 
-      const { idx } = drag
-      const target = dropIdx
-
-      if (target !== null && target !== idx) {
-        setApps((prev) => {
-          const items = [...prev]
-          let to = target
-          if (idx < to) to--
-          const [removed] = items.splice(idx, 1)
-          items.splice(to, 0, removed)
-          return items
-        })
-      }
+      const draggedId = drag.id
+      const overGroup = dragOverGroupRef.current
+      const target = dropIdxRef.current
+      // 「从面板拖出」必须在 Dock 区域内松手才算数：否则面板内的小幅拖动会把条目误踢出分组
+      const dockRect = dockRef.current?.getBoundingClientRect()
+      const inDockBand = !!dockRect && e.clientY >= dockRect.top && e.clientY <= dockRect.bottom
 
       setDragId(null)
       setDropIdx(null)
+      setDragOverGroupId(null)
+      dropIdxRef.current = null
+      dragOverGroupRef.current = null
+      if (!wasDrag) return
+
+      setApps((prev) => {
+        const from = prev.findIndex((a) => a.id === draggedId)
+        if (from === -1) return prev
+        const item = prev[from]
+
+        // 1) 拖到分组图标上 → 归入该组（分组本身不参与归组）
+        const groupOk =
+          overGroup !== null && !item.isGroup && prev.some((a) => a.id === overGroup && a.isGroup)
+        if (groupOk) {
+          if (item.groupId === overGroup) return prev
+          const without = prev.filter((a) => a.id !== draggedId)
+          const gi = without.findIndex((a) => a.id === overGroup)
+          // 插到该组现有成员之后，维持「成员紧跟在分组条目后面」的数组形态
+          let at = gi + 1
+          while (at < without.length && without[at].groupId === overGroup) at++
+          return [...without.slice(0, at), { ...item, groupId: overGroup }, ...without.slice(at)]
+        }
+
+        // 2) 组内成员拖到 Dock 上 → 移出分组并落到落点（面板内松手则取消）
+        if (item.groupId !== undefined) {
+          if (!inDockBand) return prev
+          const without = prev.filter((a) => a.id !== draggedId)
+          const anchor = topAnchorId(without, target)
+          const at = anchor === null ? without.length : without.findIndex((a) => a.id === anchor)
+          const cleared = { ...item }
+          delete cleared.groupId
+          return [...without.slice(0, at), cleared, ...without.slice(at)]
+        }
+
+        // 3) 顶层条目重排（dropIdx 为顶层图标下标空间）
+        if (target === null) return prev
+        const anchor = topAnchorId(prev, target)
+        if (anchor === draggedId) return prev
+        const without = prev.filter((a) => a.id !== draggedId)
+        if (anchor === null) return [...without, item]
+        const at = without.findIndex((a) => a.id === anchor)
+        return [...without.slice(0, at), item, ...without.slice(at)]
+      })
     }
 
     const handleMouseMove = (e: MouseEvent) => {
-      if (!dragRef.current) return
+      const drag = dragRef.current
+      if (!drag) return
       // Start dragging after 5px threshold
-      const dx = e.clientX - dragRef.current.startX
-      const dy = e.clientY - dragRef.current.startY
+      const dx = e.clientX - drag.startX
+      const dy = e.clientY - drag.startY
       if (!dragStartedRef.current && Math.abs(dx) < 5 && Math.abs(dy) < 5) return
 
       if (!dragStartedRef.current) {
         dragStartedRef.current = true
-        setDragId(dragRef.current.id)
+        setDragId(drag.id)
       }
-      setDropIdx(calcDropIndex(e.clientX))
+      // 悬停在分组图标上 → 高亮该组并隐藏插入线（松手即归组）
+      const dragged = appsRef.current.find((a) => a.id === drag.id)
+      const over = dragged && !dragged.isGroup ? hitTestGroup(e.clientX, e.clientY, drag.id) : null
+      dragOverGroupRef.current = over
+      setDragOverGroupId(over)
+      const idx = over === null ? calcDropIndex(e.clientX) : null
+      dropIdxRef.current = idx
+      setDropIdx(idx)
     }
 
     window.addEventListener('mouseup', handleMouseUp)
@@ -135,13 +288,15 @@ function App(): React.ReactElement {
       window.removeEventListener('mouseup', handleMouseUp)
       window.removeEventListener('mousemove', handleMouseMove)
     }
-  }, [dropIdx, calcDropIndex])
+  }, [calcDropIndex, hitTestGroup])
 
-  const handleIconMouseDown = useCallback((e: React.MouseEvent, id: number, idx: number) => {
+  const handleIconMouseDown = useCallback((e: React.MouseEvent, id: number) => {
     if (e.button !== 0) return // left-click only
-    dragRef.current = { id, idx, startX: e.clientX, startY: e.clientY }
+    dragRef.current = { id, startX: e.clientX, startY: e.clientY }
     // 新交互开始，清除上一次拖拽遗留的 click 抑制标记，避免误吞本次点击
     suppressClickRef.current = false
+    // 鼠标接管 → 退出键盘导航
+    setNavId(null)
   }, [])
 
   // Close menus when clicking outside
@@ -161,18 +316,26 @@ function App(): React.ReactElement {
   // ─── 鼠标移出菜单区域时自动关闭（无需点击）─────────────────────────
   // 命中检测基于元素 DOM 包含关系：鼠标不在菜单（或下拉菜单宿主 + 按钮）区域内，
   // 延迟 120ms 后关闭；期间移回则取消。鼠标移出窗口立即关闭。
+  //
+  // menuHoveredRef：必须先真正进过菜单，才启用「移出即关」。右键菜单的底边锚在
+  // Dock 栏上方，右键瞬间鼠标还停在图标上（离菜单几十像素），若一上来就判定，
+  // 手稍慢菜单就被关掉——表现为「Dock 闪一下、菜单不出现」
+  // 有了这道门控，移出就无需再留缓冲：鼠标一离开菜单立即关闭（分组面板同帧显示回来，
+  // 不会出现「菜单还压在面板上」的空档）
+  const menuHoveredRef = useRef(false)
+  // 进入菜单的时刻：刚进菜单就移出（掠过底角/边缘）不应判定为「用户要离开」
+  // 150ms 内不关，之后才启用「移出即关」
+  const menuEnteredAtRef = useRef(0)
+  useEffect(() => {
+    menuHoveredRef.current = false
+    menuEnteredAtRef.current = 0
+  }, [menuPos, contextMenu])
+
   useEffect(() => {
     if (!menuPos && !contextMenu) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const clear = () => {
-      if (timer) { clearTimeout(timer); timer = undefined }
-    }
-    const scheduleClose = () => {
-      clear()
-      timer = setTimeout(() => {
-        setMenuPos(null)
-        setContextMenu(null)
-      }, 120)
+    const closeMenus = () => {
+      setMenuPos(null)
+      setContextMenu(null)
     }
     const handleMouseMove = (e: MouseEvent) => {
       const el = document.elementFromPoint(e.clientX, e.clientY)
@@ -180,35 +343,50 @@ function App(): React.ReactElement {
       // 鼠标停在「添加」按钮上也保持菜单打开
       const inBtn = addBtnRef.current ? addBtnRef.current.contains(el) : false
       const inCtx = ctxRef.current ? ctxRef.current.contains(el) : false
-      if (inMenu || inBtn || inCtx) clear()
-      else scheduleClose()
+      if (inMenu || inBtn || inCtx) {
+        // 只有真正进过「菜单本体」才算 hovered；停在「+」按钮上不算 —— 从按钮到菜单
+        // 之间还有一段路要走，若在按钮上就置位，鼠标一离开按钮立即被判定为「离开菜单」
+        // 而秒关（表现为「鼠标刚离开 + 按钮，菜单立马消失」）
+        if (inMenu || inCtx) {
+          if (!menuHoveredRef.current) menuEnteredAtRef.current = Date.now()
+          menuHoveredRef.current = true
+        }
+        return
+      }
+      // 进过菜单之后，鼠标一移出就立即关闭；两个例外：
+      // 1) 刚进菜单 150ms 内的「掠过」不算离开；
+      // 2) 菜单外扩 24px 的宽容区 —— 从图标移向菜单时要掠过菜单底角/边缘，
+      //    贴着菜单走不算离开，避免半路被关掉（表现为「鼠标刚离开图标菜单就没了」）
+      if (menuHoveredRef.current && Date.now() - menuEnteredAtRef.current > 150) {
+        const near = (node: HTMLElement | null): boolean => {
+          if (!node) return false
+          const r = node.getBoundingClientRect()
+          const m = 24
+          return e.clientX >= r.left - m && e.clientX <= r.right + m &&
+            e.clientY >= r.top - m && e.clientY <= r.bottom + m
+        }
+        if (!near(ctxRef.current) && !near(menuRef.current)) closeMenus()
+      }
     }
-    const handleWindowLeave = () => {
-      clear()
-      setMenuPos(null)
-      setContextMenu(null)
-    }
+    const handleWindowLeave = () => closeMenus()
     document.addEventListener('mousemove', handleMouseMove)
     window.addEventListener('mouseleave', handleWindowLeave)
     return () => {
       document.removeEventListener('mousemove', handleMouseMove)
       window.removeEventListener('mouseleave', handleWindowLeave)
-      clear()
     }
   }, [menuPos, contextMenu])
 
-  // ─── Dock magnification ───────────────────────────────────────────────
+  // ─── Dock magnification（主 Dock 与分组面板共用：面板就是迷你 Dock） ───
 
-  const handleDockMouseMove = useCallback((e: React.MouseEvent) => {
-    if (dragId !== null) return // disable magnification during drag
-    const dock = dockRef.current
-    if (!dock) return
-    const dockRect = dock.getBoundingClientRect()
-    const mx = e.clientX - dockRect.left
-
-    iconRefs.current.forEach((el) => {
+  const magnify = useCallback((container: HTMLElement | null, refs: Map<number, HTMLDivElement>, clientX: number) => {
+    if (!container) return
+    const box = container.getBoundingClientRect()
+    const mx = clientX - box.left
+    refs.forEach((el) => {
+      if (el.dataset.sep) return // 分隔线不参与放大
       const rect = el.getBoundingClientRect()
-      const cx = rect.left - dockRect.left + rect.width / 2
+      const cx = rect.left - box.left + rect.width / 2
       const dist = Math.abs(mx - cx)
       const maxDist = 140
       const maxExtra = 0.4
@@ -222,14 +400,32 @@ function App(): React.ReactElement {
         el.style.zIndex = ''
       }
     })
-  }, [dragId])
+  }, [])
 
-  const handleDockMouseLeave = useCallback(() => {
-    iconRefs.current.forEach((el) => {
+  const resetMagnify = useCallback((refs: Map<number, HTMLDivElement>) => {
+    refs.forEach((el) => {
       el.style.transform = ''
       el.style.zIndex = ''
     })
   }, [])
+
+  const handleDockMouseMove = useCallback((e: React.MouseEvent) => {
+    if (dragId !== null) return // disable magnification during drag
+    magnify(dockRef.current, iconRefs.current, e.clientX)
+  }, [dragId, magnify])
+
+  const handleDockMouseLeave = useCallback(() => {
+    resetMagnify(iconRefs.current)
+  }, [resetMagnify])
+
+  const handlePanelMouseMove = useCallback((e: React.MouseEvent) => {
+    if (dragId !== null) return
+    magnify(panelInnerRef.current, panelIconRefs.current, e.clientX)
+  }, [dragId, magnify])
+
+  const handlePanelMouseLeave = useCallback(() => {
+    resetMagnify(panelIconRefs.current)
+  }, [resetMagnify])
 
   // ─── Horizontal scroll (icon overflow) ──────────────────────────────
   // 图标超过 Dock 宽度时，滚动容器横向滚动，滚轮 / 触控板左右滑动查看。
@@ -247,12 +443,99 @@ function App(): React.ReactElement {
     })
   }, [])
 
-  const handleDockWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+  // 必须用原生非被动监听：React 在 root 容器上以 `{ passive: true }` 注册 wheel
+  // 在 onWheel 里调 preventDefault 是空操作（DevTools 还会报 passive 警告）
+  useEffect(() => {
     const el = dockInnerRef.current
     if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      // 取位移较大的轴，避免触控板斜向滚动时 deltaY+deltaX 双倍位移
+      el.scrollLeft += Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
+  // ─── 拖入文件添加（仅 Dock 栏区域响应） ───────────────────────────────
+
+  const handleDockDragOver = (e: React.DragEvent) => {
+    if (!isFileDragEvent(e)) return
+    // 必须 preventDefault：否则浏览器不把这里当有效放置目标，drop 事件不会派发
     e.preventDefault()
-    // 取位移较大的轴，避免触控板斜向滚动时 deltaY+deltaX 双倍位移
-    el.scrollLeft += Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX
+    // 固定 'copy'，不要改成 'move'：Windows/OLE 拖放里 MOVE 的语义是「文件已被移走」，
+    // 源（资源管理器）据此可能删除原文件；而本应用只读路径、不搬运文件
+    e.dataTransfer.dropEffect = 'copy'
+    if (!fileDragOver) setFileDragOver(true)
+    // 落点指示线复用拖拽排序的 dropIdx（与内部拖拽不会同时发生）
+    setDropIdx(calcDropIndex(e.clientX))
+  }
+
+  const handleDockDragLeave = (e: React.DragEvent) => {
+    if (!isFileDragEvent(e)) return
+    // 在 Dock 内部子元素之间移动也会触发 dragleave，relatedTarget 仍在 Dock 内则忽略
+    const next = e.relatedTarget as Node | null
+    if (next && e.currentTarget.contains(next)) return
+    setFileDragOver(false)
+    setDropIdx(null)
+  }
+
+  const handleDockDrop = async (e: React.DragEvent) => {
+    if (!isFileDragEvent(e)) return
+    e.preventDefault()
+    const at = calcDropIndex(e.clientX)
+    setFileDragOver(false)
+    setDropIdx(null)
+
+    // Electron 32+ 移除了 File.path，路径只能由 preload 的 webUtils.getPathForFile 提供
+    const paths = Array.from(e.dataTransfer.files)
+      .map((f) => window.api.getPathForFile(f))
+      .filter((p) => !!p)
+    if (paths.length === 0) {
+      showDropHint('未能识别文件路径，添加失败')
+      return
+    }
+
+    const result = await window.api.describePaths(paths).catch(() => null)
+    if (!result) {
+      showDropHint('解析失败，未添加')
+      return
+    }
+
+    // 去重：已在 Dock 里的路径跳过（系统位置的 shell: 命令同样参与比较）
+    const known = new Set(apps.map((a) => normPath(a.targetPath)))
+    const accepted = result.accepted.filter((a) => !known.has(normPath(a.targetPath)))
+    const skipped = paths.length - accepted.length
+
+    if (accepted.length === 0) {
+      showDropHint(`已跳过 ${skipped} 个（重复或格式不支持）`)
+      return
+    }
+
+    // id 在 updater 外分配（StrictMode 双调用 updater 时无副作用）
+    const entries: AppEntry[] = accepted.map((a) => ({
+      id: nextId++,
+      iconDataUrl: a.iconDataUrl,
+      targetPath: a.targetPath,
+      arguments: a.arguments,
+      workingDirectory: a.workingDirectory,
+      description: a.description
+    }))
+    setApps((prev) => {
+      // 防御：与桌面扫描合并等并行变更竞态时按路径再过滤一次
+      const have = new Set(prev.map((a) => normPath(a.targetPath)))
+      const add = entries.filter((x) => !have.has(normPath(x.targetPath)))
+      if (add.length === 0) return prev
+      // calcDropIndex 给的是「顶层图标」下标（iconRefs 里只有顶层条目+分隔线），
+      // 不能直接当扁平数组下标用——否则存在分组成员时插入位置会偏（落在分组之前），
+      // 还会把顶层条目插进「成员紧跟分组」的区块中间。用锚点换算（与拖拽重排一致）。
+      const anchor = topAnchorId(prev, at)
+      if (anchor === null) return [...prev, ...add]
+      const pos = prev.findIndex((a) => a.id === anchor)
+      if (pos === -1) return [...prev, ...add]
+      return [...prev.slice(0, pos), ...add, ...prev.slice(pos)]
+    })
+    showDropHint(skipped > 0 ? `已添加 ${accepted.length} 个，跳过 ${skipped} 个` : `已添加 ${accepted.length} 个`)
   }
 
   // ─── Add handlers ─────────────────────────────────────────────────────
@@ -265,7 +548,7 @@ function App(): React.ReactElement {
   }
 
   // 打开/关闭新增菜单，记录「添加」按钮的视口坐标作为菜单锚点
-  const handleAddToggle = () => {
+  const handleAddToggle = useCallback(() => {
     if (menuPos) {
       setMenuPos(null)
       return
@@ -284,7 +567,7 @@ function App(): React.ReactElement {
     window.api.getAutoStart().then((v) => {
       if (!autoStartDirtyRef.current) setAutoStart(v)
     }).catch(() => {})
-  }
+  }, [menuPos])
 
   // 切换桌面图标显隐（乐观更新：点击立即切换菜单文案，IPC 结果再校正）
   const handleToggleDesktopIcons = () => {
@@ -382,6 +665,19 @@ function App(): React.ReactElement {
 
   // ─── Run / context menu ───────────────────────────────────────────────
 
+  // 收起分组面板：只置空 openGroupId（面板是固定高度的迷你 Dock，不涉及窗口尺寸）。
+  // 另外：面板收起后若导航选中项还停在组内成员上，选中框会无处渲染（← 也会变死键），
+  // 所以把「停在成员上」的选中一并复位。导航自己的 Esc / ← 走的是直接 setOpenGroupId
+  // 并把选中显式移回分组图标，不经过这里，行为不受影响。
+  const closeGroupPanel = useCallback(() => {
+    setOpenGroupId(null)
+    setNavId((cur) => {
+      if (cur === null || cur === ADD_BTN_ID) return cur
+      const hit = appsRef.current.find((a) => a.id === cur)
+      return hit && hit.groupId !== undefined ? null : cur
+    })
+  }, [])
+
   const handleRun = useCallback((app: AppEntry) => {
     // 拖拽进行中，禁止点击启动
     if (dragId !== null) return
@@ -390,14 +686,26 @@ function App(): React.ReactElement {
       suppressClickRef.current = false
       return
     }
+    // 分组条目：点击切换面板展开/收起，不启动
+    if (app.isGroup) {
+      if (openGroupId === app.id) closeGroupPanel()
+      else setOpenGroupId(app.id)
+      return
+    }
+    // 分隔符：不启动任何东西（点击/Enter 均无效）
+    if (app.isSeparator) return
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
-  }, [dragId])
+  }, [dragId, openGroupId, closeGroupPanel])
 
+  // 右键条目：stopPropagation 防止冒泡到 .dock 的空白区菜单（否则两个菜单状态互相覆盖）
   const handleContextMenu = (e: React.MouseEvent, id: number) => {
     e.preventDefault()
+    e.stopPropagation()
     setEditingId(null)
     setContextMenu({ x: e.clientX, y: e.clientY, appId: id })
   }
+
+  // 右键 Dock 空白处：不做任何事（分组用图标右键菜单的「新建分组」创建）
 
   // 打开编辑表单：填入当前条目字段（名称/参数/工作目录/图标）
   const handleEdit = (app: AppEntry) => {
@@ -441,6 +749,290 @@ function App(): React.ReactElement {
   const handleDelete = (id: number) => {
     setContextMenu(null)
     setApps((prev) => prev.filter((a) => a.id !== id))
+  }
+
+  // ─── 分组（Stack）：新建 / 解散 / 面板尺寸 ─────────────────────────────
+
+  // 新建分组：空组追加到 Dock 末尾，并横向滚动到末尾让新分组可见
+  // 不自动展开面板——面板会占满 Dock 上方，反而挡住刚建好（且滚出可视区）的分组图标
+  const handleCreateGroup = () => {
+    setContextMenu(null)
+    setMenuPos(null)
+    const id = nextId++ // id 在 updater 外分配（StrictMode 双调用 updater 时无副作用）
+    setApps((prev) => [
+      ...prev,
+      {
+        id,
+        iconDataUrl: '',
+        targetPath: '',
+        arguments: '',
+        workingDirectory: '',
+        description: `分组 ${prev.filter((a) => a.isGroup).length + 1}`,
+        isGroup: true
+      }
+    ])
+    scrollDockToEndRef.current = true
+    showDropHint('已新建分组：把图标拖到分组图标上即可加入')
+  }
+
+  // 解散分组：成员回到顶层（保持在原相对位置），分组条目本身移除
+  const handleDissolveGroup = (groupId: number) => {
+    setContextMenu(null)
+    closeGroupPanel()
+    setApps((prev) =>
+      prev
+        .filter((a) => a.id !== groupId)
+        .map((a) => {
+          if (a.groupId !== groupId) return a
+          const cleared = { ...a }
+          delete cleared.groupId
+          return cleared
+        })
+    )
+  }
+
+  // 浮层底边锚点：分组面板与右键菜单都贴在 Dock 毛玻璃条上方 8px
+  // 用实测的 .dock-bg 位置而非硬编码常量——布局改动后自动跟随
+  const overlayBottom = useCallback(() => {
+    const barTop = dockBgRef.current?.getBoundingClientRect().top
+    return barTop === undefined ? PANEL_BOTTOM : window.innerHeight - barTop + 8
+  }, [])
+
+  // 面板滚轮 → 横向滚动（与主 Dock 一致：原生非被动监听，否则 preventDefault 无效）
+  useEffect(() => {
+    const el = panelInnerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      el.scrollLeft += Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [openGroupId])
+
+  // 面板关闭路径：分组被删 / Esc / 点击别处 / 鼠标移出窗口 / 窗口失焦
+  useEffect(() => {
+    if (openGroupId === null) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      // 导航模式下 Esc 由键盘导航接管（返回主 Dock 而不是直接收起面板）
+      if (e.key === 'Escape' && navId === null) closeGroupPanel()
+    }
+    const onMouseDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (panelRef.current?.contains(t)) return
+      // 分组图标自身的点击由 handleRun 切换，不算「点击别处」
+      if (iconRefs.current.get(openGroupId)?.contains(t)) return
+      closeGroupPanel()
+    }
+    const onLeave = () => closeGroupPanel()
+    document.addEventListener('keydown', onKeyDown)
+    document.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('mouseleave', onLeave)
+    window.addEventListener('blur', onLeave)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      document.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('mouseleave', onLeave)
+      window.removeEventListener('blur', onLeave)
+    }
+  }, [openGroupId, closeGroupPanel, navId])
+
+  // 打开中的分组被删除（如解散、右键删除）时收起面板
+  useEffect(() => {
+    if (openGroupId !== null && !apps.some((a) => a.id === openGroupId)) closeGroupPanel()
+  }, [apps, openGroupId, closeGroupPanel])
+
+  // ─── 键盘导航（Alt+Space 唤出 Dock → 进入导航模式） ────────────────────
+  // 选中项 navId 可以在主 Dock，也可以在展开的面板里；→ 进入分组，← / Esc 返回主 Dock
+
+  // 统一入口：恢复上次选中的位置（不存在则回落第一个图标）
+  // 上次若在分组面板里选中某个成员，则恢复到它所属的分组图标（面板默认不展开）
+  // 注意：必须由调用方传入「新鲜的」列表 —— 启动初始化时 appsRef 的镜像 effect
+  // 声明在本 effect 之后，同一 commit 内读 ref 只会拿到上一轮的 []，会让启动选中失效
+  const resumeNavId = useCallback((list: AppEntry[]): number | null => {
+    const top = list.filter((a) => !a.groupId && !a.isSeparator) // 分隔符不参与导航
+    const last = navLastRef.current
+    if (last === ADD_BTN_ID) return ADD_BTN_ID
+    if (last !== null) {
+      const hit = list.find((a) => a.id === last)
+      // 记忆里若是不参与导航的分隔符（历史脏数据），跳过它走下一级回落
+      if (hit && !hit.isSeparator) {
+        if (hit.groupId !== undefined) {
+          if (top.some((a) => a.id === hit.groupId)) return hit.groupId
+        } else {
+          return hit.id
+        }
+      }
+    }
+    return top[0]?.id ?? null
+  }, [])
+
+  // 主进程通知：Alt+Space 唤出 Dock（托盘点击等鼠标路径不会触发）
+  useEffect(() => {
+    const unsubscribe = window.api.onNavEnter(() => {
+      closeGroupPanel() // 回到主 Dock 层
+      setNavId(resumeNavId(appsRef.current))
+    })
+    return unsubscribe
+  }, [closeGroupPanel, resumeNavId])
+
+  // 启动即进入导航模式：恢复到上次的位置（首次运行则是第一个图标）
+  // 名单可能来自 shortcuts.json，也可能首启时由桌面扫描补上，所以等第一个顶层条目出现再选
+  const navInitRef = useRef(false)
+  useEffect(() => {
+    if (navInitRef.current) return
+    const first = apps.find((a) => !a.groupId && !a.isSeparator)
+    if (!first) return
+    navInitRef.current = true
+    // 传当前渲染的 apps（而非 appsRef）：此处镜像 effect 尚未跑过本轮数据
+    setNavId(resumeNavId(apps))
+  }, [apps, resumeNavId])
+
+  // 选中的条目被删除（右键删除 / 解散分组 / 桌面清理）时退出导航
+  useEffect(() => {
+    if (navId === null || navId === ADD_BTN_ID) return
+    if (!apps.some((a) => a.id === navId)) setNavId(null)
+  }, [apps, navId])
+
+  // 选中项滚入可视区（图标多时 Dock / 面板都是横向滚动的）
+  useEffect(() => {
+    if (navId === null) return
+    navLastRef.current = navId
+    localStorage.setItem('ql-nav-last', String(navId)) // 记忆位置：重启后仍从这里恢复
+    const el = navId === ADD_BTN_ID
+      ? addBtnRef.current
+      : iconRefs.current.get(navId) ?? panelIconRefs.current.get(navId)
+    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [navId, openGroupId])
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      // 编辑表单的输入框里正常打字，不参与导航
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
+
+      // 导航列表排除分隔符（方向键直接跳过它们）
+      const list = openGroupId === null
+        ? appsRef.current.filter((a) => !a.groupId && !a.isSeparator)
+        : appsRef.current.filter((a) => a.groupId === openGroupId && !a.isSeparator)
+
+      // 未处于导航模式：按 ←/→ 直接「唤醒」选中框（Esc / 鼠标点击退出后仍可随时唤起）
+      // 恢复到上次选中的条目；菜单打开时不抢占方向键
+      if (navId === null) {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+        if (contextMenu || menuPos) return
+        const resume = resumeNavId(appsRef.current)
+        if (resume === null) return
+        e.preventDefault()
+        setNavId(resume)
+        return
+      }
+
+      // 「+」新增按钮（Dock 末尾的合成目标，不属于 apps）：← 回到最后一个图标，Enter 打开菜单
+      if (navId === ADD_BTN_ID) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault()
+          const last = list[list.length - 1]
+          if (last) setNavId(last.id)
+        } else if (e.key === 'Enter') {
+          e.preventDefault()
+          handleAddToggle()
+        } else if (e.key === 'Escape') {
+          e.preventDefault()
+          setNavId(null)
+        }
+        return
+      }
+
+      const current = appsRef.current.find((a) => a.id === navId)
+      const idx = list.findIndex((a) => a.id === navId)
+
+      switch (e.key) {
+        case 'ArrowRight': {
+          e.preventDefault()
+          // 分组：→ 进入面板并把选中移到第一个成员（分隔线不参与导航，必须排除）
+          if (current?.isGroup) {
+            setOpenGroupId(current.id)
+            const first = appsRef.current.find((a) => a.groupId === current.id && !a.isSeparator)
+            if (first) setNavId(first.id)
+            return
+          }
+          const next = list[idx + 1]
+          if (next) { setNavId(next.id); return }
+          // 已经在最右：再往右落到 Dock 末尾的「+」新增按钮（面板里没有 + 按钮）
+          if (openGroupId === null) setNavId(ADD_BTN_ID)
+          return
+        }
+        case 'ArrowLeft': {
+          e.preventDefault()
+          // 面板里：← 返回主 Dock 并选中该分组
+          if (openGroupId !== null) {
+            setOpenGroupId(null)
+            setNavId(openGroupId)
+            return
+          }
+          const prev = list[idx - 1]
+          if (prev) setNavId(prev.id)
+          return
+        }
+        case 'Enter': {
+          e.preventDefault()
+          if (!current) return
+          if (current.isGroup) {
+            setOpenGroupId(current.id)
+            const first = appsRef.current.find((a) => a.groupId === current.id && !a.isSeparator)
+            if (first) setNavId(first.id)
+            return
+          }
+          // 启动后 Dock 自动隐藏到托盘，导航随之结束
+          window.api.runApp(current.targetPath, current.arguments, current.workingDirectory)
+          setNavId(null)
+          return
+        }
+        case 'Escape': {
+          e.preventDefault()
+          if (contextMenu || menuPos) { setContextMenu(null); setMenuPos(null); return }
+          if (openGroupId !== null) {
+            // 面板里：Esc 返回主 Dock（仍处于导航模式）
+            setOpenGroupId(null)
+            setNavId(openGroupId)
+            return
+          }
+          setNavId(null)
+          return
+        }
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [navId, openGroupId, contextMenu, menuPos, closeGroupPanel, handleAddToggle])
+
+  // ─── 分隔线 ───────────────────────────────────────────────────────────
+  // 分隔线是一种特殊条目（isSeparator: true）：因此天然参与拖拽排序与持久化
+  // 而启动、桌面扫描去重、缺失清理、键盘导航都会跳过它
+
+  // beforeId 为 null 表示追加到末尾；插到分组成员之前时跟随该成员的分组归属
+  const handleInsertSeparator = (beforeId: number | null) => {
+    setContextMenu(null)
+    setMenuPos(null)
+    const id = nextId++ // id 在 updater 外分配（StrictMode 双调用 updater 时无副作用）
+    setApps((prev) => {
+      const entry: AppEntry = {
+        id,
+        iconDataUrl: '',
+        targetPath: '',
+        arguments: '',
+        workingDirectory: '',
+        description: '分隔线',
+        isSeparator: true
+      }
+      if (beforeId === null) return [...prev, entry]
+      const at = prev.findIndex((a) => a.id === beforeId)
+      if (at === -1) return [...prev, entry]
+      const target = prev[at]
+      if (target.groupId !== undefined) entry.groupId = target.groupId
+      return [...prev.slice(0, at), entry, ...prev.slice(at)]
+    })
   }
 
   // 右键菜单（非编辑态）动作可见性判断
@@ -495,7 +1087,9 @@ function App(): React.ReactElement {
       const rank = (f: { specialType?: 'this-pc' | 'recycle-bin' }): number =>
         f.specialType === 'this-pc' ? 0 : f.specialType === 'recycle-bin' ? 1 : 2
       fresh.sort((a, b) => rank(a) - rank(b))
-      const entries = fresh.map((f) => ({
+      // 显式标注 AppEntry[]：否则 map 推断出「带 specialType」/「带 isFolder」两个对象形状的
+      // 联合类型，下面 add.filter((e) => e.specialType) 会在缺该字段的分支上报 TS2339
+      const entries: AppEntry[] = fresh.map((f) => ({
         id: nextId++,
         iconDataUrl: f.iconDataUrl,
         targetPath: f.path,
@@ -600,7 +1194,13 @@ function App(): React.ReactElement {
   }, [apps])
 
   // 图标增删 / 初始加载后刷新两侧渐隐提示（此时 DOM 已更新，scrollWidth 可用）
+  // 顺带处理「新建分组后滚动到末尾」的待办标记
   useEffect(() => {
+    const el = dockInnerRef.current
+    if (scrollDockToEndRef.current) {
+      scrollDockToEndRef.current = false
+      if (el) el.scrollLeft = el.scrollWidth
+    }
     updateScrollState()
   }, [apps, updateScrollState])
 
@@ -612,8 +1212,31 @@ function App(): React.ReactElement {
     return cls
   }
 
-  // 右键菜单对应的条目（编辑表单与菜单动作共用）
+  // 右键菜单对应的条目
   const ctxApp = contextMenu ? apps.find((a) => a.id === contextMenu.appId) : undefined
+  // Dock 顶层图标（组内成员只在面板里渲染）+ 当前展开分组的成员
+  const topLevel = apps.filter((a) => !a.groupId)
+  const openGroupMembers = openGroupId === null ? [] : apps.filter((a) => a.groupId === openGroupId)
+  const openGroup = openGroupId === null ? undefined : apps.find((a) => a.id === openGroupId)
+  // 浮层（面板 / 右键菜单）的底边锚点，渲染时算一次
+  const overlayBottomOffset = overlayBottom()
+  // 右键菜单的高度上限：Dock 栏上方可用空间（默认窗口高度下约 138px），超出时内部滚动
+  const menuAvail = Math.max(120, BASE_WINDOW_H - overlayBottomOffset - 8)
+  // 分组 → 成员列表（面板渲染用，含分隔线）
+  const groupMembersById = new Map<number, AppEntry[]>()
+  // 分组 → 可显示成员（排除分隔线）：分组图标的缩略拼图与数量徽标用它，
+  // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大
+  const groupIconMembersById = new Map<number, AppEntry[]>()
+  for (const a of apps) {
+    if (a.groupId === undefined) continue
+    const list = groupMembersById.get(a.groupId)
+    if (list) list.push(a)
+    else groupMembersById.set(a.groupId, [a])
+    if (a.isSeparator) continue
+    const iconList = groupIconMembersById.get(a.groupId)
+    if (iconList) iconList.push(a)
+    else groupIconMembersById.set(a.groupId, [a])
+  }
 
   return (
     <div
@@ -621,48 +1244,100 @@ function App(): React.ReactElement {
       onMouseEnter={() => window.api.dockPointer(true)}
     >
       <div
-        className="dock"
+        className={'dock' + (fileDragOver ? ' drop-active' : '')}
         ref={dockRef}
         onMouseMove={handleDockMouseMove}
         onMouseLeave={handleDockMouseLeave}
+        onDragOver={handleDockDragOver}
+        onDragLeave={handleDockDragLeave}
+        onDrop={handleDockDrop}
       >
         {/* 毛玻璃背景独立层：只覆盖图标区（图标在其中垂直居中，上下间距小）。
             顶部放大留白区是透明的，hover 放大时图标会顶出背景之上（类似 macOS）。 */}
-        <div className="dock-bg" />
+        <div className="dock-bg" ref={dockBgRef} />
         <div
           className="dock-inner"
           ref={dockInnerRef}
-          onWheel={handleDockWheel}
           onScroll={updateScrollState}
         >
           {dropIdx === 0 && <div className="drop-indicator" />}
 
-          {apps.map((app, idx) => (
+          {topLevel.map((app, idx) => (
             <div key={app.id} style={{ display: 'contents' }}>
+              {app.isSeparator ? (
+                // 分隔线：不参与悬停放大（data-sep），可拖拽、可右键
+                <div
+                  className={'dock-sep' + (dragId === app.id ? ' dragging' : '')}
+                  data-sep="1"
+                  ref={(el) => {
+                    if (el) iconRefs.current.set(app.id, el)
+                    else iconRefs.current.delete(app.id)
+                  }}
+                  onMouseDown={(e) => handleIconMouseDown(e, app.id)}
+                  onContextMenu={(e) => handleContextMenu(e, app.id)}
+                  title={app.description}
+                />
+              ) : (
               <div
-                className={getItemClass(app.id)}
+                className={
+                  getItemClass(app.id) +
+                  (dragOverGroupId === app.id ? ' drop-target' : '') +
+                  (navId === app.id ? ' selected' : '')
+                }
                 ref={(el) => {
                   if (el) iconRefs.current.set(app.id, el)
                   else iconRefs.current.delete(app.id)
                 }}
-                onMouseDown={(e) => handleIconMouseDown(e, app.id, idx)}
+                onMouseDown={(e) => handleIconMouseDown(e, app.id)}
                 onClick={() => handleRun(app)}
                 onContextMenu={(e) => handleContextMenu(e, app.id)}
                 title={app.description}
               >
                 <div className="dock-icon-wrap">
-                  <img className="dock-icon" src={app.iconDataUrl} alt="" draggable={false} />
+                  {app.isGroup && !app.iconDataUrl ? (
+                    // 分组图标：默认用组内前 4 个图标的缩略拼图（macOS 堆叠观感），
+                    // 空组回退 2×2 网格图标；用户手动换过图标则走下面的 <img>
+                    (() => {
+                      // 用「可显示成员」（排除分隔线）做拼图，避免空破图格子
+                      const members = groupIconMembersById.get(app.id) ?? []
+                      if (members.length === 0) {
+                        return (
+                          <div className="dock-icon group-glyph">
+                            <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+                              <rect x="3" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
+                              <rect x="13.4" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
+                              <rect x="3" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
+                              <rect x="13.4" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
+                            </svg>
+                          </div>
+                        )
+                      }
+                      return (
+                        <div className={'dock-group-preview' + (members.length === 1 ? ' single' : '')}>
+                          {members.slice(0, 4).map((m) => (
+                            <img key={m.id} src={m.iconDataUrl} alt="" draggable={false} />
+                          ))}
+                        </div>
+                      )
+                    })()
+                  ) : (
+                    <img className="dock-icon" src={app.iconDataUrl} alt="" draggable={false} />
+                  )}
+                  {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 0 && (
+                    <span className="dock-badge">{groupIconMembersById.get(app.id)!.length}</span>
+                  )}
                 </div>
                 <span className="dock-label">{app.description || '未命名'}</span>
               </div>
+              )}
               {dropIdx === idx + 1 && dragId !== app.id && (
                 <div className="drop-indicator" />
               )}
             </div>
           ))}
 
-          {/* Add button */}
-          <div className="dock-item dock-add" ref={addBtnRef}>
+          {/* Add button（键盘导航可落到这里：Enter 打开菜单） */}
+          <div className={'dock-item dock-add' + (navId === ADD_BTN_ID ? ' selected' : '')} ref={addBtnRef}>
             <div
               className="dock-icon-wrap dock-add-btn"
               onClick={handleAddToggle}
@@ -681,6 +1356,78 @@ function App(): React.ReactElement {
         <div className={`dock-edge right${scrollState.right ? ' show' : ''}`} />
       </div>
 
+      {/* 分组面板：主 Dock 同构的迷你 Dock —— 图标尺寸/悬停放大/悬浮标签全部复用
+          .dock-item 系列的样式，宽度随图标数量伸缩，超出窗口时横向滚动；高度固定。
+          因此不改变窗口尺寸（无 resize 白闪）。 */}
+      {openGroup && (
+        <div
+          className="group-panel"
+          ref={panelRef}
+          style={{
+            bottom: overlayBottomOffset,
+            // 右键菜单锚在 Dock 栏上方、与面板同处一条带（窗口只有 300px 高，面板上方
+            // 只剩十几像素，无法再往上叠）——菜单打开期间藏起面板；菜单一关闭（鼠标移出即关
+            // 即关，见菜单自动关闭 effect）面板同帧显示回来，不会出现重叠空档
+            visibility: contextMenu ? 'hidden' : 'visible'
+          }}
+        >
+          <div className="group-panel-bg" />
+          <div
+            className="group-panel-inner"
+            ref={panelInnerRef}
+            onMouseMove={handlePanelMouseMove}
+            onMouseLeave={handlePanelMouseLeave}
+          >
+            {openGroupMembers.map((m) => (
+              m.isSeparator ? (
+                <div
+                  key={m.id}
+                  className={'dock-sep' + (dragId === m.id ? ' dragging' : '')}
+                  data-sep="1"
+                  ref={(el) => {
+                    if (el) panelIconRefs.current.set(m.id, el)
+                    else panelIconRefs.current.delete(m.id)
+                  }}
+                  onMouseDown={(e) => handleIconMouseDown(e, m.id)}
+                  onContextMenu={(e) => handleContextMenu(e, m.id)}
+                  title={m.description}
+                />
+              ) : (
+              <div
+                key={m.id}
+                className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')}
+                ref={(el) => {
+                  if (el) panelIconRefs.current.set(m.id, el)
+                  else panelIconRefs.current.delete(m.id)
+                }}
+                onMouseDown={(e) => handleIconMouseDown(e, m.id)}
+                onClick={() => handleRun(m)}
+                onContextMenu={(e) => handleContextMenu(e, m.id)}
+                title={m.description}
+              >
+                <div className="dock-icon-wrap">
+                  <img className="dock-icon" src={m.iconDataUrl} alt="" draggable={false} />
+                </div>
+                <span className="dock-label">{m.description || '未命名'}</span>
+              </div>
+              )
+            ))}
+            {openGroupMembers.length === 0 && (
+              <div className="group-panel-empty">
+                空分组 —— 把 Dock 上的图标拖到分组图标上即可加入
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 拖入提示 / 拖放结果提示：fixed 定位于 Dock 上方（脱离滚动容器，不被裁剪） */}
+      {(fileDragOver || dropHint) && (
+        <div className={`drop-hint${fileDragOver ? ' active' : ''}`}>
+          {fileDragOver ? '松开即添加' : dropHint}
+        </div>
+      )}
+
       {/* 新增按钮下拉菜单：渲染在滚动容器之外（fixed 定位），避免被 overflow 裁剪。
           锚点：水平居中对齐「添加」按钮，菜单底边在按钮上方 8px。 */}
       {menuPos && (
@@ -691,10 +1438,12 @@ function App(): React.ReactElement {
             // 水平钳制在窗口内：菜单以按钮中心为锚点居中，若按钮靠近窗口右缘，
             // 菜单会伸出窗口被裁掉右角（圆角变直角）。钳到距边缘 100px 内保证完整。
             left: Math.min(Math.max(menuPos.cx, 100), window.innerWidth - 100),
-            bottom: window.innerHeight - menuPos.top + 8,
+            // 底边用与右键菜单相同的锚点（Dock 毛玻璃条上方 8px）——若锚在「+」按钮顶部，
+            // 菜单底边正好贴在玻璃条顶边上，看起来完全没有间距
+            bottom: overlayBottomOffset,
             transform: 'translateX(-50%)',
-            // 菜单不超过「添加」按钮上方空间，否则顶部会超出 300px 窗口被裁掉
-            maxHeight: menuPos.top - 8
+            // 不超过 Dock 栏上方可用空间（与右键菜单一致），超出时内部滚动
+            maxHeight: menuAvail
           }}
         >
           <button className="dropdown-item" onClick={handleAdd}>
@@ -759,16 +1508,25 @@ function App(): React.ReactElement {
           ref={ctxRef}
           className="context-menu"
           style={{
-            // 同样钳制在窗口内，防止右缘被裁掉圆角
-            left: Math.min(Math.max(contextMenu.x + 4, 60), window.innerWidth - 60),
-            // 参考「+」按钮下拉菜单：向上弹出（bottom 对齐光标上方 8px）——
-            // 300px 窗口内 Dock 在底部，向下弹会被窗口下边界裁掉
-            bottom: window.innerHeight - contextMenu.y + 8,
-            // 菜单不超过光标上方空间，超出时内部滚动
-            maxHeight: contextMenu.y - 8
+            // 定位：默认在光标右侧展开，但让**光标落在菜单内侧 8px**（left: x - 8）
+            // 这样「鼠标垂直往上移」就能直接进入菜单；原先 left: x + 4 让光标停在菜单左缘
+            // 之外，必须向右偏一点才进得去，一偏一收就触发「移出即关」而秒关
+            // 靠近窗口右缘时翻转为贴右缘向左展开（同样让光标落在内侧 8px）
+            ...(contextMenu.x + 4 + (editingId === contextMenu.appId ? 280 : 170) > window.innerWidth
+              ? { right: Math.max(8, window.innerWidth - contextMenu.x - 8) }
+              : { left: Math.max(4, contextMenu.x - 8) }),
+            // 向上弹出，底边贴在 Dock 毛玻璃栏上方 8px（锚在光标上的话，光标位于图标内部，
+            // 菜单底边会压进 Dock 栏里）
+            bottom: overlayBottomOffset,
+            // 高度上限按「未加高」的窗口算（右键菜单不做 resize，避免透明窗口白闪）；
+            // 菜单项多时内部滚动
+            maxHeight: menuAvail
           }}
         >
-          {editingId === contextMenu.appId && ctxApp ? (
+          {ctxApp?.isSeparator ? (
+            // 分隔线自己的菜单：只有删除
+            <button className="context-menu-item" onClick={() => handleDelete(ctxApp.id)}>删除</button>
+          ) : editingId === contextMenu.appId && ctxApp ? (
             <>
               <div className="edit-fields">
                 <label className="edit-label">
@@ -780,30 +1538,41 @@ function App(): React.ReactElement {
                     placeholder={ctxApp.description || '名称'}
                   />
                 </label>
-                <label className="edit-label">
-                  参数
-                  <input
-                    className="edit-input"
-                    value={editFields.arguments}
-                    onChange={(e) => setEditFields({ ...editFields, arguments: e.target.value })}
-                    placeholder="启动参数（可留空）"
-                  />
-                </label>
-                <label className="edit-label">
-                  工作目录
-                  <input
-                    className="edit-input"
-                    value={editFields.workingDirectory}
-                    onChange={(e) => setEditFields({ ...editFields, workingDirectory: e.target.value })}
-                    placeholder="工作目录（可留空）"
-                  />
-                </label>
+                {/* 分组没有启动参数/工作目录，表单只留名称 + 图标 */}
+                {!ctxApp.isGroup && (
+                  <>
+                    <label className="edit-label">
+                      参数
+                      <input
+                        className="edit-input"
+                        value={editFields.arguments}
+                        onChange={(e) => setEditFields({ ...editFields, arguments: e.target.value })}
+                        placeholder="启动参数（可留空）"
+                      />
+                    </label>
+                    <label className="edit-label">
+                      工作目录
+                      <input
+                        className="edit-input"
+                        value={editFields.workingDirectory}
+                        onChange={(e) => setEditFields({ ...editFields, workingDirectory: e.target.value })}
+                        placeholder="工作目录（可留空）"
+                      />
+                    </label>
+                  </>
+                )}
               </div>
               <div className="edit-actions">
                 <button className="context-menu-item edit-action" onClick={handlePickIcon}>更换图标</button>
                 <button className="context-menu-item edit-action" onClick={handleSaveEdit}>保存</button>
                 <button className="context-menu-item edit-action" onClick={handleCancelEdit}>取消</button>
               </div>
+            </>
+          ) : ctxApp?.isGroup ? (
+            <>
+              <button className="context-menu-item" onClick={() => handleEdit(ctxApp)}>编辑</button>
+              <div className="context-menu-divider" />
+              <button className="context-menu-item" onClick={() => handleDissolveGroup(ctxApp.id)}>解散分组</button>
             </>
           ) : (
             <>
@@ -819,10 +1588,12 @@ function App(): React.ReactElement {
                   {ctxApp.targetPath && (
                     <button className="context-menu-item" onClick={() => handleCopyPath(ctxApp)}>复制路径</button>
                   )}
+                  <button className="context-menu-item" onClick={handleCreateGroup}>新建分组</button>
+                  <button className="context-menu-item" onClick={() => handleInsertSeparator(ctxApp.id)}>在此之前插入分隔线</button>
                   <div className="context-menu-divider" />
                 </>
               )}
-              <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId)}>删除</button>
+              <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId!)}>删除</button>
             </>
           )}
         </div>
