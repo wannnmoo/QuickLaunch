@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename, extname, dirname } from 'path'
-import { readFileSync, writeFileSync, existsSync, statSync, watch, type FSWatcher } from 'fs'
+import { readFileSync, writeFileSync, existsSync, statSync, watch, promises as fsp, type FSWatcher, type Dirent } from 'fs'
 import { execFile, exec } from 'child_process'
 
 
@@ -108,8 +108,8 @@ public static class IconExtractor {
 }
 '@`
 
-/** Run PowerShell to extract an icon from a DLL/EXE and return a data: URL. */
-function extractIcon(iconFile: string, iconIndex: number, size = 256): Promise<string> {
+
+/** Run PowerShell to extract an icon from a DLL/EXE and return a data: URL. */function extractIcon(iconFile: string, iconIndex: number, size = 256): Promise<string> {
   return new Promise((resolve) => {
     const psScript = `${ICON_EXTRACTOR_CS}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -311,26 +311,155 @@ ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
 
 const shortcutsPath = join(app.getPath('userData'), 'shortcuts.json')
 
-// ─── 窗口位置持久化（多显示器支持）───────────────────────────────────────
+// ─── 窗口停靠位置（下 / 中间 / 上，左/右竖排预留）─────────────────────────
+// Dock **不支持自由拖动**：窗口位置完全由「位置」预设决定（下/上贴边居中、中间居中），
+// 没有 app-region 拖动区、没有位置记忆。要挪位置就点菜单里的「位置」。
+// 好处是位置永远确定（不会停在半空 / 拖出屏幕 / 与贴边吸附打架），
+// 也省掉了整套拖动期间的位置补偿逻辑（那套在拖动中做不干净，会闪）。
+// 左/右竖排的窗口形状与几何已预留在类型和 windowSizeFor/presetPosition 里。
 
+/** 已经实现的停靠位置（左/右竖排还没做：类型里保留，但不接受写入也不需要重建窗口） */
+const DOCK_EDGES = ['bottom', 'top', 'left', 'right', 'middle'] as const
+type DockEdge = (typeof DOCK_EDGES)[number]
+const IMPLEMENTED_EDGES: readonly DockEdge[] = ['bottom', 'top', 'middle']
+const isImplementedEdge = (v: unknown): v is DockEdge =>
+  typeof v === 'string' && IMPLEMENTED_EDGES.includes(v as DockEdge)
+/** 横条 = 图标横向排列（下/上/中间）；竖条 = 图标纵向排列（左右边） */
+const isVerticalDock = (edge: DockEdge): boolean => edge === 'left' || edge === 'right'
+/** 玻璃条高度（与 CSS 里 .dock-bg 的 76px 一致，**不是** .dock 的 146px——
+ *  146 含上方 70px 透明放大区）。「中间」位置用它把可见的玻璃条居中 */
+const DOCK_GLASS_H = 76
+/** 默认停靠位置：悬浮在屏幕中间（四周都有空间，悬停放大的幅度不受屏幕边缘影响） */
+const DEFAULT_EDGE: DockEdge = 'middle'
+
+/** 只存停靠位置（历史文件里的坐标字段会被忽略：不再有自由拖动） */
 const layoutPath = join(app.getPath('userData'), 'window-position.json')
 
-/** 读取上次保存的窗口位置；坐标需落在某个显示器工作区内（显示器移除/分辨率变化时丢弃） */
-function readWindowPosition(): { x: number; y: number } | null {
+/** 当前停靠位置（窗口创建时从记忆里读，切换位置时原地应用或重建窗口） */
+let dockEdge: DockEdge = DEFAULT_EDGE
+/** 重建窗口期间抑制 window-all-closed 的退出（destroy 旧窗口会触发一次） */
+let recreatingWindow = false
+
+/** 读取记忆的停靠位置。只认已实现的三档：历史文件里若残留 left/right（竖排还没做），
+ *  一律回落到默认值——否则会建出竖窗口却按横条布局画，选择器还会三档全不亮 */
+function readDockEdge(): DockEdge {
   try {
-    const raw = JSON.parse(readFileSync(layoutPath, 'utf-8'))
-    if (typeof raw.x === 'number' && typeof raw.y === 'number') {
-      const valid = screen.getAllDisplays().some((d) => {
-        const wa = d.workArea
-        return (
-          raw.x >= wa.x - 40 && raw.x < wa.x + wa.width - 40 &&
-          raw.y >= wa.y - 40 && raw.y < wa.y + wa.height - 40
-        )
-      })
-      if (valid) return { x: raw.x, y: raw.y }
+    if (!existsSync(layoutPath)) return DEFAULT_EDGE
+    const raw = JSON.parse(readFileSync(layoutPath, 'utf-8')) as Record<string, unknown>
+    return isImplementedEdge(raw.edge) ? raw.edge : DEFAULT_EDGE
+  } catch { return DEFAULT_EDGE }
+}
+
+function writeDockEdge(edge: DockEdge): void {
+  try { writeFileSync(layoutPath, JSON.stringify({ edge }), 'utf-8') } catch {}
+}
+
+/** 停靠位置决定窗口形状：横条是「宽 85% × 高 300」（下/上/中间），竖条（下一阶段）是「宽 300 × 高 85%」 */
+function windowSizeFor(edge: DockEdge): { w: number; h: number } {
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize
+  if (isVerticalDock(edge)) return { w: 300, h: Math.min(Math.round(height * 0.85), 1200) }
+  return { w: Math.min(Math.round(width * 0.85), 1200), h: 300 }
+}
+
+/** 各停靠位置的窗口坐标（Dock 不支持自由拖动，位置只由这里决定）：
+ *  - 下 / 上：水平居中、吸附到工作区下沿 / 上沿
+ *  - 中间：水平居中，并让**可见的玻璃条**（76px，不是 .dock 的 146px）中心落在工作区中心
+ *  - 左 / 右：垂直居中、吸附到左沿 / 右沿（竖排下一阶段） */
+function presetPosition(edge: DockEdge, size: { w: number; h: number }, wa: Electron.Rectangle): { x: number; y: number } {
+  const cx = Math.round(wa.x + (wa.width - size.w) / 2)
+  const cy = Math.round(wa.y + (wa.height - size.h) / 2)
+  if (edge === 'middle') return { x: cx, y: Math.round(wa.y + wa.height / 2 - size.h + DOCK_GLASS_H / 2) }
+  if (isVerticalDock(edge)) return { y: cy, x: edge === 'left' ? wa.x : wa.x + wa.width - size.w }
+  return { x: cx, y: edge === 'bottom' ? wa.y + wa.height - size.h : wa.y }
+}
+
+/** 目标位置对应的窗口坐标（主显示器工作区内，钳制一次防止分辨率变化后跑出屏幕） */
+function positionForEdge(edge: DockEdge, size: { w: number; h: number }): { x: number; y: number } {
+  const wa = screen.getPrimaryDisplay().workArea
+  const preset = presetPosition(edge, size, wa)
+  const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v))
+  return {
+    x: clamp(preset.x, wa.x, wa.x + Math.max(0, wa.width - size.w)),
+    y: clamp(preset.y, wa.y, wa.y + Math.max(0, wa.height - size.h))
+  }
+}
+
+/** 只做「销毁旧窗口 + 按指定位置重建」（竖排换窗口形状时用）。
+ *  重建失败会留下「没有窗口」的死状态（Alt+Space 与托盘「显示窗口」都依赖 mainWindow），
+ *  所以这里兜一次重试并把错误打出来，至少留下可诊断的痕迹 */
+function recreateWindowForEdge(next: DockEdge, hidden: boolean): void {
+  recreatingWindow = true
+  const old = mainWindow
+  mainWindow = null
+  try { old?.destroy() } catch {}
+  try {
+    createWindow(next, hidden)
+  } catch (err) {
+    console.error('[window] 重建窗口失败，重试一次:', err)
+    try { createWindow(next, hidden) } catch (err2) { console.error('[window] 重建窗口再次失败:', err2) }
+  } finally {
+    // try/finally：万一 createWindow 抛异常，标志位也必须复位，
+    // 否则之后真正的「关掉最后一个窗口」会被吞掉，应用退不出去
+    recreatingWindow = false
+  }
+}
+
+/** 应用停靠位置（点菜单里的「位置」）。
+ *  **横向三档（下 / 上 / 中间）窗口尺寸完全相同**，所以原地 `setBounds` + 通知渲染端换布局
+ *  即可——瞬间生效，不用重建窗口。重建的代价是重跑一遍启动流程（读 shortcuts、PowerShell
+ *  扫桌面文件夹、读驱动器），要 1~2 秒。
+ *  只有尺寸真的变了（竖排左/右，下一阶段）才重建。
+ *  位置只由预设决定：Dock 不支持自由拖动，所以这里不需要任何位置补偿逻辑。 */
+function applyDockEdge(next: DockEdge): boolean {
+  if (dockEdge !== next) writeDockEdge(next)
+  const prev = dockEdge
+  dockEdge = next
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow(next, dockTrayHidden)
+    return true
+  }
+  const a = windowSizeFor(prev)
+  const b = windowSizeFor(next)
+  if (a.w !== b.w || a.h !== b.h) {
+    recreateWindowForEdge(next, dockTrayHidden)
+    return true
+  }
+  const pos = positionForEdge(next, { w: b.w, h: b.h })
+  mainWindow.setBounds({ x: pos.x, y: pos.y, width: b.w, height: b.h })
+  mainWindow.webContents.send('dock-edge-changed', next)
+  return true
+}
+
+/** 切换停靠位置。已经在该位置的标准坐标上（±2px）也不早退而不发事件——
+ *  渲染端可能是刚重载过的（dev HMR / Ctrl+R），它需要这条事件把布局对齐到真实位置 */
+function setDockEdge(next: DockEdge): boolean {
+  if (mainWindow && !mainWindow.isDestroyed() && next === dockEdge) {
+    const preset = positionForEdge(next, windowSizeFor(next))
+    const b = mainWindow.getBounds()
+    if (Math.abs(b.x - preset.x) <= 2 && Math.abs(b.y - preset.y) <= 2) {
+      // 位置已经对了：只需要把当前停靠位置同步给渲染端
+      mainWindow.webContents.send('dock-edge-changed', next)
+      return true
     }
-  } catch {}
-  return null
+  }
+  return applyDockEdge(next)
+}
+
+ipcMain.handle('set-dock-edge', (_e, next: unknown) => {
+  if (!isImplementedEdge(next)) return false // 左/右竖排未实现：拒绝写入，避免出现竖窗横布局
+  return setDockEdge(next)
+})
+
+/** 读取当前停靠位置：渲染端挂载时用它对齐（argv 里的 `--ql-edge` 只是建窗那一刻的快照，
+ *  而横向三档是原地切换、不重建窗口，所以页面重载后 argv 会过期） */
+ipcMain.handle('get-dock-edge', () => dockEdge)
+
+/** 显示器参数变化（分辨率/DPI/主屏切换/显示器增删）后重新归位：
+ *  预设坐标与窗口尺寸都按当前工作区算，否则会出现「不再贴边/居中」甚至右端跑出屏幕。
+ *  注意：`screen` 模块必须在 app ready 之后才能用，所以注册放在 whenReady 里 */
+function reapplyDockEdgeOnDisplayChange(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  applyDockEdge(dockEdge)
 }
 
 ipcMain.handle('load-shortcuts', () => {
@@ -692,6 +821,14 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // Executable
   execFile(targetPath, args ? splitArgs(args) : [], { cwd: workingDir || undefined }, (err) => {
     if (!err) return
+    // 启动失败就把 Dock 还回来：点图标时已经先隐藏到托盘了，若目标已被删除/移动（ENOENT）
+    // 或没有关联程序，用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      dockTrayHidden = false
+      mainWindow.show()
+      mainWindow.setAlwaysOnTop(true)
+      mainWindow.moveTop()
+    }
     // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
     // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
     // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
@@ -844,6 +981,280 @@ ipcMain.handle('describe-paths', async (_e, paths: unknown) => {
   return { accepted: slots.filter((s): s is DroppedEntry => s !== null), rejected }
 })
 
+// ─── IPC: 枚举驱动器（「此电脑」悬停卡片 + 图标用量条） ────────────────────
+// GetDrives() 本身不产生 I/O；容量与卷标只对固定盘/移动盘查询——断开的网络盘上
+// AvailableFreeSpace 会阻塞数秒，所以网络盘/光驱只列盘符不查容量。
+ipcMain.handle('list-drives', () => new Promise((resolve) => {
+  const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$out = @()
+foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+  $type = [string]$d.DriveType
+  $label = ''
+  $format = ''
+  $total = [long]0
+  $free = [long]0
+  $ready = $true
+  if ($type -eq 'Fixed' -or $type -eq 'Removable') {
+    try {
+      $ready = $d.IsReady
+      if ($ready) {
+        $label = [string]$d.VolumeLabel
+        $format = [string]$d.DriveFormat
+        $total = [long]$d.TotalSize
+        $free = [long]$d.AvailableFreeSpace
+      }
+    } catch { $ready = $false }
+  }
+  $out += @{ name = $d.Name.TrimEnd('\\'); label = $label; type = $type; format = $format; total = $total; free = $free; ready = $ready }
+}
+if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
+  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 8000 }, (err, stdout) => {
+    if (err || !stdout.trim()) { resolve([]); return }
+    try {
+      const parsed = JSON.parse(stdout.trim())
+      // 只有一个驱动器时 ConvertTo-Json 输出对象而非数组
+      const items: { name: string; label: string; type: string; format: string; total: number; free: number; ready: boolean }[] =
+        Array.isArray(parsed) ? parsed : [parsed]
+      resolve(items.map((d) => ({
+        name: String(d.name || ''),
+        label: String(d.label || ''),
+        type: String(d.type || ''),
+        format: String(d.format || ''),
+        total: Number(d.total) || 0,
+        free: Number(d.free) || 0,
+        ready: d.ready !== false
+      })))
+    } catch { resolve([]) }
+  })
+}))
+
+// ─── IPC: 列出文件夹子项（文件夹条目悬停预览卡片） ────────────────────────
+// 枚举走 fs、图标走 Electron 内置的 app.getFileIcon（进程内 shell 图标查询）——
+// **全程不起 PowerShell**：实测 `powershell -NoProfile` 单是启动就 ~900ms，加上
+// Add-Type 编译 ~250ms、每图标 ~12ms，一个文件夹要 1.3s 才换上真图标；
+// app.getFileIcon 20 个文件共 284ms（首次）/ 36ms（之后，系统有缓存），快 5~40 倍。
+// 返回分两段：首批 FOLDER_ICON_INLINE 个图标在返回前就填好（配合 renderer 的悬停预取，
+// 卡片弹出时图标已就位），其余后台分批补并推 `folder-icons` 事件就地替换。
+const FOLDER_LIST_LIMIT = 400
+const FOLDER_LIST_TTL = 5000
+const FOLDER_CACHE_MAX = 40
+const FOLDER_ICON_INLINE = 14 // 返回前就填好的首批（卡片首屏可见的那十几行）
+const FOLDER_ICON_BATCH = 24 // 后台每批数量（每批推一次事件，卡片逐批换图标）
+const FOLDER_ICON_LIMIT = 150 // 后台补图标的总上限，再多就没意义了（超出用中性占位块）
+// 资源管理器默认不显示的系统文件/目录：列出来只是噪音（每个文件夹都有 desktop.ini）
+const FOLDER_BLOCKLIST = new Set(['desktop.ini', 'thumbs.db', '$recycle.bin', 'system volume information'])
+const folderCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' })
+
+interface FolderChild {
+  name: string
+  path: string
+  isDir: boolean
+  /** 文件字节数；目录恒为 -1（不递归统计——大文件夹会把卡片卡死） */
+  size: number
+  iconDataUrl: string
+}
+interface FolderListing {
+  path: string
+  name: string
+  folders: number
+  files: number
+  items: FolderChild[]
+  /** 超出列举上限、未列出的条目数（卡片底部提示一句，让用户去资源管理器看） */
+  truncated: number
+  /** 仅在失败时出现：missing=不存在 / denied=没权限 / notdir=不是文件夹 */
+  error?: 'missing' | 'denied' | 'notdir'
+}
+
+const folderListCache = new Map<string, { at: number; data: FolderListing }>()
+/** 正在枚举中的目录（渲染端会「悬停预取 + 卡片打开」请求两次，靠它复用同一个 Promise） */
+const folderListPending = new Map<string, Promise<FolderListing>>()
+
+// 目录统一用标准黄色文件夹图标（shell32 index 4，与 Dock 上文件夹条目同源）。
+// 不能对目录用 app.getFileIcon：实测它返回的是错图标（dist/node_modules 变成「磁盘」图标、
+// .git/.dsh-* 变成白纸），只有对文件才是正确的 shell 类型图标。
+// 提取一次（~0.3s 的 PowerShell）后常驻内存；启动即预热，首次悬停通常已经就绪。
+let folderIcon: string | null = null
+let folderIconLoading: Promise<void> | null = null
+function ensureFolderIcon(): Promise<void> {
+  if (folderIcon !== null) return Promise.resolve()
+  if (!folderIconLoading) {
+    // 64px 足够（卡片行只显示 17px），payload 比 256px 小一个量级
+    folderIconLoading = extractIcon('C:\\Windows\\System32\\shell32.dll', 4, 64)
+      .then((url) => { folderIcon = url || '' })
+      .catch(() => { folderIcon = '' })
+  }
+  return folderIconLoading
+}
+
+ipcMain.handle('list-folder', async (event, dir: unknown) => {
+  const empty = (path: string, error: FolderListing['error']): FolderListing =>
+    ({ path, name: path ? basename(path) : '', folders: 0, files: 0, items: [], truncated: 0, error })
+  if (typeof dir !== 'string' || !dir) return empty('', 'missing')
+
+  const hit = folderListCache.get(dir)
+  if (hit && Date.now() - hit.at < FOLDER_LIST_TTL) return hit.data
+  // 同一目录正在枚举时复用同一个 Promise：渲染端会先「悬停预取」、300ms 后卡片打开时
+  // 再请求一次，若不做去重，两次都会跑完整个枚举 + 图标提取（readdir/stat 双份、
+  // 图标提取双份、folder-icons 事件也推两遍）
+  const inflight = folderListPending.get(dir)
+  if (inflight) return inflight
+
+  const job = (async (): Promise<FolderListing> => {
+    let entries: Dirent[]
+    try {
+      const st = await fsp.stat(dir)
+      if (!st.isDirectory()) return empty(dir, 'notdir')
+      entries = await fsp.readdir(dir, { withFileTypes: true })
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code
+      return empty(dir, code === 'ENOENT' ? 'missing' : 'denied')
+    }
+
+    const all: { name: string; key: string; isDir: boolean }[] = []
+    let folderCount = 0
+    let fileCount = 0
+    for (const it of entries) {
+      if (FOLDER_BLOCKLIST.has(it.name.toLowerCase())) continue
+      let isDir = it.isDirectory()
+      // Windows 的目录联接/符号链接（pnpm 的 node_modules、用户目录里的 Application Data 等）
+      // 在 Dirent 上是 isDirectory()=false + isSymbolicLink()=true，只有 stat 才知道真身。
+      // 不识别的话它们会被当成文件：算进文件数、按文件排序、显示成字节大小、图标也不对
+      if (!isDir && it.isSymbolicLink()) {
+        try { isDir = (await fsp.stat(join(dir, it.name))).isDirectory() } catch { /* 断链当文件 */ }
+      }
+      if (isDir) folderCount++
+      else fileCount++
+      all.push({ name: it.name, key: it.name.toLowerCase(), isDir })
+    }
+    // 目录优先，其次按名称（中文/数字自然序，与资源管理器观感一致）。
+    // 超大目录（几十万项）里 Intl.Collator 比较百万次会把主进程卡住好几秒，
+    // 而卡片最多只显示 400 行——超过阈值就退回廉价的字符串比较
+    const cheapSort = all.length > 4000
+    all.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+      if (cheapSort) return a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+      return folderCollator.compare(a.name, b.name)
+    })
+
+    const shown = all.slice(0, FOLDER_LIST_LIMIT)
+    const items: FolderChild[] = shown.map((s) => ({
+      name: s.name,
+      path: join(dir, s.name),
+      isDir: s.isDir,
+      size: -1,
+      iconDataUrl: '' // 由下面的首批提取 / 后台分批填入
+    }))
+
+    // 文件大小：只 stat 文件（目录不递归），单个 stat 失败不影响整卡
+    await Promise.all(items.map(async (it) => {
+      if (it.isDir) return
+      try { it.size = (await fsp.stat(it.path)).size } catch { it.size = -1 }
+    }))
+
+    const data: FolderListing = {
+      path: dir,
+      name: basename(dir),
+      folders: folderCount,
+      files: fileCount,
+      items,
+      truncated: all.length - shown.length
+    }
+
+    // 首批图标（卡片首屏可见的前十几行）**在返回前就填好**——配合 renderer 的悬停预取
+    // （鼠标刚碰到图标就开始列目录），卡片弹出时图标已经就位，看不到「先占位块再换」的过程。
+    // 目录用缓存的标准黄色文件夹图标（不 await：预热没完成时先留空，由后台补批填上）
+    await Promise.all(items.slice(0, FOLDER_ICON_INLINE).map(async (it) => {
+      it.iconDataUrl = it.isDir ? (folderIcon ?? '') : await fileIconDataUrl(it.path)
+    }))
+
+    if (folderListCache.size >= FOLDER_CACHE_MAX) {
+      const oldest = folderListCache.keys().next().value
+      if (oldest !== undefined) folderListCache.delete(oldest)
+    }
+    folderListCache.set(dir, { at: Date.now(), data })
+
+    // 其余图标后台分批补（每批推一次事件，卡片逐批换），不阻塞卡片出现
+    void fillFolderIcons(items, dir, event.sender, data)
+
+    return data
+  })()
+
+  folderListPending.set(dir, job)
+  try {
+    return await job
+  } finally {
+    folderListPending.delete(dir)
+  }
+})
+
+/** 单文件 shell 图标 → data URL（失败返回空串，renderer 用中性占位块）。 */
+async function fileIconDataUrl(targetPath: string): Promise<string> {
+  try {
+    const img = await app.getFileIcon(targetPath, { size: 'normal' })
+    return img.isEmpty() ? '' : img.toDataURL()
+  } catch { return '' }
+}
+
+/** 后台补图标：每批完成后推一次 `folder-icons`，renderer 按路径就地替换。
+ *  窗口被重建（切位置）时 sender 会失效：此时**把这个缓存项删掉**，
+ *  否则列表里剩下没图标的项会在 TTL 内被当成「已完成的缓存」返回，
+ *  卡片只能显示占位块，且没有任何补批会再来。 */
+async function fillFolderIcons(
+  items: FolderChild[],
+  dir: string,
+  sender: Electron.WebContents,
+  data: FolderListing
+): Promise<void> {
+  const targets = items.filter((it) => !it.iconDataUrl).slice(0, FOLDER_ICON_LIMIT)
+  if (targets.length === 0) return
+  // 目录要用到那枚缓存的文件夹图标，先把预热等完（通常早就好了）
+  if (targets.some((it) => it.isDir)) await ensureFolderIcon()
+  const dropCacheIfOurs = (): void => {
+    // 只删自己那一次枚举写进去的缓存（可能已被更新的枚举替换）
+    if (folderListCache.get(dir)?.data === data) folderListCache.delete(dir)
+  }
+  for (let i = 0; i < targets.length; i += FOLDER_ICON_BATCH) {
+    const batch = targets.slice(i, i + FOLDER_ICON_BATCH)
+    await Promise.all(batch.map(async (it) => {
+      it.iconDataUrl = it.isDir ? (folderIcon ?? '') : await fileIconDataUrl(it.path)
+    }))
+    if (sender.isDestroyed()) { dropCacheIfOurs(); return }
+    const icons: Record<string, string> = {}
+    for (const it of batch) if (it.iconDataUrl) icons[it.path] = it.iconDataUrl
+    if (Object.keys(icons).length === 0) continue
+    sender.send('folder-icons', { path: dir, icons })
+  }
+}
+
+// 打开任意路径（文件夹预览卡片点条目/「打开」按钮用）：shell.openPath 走 ShellExecuteEx，
+// 即资源管理器双击的语义——目录开资源管理器，文档/图片/快捷方式交给关联程序。
+// 不能复用 run-app：那条路径用 execFile 直接 CreateProcess，对 .md/.txt/.png 这类非可执行
+// 文件必然失败（ERR ENOEXEC，且原代码只在 EACCES/EPERM 时回退 shell），所以点了没反应。
+ipcMain.handle('open-path', async (_e, targetPath: unknown) => {
+  if (typeof targetPath !== 'string' || !targetPath) return false
+  // 先确认真的打开了再隐藏 Dock：目标已被删除/没有关联程序时，shell.openPath 会返回错误串，
+  // 此时若已经把 Dock 藏起来，用户就是「点了没反应、Dock 还消失了」，只能靠 Alt+Space 找回
+  const err = await shell.openPath(targetPath)
+  if (err) {
+    console.error('[launcher] openPath failed:', err)
+    return false
+  }
+  // 与点 Dock 图标一致：打开成功后 Dock 让出桌面
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    dockTrayHidden = true
+    mainWindow.hide()
+  }
+  return true
+})
+
+// 启动预热：① 标准黄色文件夹图标（目录行用，提取一次常驻）② 一次 getFileIcon 让 shell
+// 图像列表初始化（首次调用有 ~110ms 冷启动），用户第一次悬停文件夹时就不会撞上这个尖峰
+void app.whenReady().then(() => {
+  void ensureFolderIcon()
+  void fileIconDataUrl(process.execPath)
+})
+
 // 以管理员身份运行（Start-Process -Verb RunAs → UAC 提权，与资源管理器「以管理员身份运行」一致）
 ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
@@ -940,19 +1351,17 @@ public static class WinZ {
   })
 }
 
-function createWindow(): void {
+/** 创建 Dock 窗口。
+ *  edge 显式传入（**不再从磁盘回读**）：切换位置的写入万一失败，也不会出现
+ *  「窗口已重建、方向却退回旧值」的错位；dockEdge 与窗口始终一致。
+ *  startHidden 决定建好后是否显示——由调用方给出「原本是显示还是收在托盘里」，
+ *  不能再拿 startedAtLogin 判断：那是整进程常量，开机自启会话里永远为真，
+ *  切位置重建的窗口会一直不显示（Dock 直接消失进托盘）。 */
+function createWindow(edge: DockEdge, startHidden: boolean): void {
   const iconPath = resolveResource('icon.ico')
-  const { width: screenW, height: screenH } = screen.getPrimaryDisplay().workAreaSize
-  const winW = Math.min(Math.round(screenW * 0.85), 1200)
-  const winH = 300
-
-  // 多显示器支持：优先恢复上次拖拽到的位置（坐标需落在某显示器工作区内，
-  // 否则丢弃——显示器移除/分辨率变化后不至于跑到屏幕外），否则主屏居中
-  const savedPos = readWindowPosition()
-  const pos = savedPos ?? {
-    x: Math.round((screenW - winW) / 2),
-    y: Math.round((screenH - winH) / 2)
-  }
+  dockEdge = edge
+  const { w: winW, h: winH } = windowSizeFor(edge)
+  const pos = positionForEdge(edge, { w: winW, h: winH })
 
   mainWindow = new BrowserWindow({
     width: winW,
@@ -972,28 +1381,21 @@ function createWindow(): void {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      // 把停靠边同步传给渲染端（preload 直接读 argv 暴露成常量）：首帧就能按方向布局，
+      // 不走 IPC 异步取，避免启动瞬间先画一次底部 Dock 再翻上去
+      additionalArguments: [`--ql-edge=${dockEdge}`]
     }
   })
 
-  // 拖拽移动 Dock 后记住位置（debounce 500ms 避免拖动过程高频写盘）
-  let posTimer: ReturnType<typeof setTimeout> | null = null
-  mainWindow.on('moved', () => {
-    if (posTimer) clearTimeout(posTimer)
-    posTimer = setTimeout(() => {
-      posTimer = null
-      try {
-        const b = mainWindow?.getBounds()
-        if (!b) return
-        const d = screen.getDisplayMatching(b)
-        writeFileSync(layoutPath, JSON.stringify({ x: b.x, y: b.y, displayId: d.id }), 'utf-8')
-      } catch {}
-    }, 500)
-  })
+  // 注：这里不再监听 move/moved，也没有位置巡检——Dock 不支持自由拖动，
+  // 窗口位置只由「位置」预设决定（见 positionForEdge / applyDockEdge）。
 
   mainWindow.on('ready-to-show', () => {
-    // 开机自启动（--autostart）时默认隐藏到托盘，不打扰登录后的桌面
-    if (!startedAtLogin) mainWindow?.show()
+    // 是否显示只看 startHidden（调用方给出的「原本显示 / 原本收在托盘里」）。
+    // 曾经这里还判断 startedAtLogin，那是整进程常量：开机自启会话里永远为真，
+    // 于是切位置重建出来的窗口一律不显示——Dock 会直接消失进托盘。
+    if (!startHidden) mainWindow?.show()
     else dockTrayHidden = true
   })
 
@@ -1047,7 +1449,12 @@ app.whenReady().then(() => {
   // 未获得单实例锁：本实例正在退出流程中，不初始化窗口/托盘
   if (!gotSingleInstanceLock) return
 
-  createWindow()
+  // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
+  createWindow(readDockEdge(), startedAtLogin)
+  // 显示器参数变化后重新归位（screen 模块必须等 ready，所以在这里注册）
+  screen.on('display-metrics-changed', reapplyDockEdgeOnDisplayChange)
+  screen.on('display-added', reapplyDockEdgeOnDisplayChange)
+  screen.on('display-removed', reapplyDockEdgeOnDisplayChange)
   // 桌面目录实时监听：文件夹新增/删除时通知 renderer 同步 Dock 图标
   startDesktopWatch()
 
@@ -1097,7 +1504,8 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
+      // 重新建窗：沿用当前方向，并直接显示（用户主动激活）
+      createWindow(dockEdge, false)
     }
   })
 })
@@ -1107,6 +1515,8 @@ app.on('will-quit', () => {
 })
 
 app.on('window-all-closed', () => {
+  // 切换停靠边时会 destroy 旧窗口再建新的：这一瞬间没有窗口，不能当成「用户关掉了应用」
+  if (recreatingWindow) return
   if (process.platform !== 'darwin') {
     app.quit()
   }

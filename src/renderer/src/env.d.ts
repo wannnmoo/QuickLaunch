@@ -1,7 +1,41 @@
 /// <reference types="vite/client" />
 
+/** 文件夹子项（文件夹条目悬停预览卡片；主进程 list-folder 返回） */
+interface FolderChild {
+  name: string
+  path: string
+  isDir: boolean
+  /** 文件字节数；目录恒为 -1（不递归统计） */
+  size: number
+  iconDataUrl: string
+}
+
+interface FolderListing {
+  path: string
+  name: string
+  folders: number
+  files: number
+  items: FolderChild[]
+  /** 超出列举上限（400）未列出的条目数 */
+  truncated: number
+  error?: 'missing' | 'denied' | 'notdir'
+}
+
+interface FolderIconsPayload {
+  path: string
+  /** 路径 → data:image/png;base64,…（只含本批取到图标的项） */
+  icons: Record<string, string>
+}
+
+/** 停靠位置：bottom = 底部横条；top = 顶部横条；middle = 悬浮屏幕中央；left / right = 侧边竖排 */
+type DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'
+
 interface Window {
   api: {
+    dockEdge: DockEdge
+    getDockEdge: () => Promise<DockEdge>
+    setDockEdge: (edge: DockEdge) => Promise<boolean>
+    onDockEdgeChanged: (callback: (edge: DockEdge) => void) => () => void
     parseLnk: (filePath?: string) => Promise<{
       targetPath: string
       arguments: string
@@ -18,9 +52,21 @@ interface Window {
       accepted: { targetPath: string; arguments: string; workingDirectory: string; description: string; iconDataUrl: string }[]
       rejected: string[]
     }>
+    listDrives: () => Promise<{
+      name: string
+      label: string
+      type: string
+      format: string
+      total: number
+      free: number
+      ready: boolean
+    }[]>
     pickIcon: () => Promise<{ path: string; iconDataUrl: string } | null>
+    listFolder: (dir: string) => Promise<FolderListing>
+    onFolderIcons: (callback: (payload: FolderIconsPayload) => void) => () => void
     runAsAdmin: (targetPath: string, args: string, workingDir: string) => Promise<boolean>
     openFileLocation: (targetPath: string) => Promise<void>
+    openPath: (targetPath: string) => Promise<boolean>
     copyText: (text: string) => Promise<void>
     loadShortcuts: () => Promise<{ id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin'; isGroup?: boolean; groupId?: number; isSeparator?: boolean }[]>
     saveShortcuts: (data: { id: number; iconDataUrl: string; targetPath: string; arguments: string; workingDirectory: string; description: string; isFolder?: boolean; specialType?: 'this-pc' | 'recycle-bin'; isGroup?: boolean; groupId?: number; isSeparator?: boolean }[]) => Promise<void>

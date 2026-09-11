@@ -39,7 +39,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 ### 透明窗口 + Dock 布局
 
-- `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏幕宽，最大 1200px，居中）
+- `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏宽 ≤ 1200px）——水平方向**恒为主显示器工作区居中**，垂直方向由停靠位置预设决定
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
 - **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
   1. `blur` 事件（点击其他窗口失去焦点）→ 立即 `setAlwaysOnTop(false)` + `sendToBottom()`（点击其他软件是有意让位）；**窗口已隐藏（`isVisible()` 为 false）时跳过**——`run-app` 隐藏到托盘触发的 blur 不再白跑一次 PowerShell 沉底
@@ -47,16 +47,17 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
 - **恢复置顶**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）→ `setAlwaysOnTop(true)` + `moveTop()`
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
-- Dock 栏在窗口底部。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中），`blur(36px) saturate(1.7)`、圆角 24px、边框 + 阴影
-- Dock 空白区域可拖拽移动窗口（`-webkit-app-region: drag`）
-- **多显示器 + 位置记忆**：`moved` 事件（debounce 500ms）把窗口坐标写入 `{userData}/window-position.json`（含 displayId）；`createWindow` 启动时读取，坐标需落在某显示器工作区内（`readWindowPosition()` 校验，显示器移除/分辨率变化时回退主屏居中）
-- 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，最大放大 1.4×，上浮 8px，影响半径 140px）。放大图标从背景顶部**透明区顶出**（类似 macOS）——`.dock-inner` 顶部有 **70px** 透明 padding 作为放大+悬浮标签显示区，否则 `overflow` 会把放大溢出裁掉
+- **停靠位置三档（中间 / 下 / 上）**：类型 `DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'`，但 `IMPLEMENTED_EDGES` 只放行 `bottom`/`top`/`middle`——左/右竖排窗口尺寸不同，需要重建窗口（`recreateWindowForEdge` 已留好），是下一阶段的事。坐标由 `presetPosition(edge)` 在主显示器工作区上算：`top` 贴工作区顶边、`bottom` 贴工作区底边、`middle` 垂直居中；三者都水平居中、窗口尺寸（85% 屏宽 ≤ 1200px × 300px）完全相同，所以切换是**原地 `setBounds` + `webContents.send('dock-edge-changed')`**（实测 ~62ms，不重建窗口、不重载页面、无白闪），只有尺寸真的变了才走 `recreateWindowForEdge`。持久化在 `{userData}/window-position.json`（只存 `{"edge":"..."}`，**文件名沿用旧版**；旧版写的 `{x,y,displayId}` 直接忽略；读入与写入都把未实现档位归一化回 `DEFAULT_EDGE` = `middle`，防止手改配置文件改出竖排尺寸的窗口）。`setDockEdge` 对同档位（±2px 内）提前返回时**仍然重发事件**——页面重载过的 renderer 拿的是启动时 argv 里的旧边，不重发它的布局会一直停在旧位置；renderer 挂载时另外用 `get-dock-edge` 主动同步一次。首次参数走 preload 读的 `--ql-edge=<edge>` argv 常量，首帧就是正确方向，不会先画底部再翻上去
+- **窗口不可自由拖动**：代码里没有任何 `-webkit-app-region: drag`（CSS 里只剩两处解释性注释），也没有 `move`/`moved` 监听或位置巡检。原因：透明窗口下 Dock 栏要么贴窗口上沿、要么贴下沿，窗口位置一动就得补偿布局，实测表现为**明显跳动**（做过「边缘区域判定 + 拖动过程中不切位置 + 松手平滑收尾」也压不住），于是位置**只由预设决定**。不要再引入拖拽/位置记忆
+- **显示器参数变化**：`screen.on('display-metrics-changed' | 'display-added' | 'display-removed', reapplyDockEdgeOnDisplayChange)` 重新套用当前档位。**这三行必须写在 `app.whenReady()` 里**——`screen` 模块在 `ready` 之前使用会抛 `The 'screen' module can't be used before the app 'ready' event`，直接把启动打崩（曾发生过）
+- Dock 栏贴窗口的贴边侧：`bottom`/`middle` 布局里玻璃条在窗口下沿（`middle` 只是窗口整体悬在屏幕中间），`top` 布局里玻璃条贴窗口上沿、整套几何垂直镜像（`.app[data-edge='top']` 里改玻璃条位置、`.dock-inner` 的 70px 透明放大区从上改到下、`.dock-item` 的 `transform-origin` 改 `center top`、悬浮标签挂到图标下方、菜单/卡片/面板的浮层锚点由 JS 改到玻璃条下沿外侧）。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中），`blur(36px) saturate(1.7)`、圆角 24px、边框 + 阴影
+- 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，最大放大 1.4×，上浮 8px，影响半径 140px）。放大图标从背景顶部**透明区顶出**（类似 macOS）——`.dock-inner` 顶部有 **70px** 透明 padding 作为放大+悬浮标签显示区，否则 `overflow` 会把放大溢出裁掉（`data-edge='top'` 时这 70px 挪到下方，放大向下顶出）
 - **标签悬停显示（三主题一致）**：`.dock-label` 默认隐藏，鼠标悬停图标时淡入（0.16s）；标签**绝对定位悬浮在图标上方**（macOS 式，不占图标下方布局行——玻璃条紧凑贴合图标），完整显示名称不截断；每主题一个药丸底衬（`--label-pill-bg`：黑夜=深藏青 `rgba(12,16,28,0.55)` 白字、白天=浅白玻璃 `rgba(255,255,255,0.75)` 深字、透明=中性深灰 `rgba(0,0,0,0.30)` 白字）；「+」添加按钮不显示悬浮标签
 - 图标放不下时**横向滚动**：`.dock-inner` 是滚动容器（`overflow-x: auto`，隐藏滚动条），滚轮/触控板转水平滚动（原生 `addEventListener('wheel', …, { passive: false })`——React 在 root 上以 passive 注册 wheel，`onWheel` 里 `preventDefault()` 是空操作）；两端 `dock-edge` 渐隐遮罩提示「还有更多」，仅可滚动侧显示（`scrollState`）
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）。**落点换算**：`calcDropIndex` 返回的是「顶层图标」下标（`iconRefs` 里只有顶层条目 + 分隔线），而 `apps` 是扁平数组（含分组成员），所以重排与拖入添加都必须用 `topAnchorId(list, idx)` 先换成锚点 id 再取扁平插入点——直接把顶层下标当扁平下标用会让插入位置偏「成员数」个槽位
 - **拖入文件添加**：从资源管理器拖 `.lnk`/`.url`/`.pif`/`.exe`/`.com` 到 Dock 栏即添加（**仅 Dock 栏区域**响应，其余位置显示禁止光标）。Electron 32+ 已移除 `File.path`，路径只能由 preload 的 `webUtils.getPathForFile` 提供；主进程 `describe-paths` 分派解析（快捷方式复用 `parseLnkFile`，exe 走单次 PowerShell 批量取 FileDescription + 图标，提取失败回退 shell32 通用图标），renderer 按落点插入、按路径去重（重复或格式不支持则跳过并提示）。**整窗**都要 `dragover`/`drop` preventDefault，否则 Chromium 会把窗口导航到 `file://`（白屏）
 - **分隔线**：`isSeparator` 特殊条目——1px 渐变柔线（比图标矮、两端淡出、随主题变色），只从图标右键「在此之前插入分隔线」创建；可拖拽排序、随 `shortcuts.json` 持久化；不启动、不参与桌面扫描去重/清理/键盘导航/悬停放大。命中区做成 9px（可视竖线仅 1px）+ `z-index: 20`：1px 太细时旁边放大中的图标（`magnify` 给图标设 `z-index: 10`）会压住它，右键点不中
-- **键盘导航**：`Alt+Space` 唤出 Dock 时主进程 `webContents.send('nav-enter')` → renderer 进入导航模式（`navId`）。`←/→` 不循环移动、`Enter` 启动、`Esc` 退出；分组上 `→`/`Enter` 展开面板并把选中移入第一个**非分隔线**成员、`←`/`Esc` 返回主 Dock；可导航到末尾的「+」按钮（`ADD_BTN_ID = -1` 哨兵，Enter 打开菜单）。选中位置写入 localStorage `ql-nav-last`，启动/唤出/方向键唤醒都恢复到它（条目失效则回落第一个）。选中态是左右两条渐变竖框（`.dock-item.selected` / `.drop-target` 共用），并靠 `.dock-item { scroll-margin-inline: 14px }` 保留滚动余量——否则 `scrollIntoView({ inline: 'nearest' })` 会把容器内边距一起滚掉，最左图标的左框被裁
+- **键盘导航**：`Alt+Space` 唤出 Dock 时主进程 `webContents.send('nav-enter')` → renderer 进入导航模式（`navId`）。`←/→` 不循环移动、`Enter` 启动、`Esc` 退出；分组上 `→`/`Enter` 展开面板并把选中移入第一个**非分隔线**成员、`←`/`Esc` 返回主 Dock；可导航到末尾的「+」按钮（`ADD_BTN_ID = -1` 哨兵，Enter 打开菜单）。选中位置写入 localStorage `ql-nav-last`，启动/唤出/方向键唤醒都恢复到它（条目失效则回落第一个）。选中态是左右两条渐变竖框（`.dock-item.selected` / `.drop-target` 共用），并靠 `.dock-item { scroll-margin-inline: 44px }` 保留滚动余量——否则 `scrollIntoView({ inline: 'nearest' })` 会把容器内边距一起滚掉，最左图标的左框被裁。**菜单打开时必须清掉 `navId`**（`handleContextMenu` / `handleAddToggle` 都 `setNavId(null)`）并把 `Enter` 让给菜单——否则选中框不可见却仍是活的，按 Enter 会启动看不见的条目
 
 ### 系统托盘 + 快捷键
 
@@ -102,6 +103,11 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `copy-text` | Renderer → Main | 复制文本到剪贴板（`clipboard.writeText`，用于「复制路径」） |
 | `describe-paths` | Renderer → Main | 拖放添加：解析拖入的文件路径数组——快捷方式走 `parseLnkFile`、`.exe`/`.com` 走单次 PowerShell 批量取 FileDescription + 图标（失败回退 shell32 通用图标），返回 `{ accepted, rejected }`；rejected 由 renderer 汇总成「已跳过 N 个」提示 |
 | `nav-enter` | Main → Renderer | Alt+Space 唤出 Dock 时推送（`webContents.send`，非 handle/invoke）；renderer 据此进入键盘导航模式并恢复到上次选中位置 |
+| `get-dock-edge` / `set-dock-edge` | Renderer → Main | 读取 / 切换停靠位置（`middle`/`bottom`/`top`；横向三档窗口尺寸相同 → `applyDockEdge` 原地 `setBounds` + 推事件并写 `window-position.json`；未实现档位被拒并归一化回默认） |
+| `dock-edge-changed` | Main → Renderer | 停靠位置变更推送（含显示器参数变化后的重新归位）；renderer 收到后翻 `data-edge` 布局。**同档位提前返回时也会重发**（页面重载过的 renderer 只有启动 argv 里的旧边） |
+| `list-folder` | Renderer → Main | 文件夹预览卡片的数据源：`fs.readdir` + 目录优先自然序 + 400 项上限，文件大小只 stat 文件（目录不递归），**首批 14 个图标在返回前填好**（目录用一次提取常驻的 shell32 index 4 黄色文件夹图标、文件用 `app.getFileIcon`）；5s TTL 缓存（上限 40）+ 在途请求 Promise 去重；失败返回 `error: 'missing' \| 'denied' \| 'notdir'` |
+| `folder-icons` | Main → Renderer | 预览图标后台分批推送（每批 24 个，总上限 150）；renderer 按路径就地替换。窗口被重建后 sender 失效时，主进程会删掉自己写的那条缓存（否则卡片在 TTL 内永远停在占位块） |
+| `open-path` | Renderer → Main | `shell.openPath`（ShellExecuteEx 语义）打开任意路径——目录开资源管理器、文档/图片交给关联程序；**返回成功后才隐藏 Dock**（目标不存在/无关联程序时保持可见，否则用户看到「点了没反应 + Dock 消失」） |
 
 ### React UI
 
@@ -109,16 +115,17 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
 - 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
-- **Dock 栏**：底部毛玻璃横栏，图标水平排列，gap 4px；内容超过宽度时横向滚动
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/**主题嵌套选择器**/**隐藏或显示桌面图标**/**开机自启动**；「此电脑」「回收站」由启动扫描自动加入，无手动入口）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角
+- **Dock 栏**：毛玻璃横栏（位置由根元素 `data-edge` 决定：`bottom`/`middle` 在窗口下沿、`top` 在上沿），图标水平排列，gap 4px；内容超过宽度时横向滚动
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/**停靠位置分段选择器**/**主题嵌套选择器**/**隐藏或显示桌面图标**/**开机自启动**；「此电脑」「回收站」由启动扫描自动加入，无手动入口）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角。**停靠位置选择器**（`DOCK_EDGE_CHOICES`：中间/下/上）复用主题分段控件的 `.theme-seg` 样式——位置选择后菜单保持打开，`handleEdgePick` 不做本地短路，一切以主进程 `setDockEdge` + 事件回推为准
 - **主题分段选择器**（`.theme-seg`，纯 flex 分段控件——绝对定位滑块方案反复出布局问题后重写）：主行「透明 | 毛玻璃」两段（激活项自带底色 `--nt-ink` 高亮 + 文字 `--nt-ink-on`）；毛玻璃激活时下方展开子行「黑夜 | 白天」（透明态 `display: none` 隐藏），选中项底色 `--nt-sub-bg`。`handleThemePick(next)` 选择后**菜单保持打开**可连续预览；`glassPlan` state 记忆毛玻璃子主题（切去透明再切回不丢）。配色经 CSS 变量随主题适配，定义于 `.app`/`.theme-light`/`.theme-transparent`
 - **菜单自动关闭**：鼠标移出即关（点击外部 `mousedown`、鼠标移出窗口也关）。三条防误关规则：① `menuHoveredRef` 门控——**必须先真正进过菜单本体**才启用「移出即关」（右键瞬间鼠标还停在图标上、离菜单几十像素，一上来就判定会把菜单秒关）；② 进菜单后 150ms 内的「掠过」不算离开；③ 菜单矩形外扩 24px 宽容区——从图标移向菜单的路上要掠过菜单底角/边缘，贴着走不算离开。「+」按钮只负责「保持打开」，不置位 hovered（否则鼠标一离开按钮就秒关）
+- **文件夹悬停预览卡片**：悬停文件夹条目 300ms 弹出（`openFolderCard`），与「此电脑」盘符卡片同构、复用 `.drives-card` 浮层几何。三条关键设计：① **悬停即预取**——`mouseenter` 立刻 `listFolder()`，300ms 后真弹卡片时直接命中主进程缓存，看不到「先占位块再换图标」；② **延迟关闭 150ms 宽限**——鼠标从图标移到卡片上会先离开图标，宽限期内移入卡片即取消关闭（可继续在卡片里滚动看）；③ 同一目录且已加载完时只更新锚点，不清成「读取中」再重载（否则闪一下、缓存过期还要整目录重扫）。卡片宽度先按图标中心渲染，`useLayoutEffect` 测量后在 paint 前把水平位置钳制进窗口（贴边缘时内收，不会看到跳一下）。拖拽排序 / 文件拖入进行中不弹（会挡住落点指示线）
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **开机自启动开关**：菜单打开时 `getAutoStart()` 读取注册表状态决定开关开/关（`.item-switch`），点击 `setAutoStart()` 乐观更新（先切开关，IPC 返回后校正，**不关闭菜单**）；写注册表 `HKCU\...\Run` 登录项
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
 - **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。**菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步全透明**（背景/毛玻璃/边框置空，保留悬浮投影），文字固定近黑 `#1f2430` + 白色光晕投影（曾试过 desktopCapturer 采样壁纸亮度自适应黑/白字，已按需求移除——透明就是透明），加号白 0.92 + 双层深投影，编辑输入框浅白底 + 深字
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
-- **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**，底边固定在实测的 Dock 毛玻璃条上方 8px（`overlayBottom()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
+- **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**（`data-edge='top'` 时整套浮层改由 `overlayTop()` 锚在玻璃条**下沿外侧**8px，向下弹出、`maxHeight` 按窗口剩余高度算），底边固定在实测的 Dock 毛玻璃条外侧 8px（`overlayBottom()` / `overlayTop()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
 - **放大效果**：`handleDockMouseMove` 计算鼠标到每个图标的距离，< 140px 时缩放 + 上浮（拖拽时暂停）
 - **持久化**：`apps` 变化时 `useEffect` 自动保存，启动时 `useEffect` 自动恢复
@@ -185,6 +192,8 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 
 主题偏好（白天/黑夜）存在渲染端 localStorage（key `ql-theme`），不走 IPC 文件持久化——纯 UI 偏好，无需主进程参与。
 
+Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字段**：`{"edge":"middle"|"bottom"|"top"}`。文件名沿用 v1.8.x 的「窗口位置记忆」文件（旧版写的 `{x,y,displayId}` 直接忽略，按默认位置启动）。读写都过一遍 `IMPLEMENTED_EDGES` 白名单，白名单外的档位（左/右竖排）一律归一化成 `DEFAULT_EDGE`（`middle`）——手改配置文件也改不出尺寸不对的窗口。
+
 ### 桌面自动扫描
 
 - 启动时（renderer 加载完 `shortcuts.json` **之后**）自动调用 `scan-desktop-folders`：**单次 PowerShell 调用**完成枚举 + 图标提取（避免启动时拉起多个 powershell 进程）——枚举桌面文件夹 + 用 `WScript.Shell` 解析 `.lnk` 目标（目标为目录才纳入；`.url`/程序快捷方式跳过）
@@ -209,18 +218,20 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - `AppEntry` 类型在 [`src/preload/index.ts`](src/preload/index.ts)、[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)、[`src/renderer/src/env.d.ts`](src/renderer/src/env.d.ts) 三处各自定义，修改时需保持同步
 - `env.d.ts` 再次复刻 API 类型到 `Window` 接口——contextBridge 隔离导致 Renderer 端类型必须在此声明
 - `App.tsx` 使用模块级变量 `nextId`（非 React state）；启动时从已保存最大 ID + 1 重建
-- 窗口拖拽：`.dock` 设为 `drag` 区域，所有交互元素（`.dock-inner`、`.dock-item`、`.dropdown-menu`、`.context-menu` 等）显式设为 `no-drag`
-- `.dock-inner` 是横向滚动容器（`overflow-x: auto`），CSS 规范强制其垂直方向也裁剪——**向上弹出的下拉菜单必须渲染在容器外**（fixed 定位），放容器内会被裁掉
-- 滚动容器会裁剪垂直溢出的放大图标，`.dock-inner` 顶部 70px 透明 padding 即预留的放大+悬浮标签显示区；`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区
+- **窗口不可拖拽**（v1.10.0 起）：`.dock` 不再是 `drag` 区域，全项目**没有任何 `-webkit-app-region` 声明**（CSS 里只剩两处解释性注释）。位置只能由 `presetPosition` 预设决定——新增交互时不要往 Dock 空白区加 drag
+- 弹出层（「+」下拉菜单、右键菜单、「此电脑」卡片、文件夹卡片、分组面板）**必须渲染在滚动容器外**（fixed 定位 + 实测锚点）：`.dock-inner` 是横向滚动容器（`overflow-x: auto`），CSS 规范强制其垂直方向也裁剪，放容器内会被裁掉
+- 滚动容器会裁剪垂直溢出的放大图标：`.dock-inner` 在贴边侧留 **70px** 透明 padding 作为放大+悬浮标签显示区（`data-edge='top'` 时这 70px 在下方，其余在顶部）；`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区
 - 开发模式下窗口加载 `ELECTRON_RENDERER_URL` 环境变量 URL；生产模式下加载 `../renderer/index.html` 文件
 - `setWindowOpenHandler` 拦截所有 `target=_blank`/新窗口请求：一律 `shell.openExternal()` 用默认浏览器打开并 `deny`，应用内不产生新窗口
 - `webPreferences.sandbox: false`：preload 依赖 `process.contextIsolated` 分支和 `@electron-toolkit/preload`，改成 `true` 会破坏 contextBridge
 - 关闭 → 隐藏托盘通过 `forceQuit` 标志区分：普通关闭 `preventDefault()` + `hide()`；托盘「退出」置 `forceQuit=true` 后 `app.quit()`。新增退出路径需同步设置该标志
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
 - `run-app` 用 `execFile(targetPath, splitArgs(args))` 拆分参数——`splitArgs` 按空格切分但把双引号包裹段作为整体并剥引号（.lnk 的 Arguments 常带引号，如 `"E:\DSH\start-dsh.vbs"`；原样拆分会把字面引号传给 wscript 等宿主导致「Windows Script Host 执行失败」，顺带支持含空格的带引号参数）；含空格且无引号的参数仍不支持——已知限制
-- `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈
+- `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈；ENOENT 等其它失败会**恢复显示 + 置顶**（点了图标却什么都没启动时 Dock 不能消失）
+- **文件夹预览（`list-folder`）的三个坑**：① Windows 目录联接/符号链接在 `Dirent` 上是 `isDirectory()=false` + `isSymbolicLink()=true`，必须补一次 `stat` 才认得出是目录（否则算进文件数、按文件排序、显示字节大小、图标也不对）；② 超大目录（>4000 项）用 `Intl.Collator` 排序会比较百万次、把主进程卡住好几秒，超阈值退回廉价的字符串比较；③ 后台补图标（`fillFolderIcons`）每批前检查 `sender.isDestroyed()`，失效时**删掉自己写的那条缓存**——否则窗口重建后卡片在 TTL 内永远只有占位块，且没有任何补批会再来。**目录图标不能用 `app.getFileIcon`**（实测返回错图标），统一用启动时提取一次、常驻内存的 shell32 index 4 黄色文件夹图标
+- `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.9.0`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.9.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.10.0`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.10.0），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

@@ -87,7 +87,9 @@ html, body {
     0 2px 8px rgba(0, 0, 0, 0.1),
     inset 0 1px 0 rgba(255, 255, 255, 0.9),
     inset 0 -1px 0 rgba(0, 0, 0, 0.05);
-  --dock-edge: rgba(238, 241, 247, 0.88);
+  /* 右侧渐隐的实色端：取玻璃条自身的底色（--dock-bg-bottom 系）而不是近白实色，
+     否则这块遮罩比玻璃条更亮更实，会把右端描边盖掉、看着像 Dock 到这里就结束了 */
+  --dock-edge: rgba(240, 242, 248, 0.8);
   --label-color: rgba(0, 0, 0, 0.6);
   --label-color-hover: #111;
   --label-pill-bg: rgba(255, 255, 255, 0.75); /* 白天：浅白玻璃药丸衬底（悬停显示标签，深色文字） */
@@ -124,7 +126,7 @@ html, body {
   position: relative; /* 渐隐遮罩定位参照 */
   padding: 8px 24px;
   z-index: 50;
-  -webkit-app-region: drag;
+  /* 无 app-region 拖动区：Dock 位置由「位置」预设决定（下/上贴边居中、中间居中） */
 }
 
 /* 毛玻璃背景：独立层，只覆盖图标区（图标在其中垂直居中，上下各 8px 小间距）。
@@ -164,11 +166,31 @@ html, body {
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none; /* Firefox 隐藏滚动条 */
-  -webkit-app-region: no-drag;
 }
 
 .dock-inner::-webkit-scrollbar {
   display: none; /* Chromium 隐藏滚动条 */
+}
+
+/* 两端还有内容时的「溶解」遮罩：只作用于图标层（玻璃条不受影响）。
+   靠边的那半个图标在到达圆角轮廓之前就淡出，不会出现「被硬切一刀的图标压在轮廓上」，
+   那种画面看起来就像图标跑到了 Dock 外面。
+   注意：遮罩作用于整棵子树，包括悬浮标签和键盘选中框——所以两侧都用 40px，
+   且 JS 的标签钳制余量（LABEL_CLAMP_PAD = 48）与 .dock-item 的 scroll-margin-inline
+   都要大于它，否则标签/选中框会被淡成半透明。 */
+.dock-inner.edge-right {
+  -webkit-mask-image: linear-gradient(to left, transparent 0, #000 40px, #000 100%);
+  mask-image: linear-gradient(to left, transparent 0, #000 40px, #000 100%);
+}
+
+.dock-inner.edge-left {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 40px, #000 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 40px, #000 100%);
+}
+
+.dock-inner.edge-left.edge-right {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 40px, #000 calc(100% - 40px), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 40px, #000 calc(100% - 40px), transparent 100%);
 }
 
 /* ─── 两端渐隐提示（还有更多图标） ─────────────────────────────────── */
@@ -182,18 +204,21 @@ html, body {
   z-index: 60;
   opacity: 0;
   transition: opacity 0.2s;
+  /* 严格裁进玻璃条的圆角矩形内，并内缩 1px 让玻璃条的描边保持可见。
+     原来只有 border-radius: 22px（玻璃条是 24px）且是完全不透明的一层：白天主题下
+     这块近白的遮罩会把右侧描边一起糊掉、转角处还比玻璃条多出一点，看起来就像最右边的
+     图标跑到了圆角轮廓外面。 */
+  clip-path: inset(1px round 23px);
 }
 
 .dock-edge.left {
   left: 24px;
   background: linear-gradient(to right, var(--dock-edge), rgba(18, 22, 34, 0));
-  border-radius: 22px 0 0 22px;
 }
 
 .dock-edge.right {
   right: 24px;
   background: linear-gradient(to left, var(--dock-edge), rgba(18, 22, 34, 0));
-  border-radius: 0 22px 22px 0;
 }
 
 .dock-edge.show {
@@ -213,11 +238,11 @@ html, body {
   will-change: transform;
   transform-origin: center bottom; /* 放大从底部升起，贴合 macOS Dock */
   position: relative;
-  -webkit-app-region: no-drag;
   /* 键盘导航用 scrollIntoView({inline:'nearest'}) 把选中项带入可视区，而「刚好可见」
      会把容器内边距也滚掉：第一个图标的框左缘正好贴住容器左缘，缩放后还溢出 1.5px，
-     竖框就被裁掉（表现为「移到最左边时左框不显示」）。留出余量即可。 */
-  scroll-margin-inline: 14px;
+     竖框就被裁掉（表现为「移到最左边时左框不显示」）。留出余量即可。
+     取 44px：要大于两端溶解遮罩的 40px，否则选中框落在渐隐区里会被淡成半透明。 */
+  scroll-margin-inline: 44px;
 }
 
 .dock-icon-wrap {
@@ -255,7 +280,10 @@ html, body {
   position: absolute;
   bottom: calc(100% + 4px);
   left: 50%;
-  transform: translateX(-50%);
+  /* --label-shift 由 JS 在悬停时写入（钳制用）：靠边的图标标签居中会伸出滚动容器
+     被 overflow 裁掉（「此电脑」的「此电脑 · 可用 …」就会被切掉左半截），
+     悬停时量一次宽度把标签推回 Dock 内 */
+  transform: translateX(calc(-50% + var(--label-shift, 0px)));
   font-size: 0.68rem;
   font-weight: 500;
   letter-spacing: 0.02em;
@@ -279,6 +307,12 @@ html, body {
 .dock-add .dock-label,
 .dock-add.dock-item:hover .dock-label {
   display: none;
+}
+
+/* 悬停卡片（文件夹预览 / 此电脑盘符）打开时压掉图标悬浮标签：两者同处 Dock 上方一条带，
+   卡片是半透明的，标签会透成一层幽灵文字叠在卡片内容上（卡片标题已经写了名字） */
+.app.card-open .dock-item:hover .dock-label {
+  opacity: 0;
 }
 
 .dock-item:hover .dock-label {
@@ -348,7 +382,6 @@ html, body {
   overflow: hidden;
   overflow-y: auto; /* 菜单超高（如 300px 窗口装不下 5+ 项）时内部滚动，不再被窗口裁掉 */
   animation: dropdown-in 0.16s ease-out;
-  -webkit-app-region: no-drag;
 }
 
 .dropdown-item {
@@ -371,7 +404,6 @@ html, body {
   outline: none;
   -webkit-tap-highlight-color: transparent;
   white-space: nowrap;
-  -webkit-app-region: no-drag;
 }
 
 .dropdown-item:hover {
@@ -433,7 +465,6 @@ html, body {
   background: var(--nt-shell);
   border-radius: 999px;
   box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
-  -webkit-app-region: no-drag;
   user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
@@ -476,7 +507,6 @@ html, body {
   padding: 2px;
   background: var(--nt-shell);
   border-radius: 999px;
-  -webkit-app-region: no-drag;
   user-select: none;
 }
 
@@ -517,7 +547,6 @@ html, body {
   min-width: 100px;
   /* 宽度上限：超长名称也不至于顶出窗口；菜单项 nowrap，正常文案都占一行不折行 */
   max-width: 280px;
-  -webkit-app-region: no-drag;
   background: var(--menu-bg);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -845,7 +874,6 @@ html, body {
   z-index: 150;
   width: max-content;
   max-width: calc(100vw - 32px);
-  -webkit-app-region: no-drag;
 }
 
 /* 玻璃底：只覆盖图标区（顶部 56px 是透明区，供悬停放大 + 悬浮标签顶出） */
@@ -914,7 +942,6 @@ html, body {
   margin: 0 4px;
   align-self: center;
   flex-shrink: 0;
-  -webkit-app-region: no-drag;
 }
 
 .dock-sep::before {
@@ -938,6 +965,257 @@ html, body {
 /* 拖拽中：与图标一致的淡化反馈 */
 .dock-sep.dragging {
   opacity: 0.25;
+}
+
+/* ─── 「此电脑」驱动器用量（图标细条 + 悬停卡片） ────────────────────── */
+
+/* 汇总用量细条：贴在图标框底部内侧（负偏移会被滚动容器裁掉下沿） */
+.dock-usage {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 3px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(127, 127, 127, 0.28);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.dock-usage-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+}
+
+/* 悬停卡片：与分组面板/菜单同款浮层（底边与高度由 JS 按实测几何设置） */
+.drives-card {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  width: max-content;
+  min-width: 300px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 14px;
+  border-radius: 18px;
+  background: var(--menu-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--dock-border);
+  box-shadow: var(--dock-shadow);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.drives-card::-webkit-scrollbar {
+  display: none;
+}
+
+.drives-card-title {
+  margin-bottom: 8px;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--label-color);
+}
+
+.drive-row {
+  margin-bottom: 10px;
+}
+
+.drive-row:last-child {
+  margin-bottom: 0;
+}
+
+.drive-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--label-color);
+}
+
+.drive-name {
+  min-width: 26px;
+  font-weight: 600;
+}
+
+.drive-type {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.drive-nums {
+  margin-left: auto;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.drive-bar {
+  display: block;
+  height: 4px;
+  margin-top: 4px;
+  border-radius: 2px;
+  background: rgba(127, 127, 127, 0.28);
+  overflow: hidden;
+}
+
+.drive-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.2s;
+}
+
+.drives-empty {
+  padding: 4px 0;
+  font-size: 0.75rem;
+  color: var(--label-color);
+  opacity: 0.8;
+}
+
+/* 透明风格：卡片同步全透明（与菜单一致） */
+.app.theme-transparent .drives-card {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-color: transparent;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+/* ─── 文件夹悬停预览卡片 ────────────────────────────────────────────── */
+/* 复用 .drives-card 的浮层几何与玻璃观感（元素同时带两个类），这里只改：
+   定宽（锚定位置靠它推算，长文件名不撑宽卡片）+ 可见滚动条（内容超出时可滚动看全部） */
+.folder-card {
+  width: 340px;
+  min-width: 0;
+  padding: 10px 8px 10px 12px; /* 右侧留给滚动条，不压住文字 */
+  /* 可见细滚动条（Chromium 121+ 标准属性，优先于 ::-webkit-scrollbar） */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(127, 127, 127, 0.42) transparent;
+}
+
+.folder-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding-right: 4px;
+}
+
+.folder-card-title {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.folder-card-name {
+  overflow: hidden;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--label-color);
+}
+
+.folder-card-path {
+  overflow: hidden;
+  font-size: 0.68rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--label-color);
+  opacity: 0.6;
+}
+
+.folder-card-open {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 0.7rem;
+  color: var(--label-color);
+  background: rgba(127, 127, 127, 0.18);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.folder-card-open:hover {
+  background: rgba(127, 127, 127, 0.34);
+}
+
+.folder-card-sub {
+  margin-bottom: 6px;
+  padding-right: 4px;
+  font-size: 0.7rem;
+  color: var(--label-color);
+  opacity: 0.7;
+}
+
+/* 子项行：图标 + 名字（省略号）+ 右列大小/类型；悬停高亮一行 */
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 6px 0 4px;
+  border-radius: 7px;
+  font-size: 0.75rem;
+  color: var(--label-color);
+  cursor: default;
+  transition: background 0.12s;
+}
+
+.folder-row:hover {
+  background: rgba(127, 127, 127, 0.2);
+}
+
+.folder-row-icon {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+}
+
+.folder-row-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* 图标缺失时的中性占位块（比 <img src=""> 的破图好） */
+.folder-row-glyph {
+  width: 11px;
+  height: 13px;
+  border-radius: 2px;
+  background: rgba(127, 127, 127, 0.5);
+}
+
+.folder-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.folder-row-meta {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  opacity: 0.6;
+}
+
+.folder-card-more {
+  margin-top: 6px;
+  padding-right: 4px;
+  font-size: 0.68rem;
+  color: var(--label-color);
+  opacity: 0.6;
 }
 
 /* ─── 拖入文件添加（外部拖放） ──────────────────────────────────────── */
@@ -972,4 +1250,85 @@ html, body {
 .drop-hint.active {
   border: 1px solid rgba(58, 123, 213, 0.9);
   box-shadow: 0 0 0 3px rgba(58, 123, 213, 0.25), 0 6px 18px rgba(0, 0, 0, 0.2);
+}
+
+/* ─── 顶部 Dock（data-edge="top"）───────────────────────────────────────── */
+/* 窗口形状与底部 Dock 完全相同（宽 85% × 高 300），整套几何垂直镜像：
+   玻璃条贴窗口上沿、70px 透明放大区让到下方，图标下沉、悬浮标签挂在图标下方，
+   浮层（卡片/菜单/面板）由 JS 改成锚在玻璃条下沿外侧。 */
+
+.app[data-edge='top'] {
+  justify-content: flex-start; /* 玻璃条贴窗口上沿（底部 Dock 是 flex-end） */
+}
+
+.app[data-edge='top'] .dock-bg {
+  top: 0; /* 玻璃条盖住图标区 + 上方 8px */
+  bottom: 70px; /* 下方让出 70px 透明区（放大图标与标签往下顶出） */
+}
+
+.app[data-edge='top'] .dock-inner {
+  padding: 0 16px 70px; /* 透明放大区从上改到下 */
+  align-items: flex-start; /* 图标贴内容区顶部（玻璃条内垂直居中） */
+}
+
+.app[data-edge='top'] .dock-edge {
+  top: 0;
+  bottom: 70px; /* 两端渐隐跟随玻璃条的位置 */
+}
+
+/* 放大以「图标顶边」为原点：顶部时增长全部朝下（朝桌面方向顶出）。
+   默认是以中心为原点，会同时向上长——而玻璃条紧贴屏幕顶边、上方没有空间，
+   那半截增长被屏幕边缘吃掉，动画看着就只剩一半幅度。 */
+.app[data-edge='top'] .dock-item {
+  transform-origin: center top;
+}
+
+/* 选中/归组高亮时图标瓷砖会 scale(1.05)。底部布局由此上方的 70px 透明区容得下这 3px
+   增长，顶部布局的透明区在下方、上方紧贴裁剪线，所以原点也要镜像到顶边，
+   否则瓷砖顶边被 overflow 削平、圆角变直角 */
+.app[data-edge='top'] .dock-item.selected .dock-icon-wrap,
+.app[data-edge='top'] .dock-item.drop-target .dock-icon-wrap {
+  transform-origin: center top;
+}
+
+/* 悬浮标签挂到图标下方：默认规则是挂在图标上方，顶部 Dock 时那里是窗口外沿 */
+.app[data-edge='top'] .dock-label {
+  bottom: auto;
+  top: calc(100% + 4px);
+}
+
+/* 拖入提示胶囊：浮到玻璃条下方 */
+.app[data-edge='top'] .drop-hint {
+  bottom: auto;
+  top: 156px; /* 镜像：Dock 高 146 + 10px 间隙 */
+}
+
+/* 分组面板（迷你 Dock）同样镜像：玻璃在上、透明放大区在下。
+   面板总高 132 = 8(上留白) + 60(图标) + 64(下透明区)，玻璃条要覆盖 0..76
+   （与底部面板的 56..132 对称：图标区上下各 8px）——写 top: 8px 会把玻璃条
+   压成 68px，图标上沿直接贴住玻璃边框。 */
+.app[data-edge='top'] .group-panel-bg {
+  top: 0;
+  bottom: 56px;
+}
+
+.app[data-edge='top'] .group-panel-inner {
+  padding: 8px 12px 64px;
+  align-items: flex-start;
+}
+
+/* 「+」下拉菜单从上方滑入（默认动画是从下方升起）：起点在玻璃条内、向下落到位 */
+@keyframes dropdown-in-top {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+.app[data-edge='top'] .dropdown-menu {
+  animation-name: dropdown-in-top;
 }

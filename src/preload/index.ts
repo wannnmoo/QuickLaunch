@@ -29,8 +29,65 @@ export interface AppEntry {
   isSeparator?: boolean
 }
 
+/** 文件夹子项（悬停预览卡片用） */
+export interface FolderChild {
+  name: string
+  path: string
+  isDir: boolean
+  /** 文件字节数；目录恒为 -1（不递归统计） */
+  size: number
+  iconDataUrl: string
+}
+
+export interface FolderListing {
+  path: string
+  name: string
+  folders: number
+  files: number
+  items: FolderChild[]
+  /** 超出列举上限（400）未列出的条目数 */
+  truncated: number
+  error?: 'missing' | 'denied' | 'notdir'
+}
+
+/** 图标分批补齐事件负载：列表先返回，图标分批提取完后就地替换（只含本批取到的路径） */
+export interface FolderIconsPayload {
+  path: string
+  /** 路径 → data:image/png;base64,… */
+  icons: Record<string, string>
+}
+
+/** 停靠位置：bottom = 底部横条；top = 顶部横条；middle = 悬浮屏幕中央；
+ *  left / right = 侧边竖排（下一阶段） */
+export type DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'
+
+// 停靠位置（主进程通过 additionalArguments 传进来，首帧即可用）。
+// 兜底值必须与主进程的 DEFAULT_EDGE 一致（中间），否则参数缺失时会出现
+// 「主进程按中间摆窗口、渲染端按底部画布局」的错配
+const dockEdgeFromArgv = (): DockEdge => {
+  const arg = process.argv.find((a) => a.startsWith('--ql-edge='))
+  const v = arg?.slice('--ql-edge='.length)
+  return v === 'top' || v === 'left' || v === 'right' || v === 'bottom' ? v : 'middle'
+}
+
 // Custom APIs for renderer
 const api = {
+  /** 当前停靠边（'bottom' | 'top' | 'left' | 'right'）：渲染端据此决定布局方向。 */
+  dockEdge: dockEdgeFromArgv(),
+  /** 订阅「停靠位置被原地切换」事件（横向三档尺寸相同，主进程用 setBounds + 本事件切换，
+   *  不重建窗口，所以是瞬间的），返回取消订阅函数。 */
+  onDockEdgeChanged: (callback: (edge: DockEdge) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, edge: DockEdge): void => callback(edge)
+    ipcRenderer.on('dock-edge-changed', listener)
+    return () => { ipcRenderer.removeListener('dock-edge-changed', listener) }
+  },
+  /** 读取当前停靠位置：`dockEdge` 是建窗那一刻的快照，而横向三档是原地切换不重建窗口，
+   *  所以页面重载（dev HMR / Ctrl+R）后要用它对齐。 */
+  getDockEdge: (): Promise<DockEdge> =>
+    ipcRenderer.invoke('get-dock-edge'),
+  /** 切换停靠位置（下/上/左/右/中间）：横向三档原地切换，竖排会销毁并按新形状重建窗口。 */
+  setDockEdge: (edge: DockEdge): Promise<boolean> =>
+    ipcRenderer.invoke('set-dock-edge', edge),
   /** Parse one or more .lnk shortcut files. Pass a path, or omit to open a multi-select file dialog. */
   parseLnk: (filePath?: string): Promise<LnkInfo[]> =>
     ipcRenderer.invoke('parse-lnk', filePath),
@@ -51,12 +108,35 @@ const api = {
     accepted: { targetPath: string; arguments: string; workingDirectory: string; description: string; iconDataUrl: string }[]
     rejected: string[]
   }> => ipcRenderer.invoke('describe-paths', paths),
+  /** 枚举驱动器（「此电脑」悬停卡片与图标用量条用）：单次 PowerShell 返回盘符/卷标/类型/容量。 */
+  listDrives: (): Promise<{
+    name: string
+    label: string
+    type: string
+    format: string
+    total: number
+    free: number
+    ready: boolean
+  }[]> => ipcRenderer.invoke('list-drives'),
+  /** 列出文件夹子项（文件夹条目悬停预览卡片）：目录优先 + 名称自然序，最多 400 项。
+   *  图标先用通用图标秒回，真图标由 `folder-icons` 事件随后补齐。 */
+  listFolder: (dir: string): Promise<FolderListing> =>
+    ipcRenderer.invoke('list-folder', dir),
+  /** 订阅「真图标补齐」事件（exe/lnk/url 的真实图标后台提取完后推送），返回取消订阅函数。 */
+  onFolderIcons: (callback: (payload: FolderIconsPayload) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, payload: FolderIconsPayload): void => callback(payload)
+    ipcRenderer.on('folder-icons', listener)
+    return () => { ipcRenderer.removeListener('folder-icons', listener) }
+  },
   /** 以管理员身份运行目标（Start-Process -Verb RunAs → UAC 提权）。 */
   runAsAdmin: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
     ipcRenderer.invoke('run-as-admin', targetPath, args, workingDir),
   /** 在资源管理器中定位目标文件/文件夹。 */
   openFileLocation: (targetPath: string): Promise<void> =>
     ipcRenderer.invoke('open-file-location', targetPath),
+  /** 按资源管理器双击的语义打开任意路径（目录开资源管理器，文件交给关联程序）。 */
+  openPath: (targetPath: string): Promise<boolean> =>
+    ipcRenderer.invoke('open-path', targetPath),
   /** 复制文本到剪贴板（如条目路径）。 */
   copyText: (text: string): Promise<void> =>
     ipcRenderer.invoke('copy-text', text),

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
 
 interface AppEntry {
   id: number
@@ -34,8 +34,84 @@ const topAnchorId = (list: AppEntry[], idx: number | null): number | null => {
 // 它不属于 apps 列表，用一个负数哨兵 id 表示（nextId 从 0 起单调递增，不会冲突）
 const ADD_BTN_ID = -1
 
-// 分组面板底部间距：Dock 高度 146 + 8px 间隙
-const PANEL_BOTTOM = 154
+// 拖拽边缘自动滚动：进入边缘 60px 内开始滚，越贴边越快（每帧最大 18px ≈ 1080px/s）
+const EDGE_ZONE = 60
+const EDGE_MAX_SPEED = 18
+
+type DriveInfo = {
+  name: string
+  label: string
+  type: string
+  format: string
+  total: number
+  free: number
+  ready: boolean
+}
+
+// 字节数格式化（用量条标签与悬停卡片共用）
+const fmtSize = (bytes: number): string =>
+  bytes >= 1024 ** 4
+    ? `${(bytes / 1024 ** 4).toFixed(1)} TB`
+    : `${Math.round(bytes / 1024 ** 3)} GB`
+
+// 文件大小格式化（文件夹预览卡片右列：单个文件比磁盘小几个量级，按 B/KB/MB/GB 递进）
+const fmtFileSize = (bytes: number): string => {
+  if (bytes < 0) return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024)} KB`
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+}
+
+// 文件夹悬停预览卡片的状态：anchorX = 悬停图标中心的视口 X（卡片按它锚定并钳制在窗口内）
+type FolderCardState = {
+  path: string
+  name: string
+  anchorX: number
+  /** null = 正在读取（卡片先出现，列表随后填入） */
+  data: FolderListing | null
+}
+
+// 已用比例（0..1）；容量未知（网络盘/空光驱）返回 0
+const usedRatio = (d: DriveInfo): number =>
+  d.total > 0 ? Math.min(1, Math.max(0, (d.total - d.free) / d.total)) : 0
+
+// 用量条配色：<70% 主题蓝、70–90% 琥珀、>90% 红
+const usageColor = (ratio: number): string =>
+  ratio >= 0.9 ? '#e0533d' : ratio >= 0.7 ? '#e0a33d' : '#3a7bd5'
+
+// 驱动器类型的中文说明（卷标为空时显示）
+const driveTypeText = (type: string): string =>
+  type === 'Network' ? '网络驱动器'
+    : type === 'CDRom' ? '光驱'
+      : type === 'Removable' ? '可移动磁盘'
+        : type === 'Ram' ? '内存盘'
+          : '本地磁盘'
+
+// 浮层贴边锚点的兜底值（拿不到 .dock-bg 实测值时用）：玻璃条高 76 + 8px 间隙 = 84，
+// 上下两种停靠位置数值相同（浮层都贴在玻璃条外侧 8px）
+const PANEL_FALLBACK = 84
+
+// ─── 停靠位置（下 / 上 / 中间 / 左 / 右）──────────────────────────────
+// 主进程创建窗口时通过 additionalArguments 传进来（preload 暴露为 window.api.dockEdge）作为
+// 初始值；之后**可以在运行中变**——横向三档（下/上/中间）窗口尺寸相同，主进程用
+// setBounds + `dock-edge-changed` 事件原地切换（不重建窗口，所以是瞬间的），
+// 因此这里必须是 state 而不是模块常量。左/右竖排（尺寸不同）仍走重建窗口。
+const EDGE_INITIAL: DockEdge = (window.api && window.api.dockEdge) || 'middle'
+// 位置选择器的可选项。左/右竖排是下一阶段接上的部分，先把入口留在这里，
+// 等布局与交互（纵向滚动、侧向浮层）都做完了再开启这两项。
+// 「中间」= 悬浮在屏幕中央：布局与「下」完全相同（标签在上、浮层在上方），
+// 只是窗口不贴边——好处是上下都有空间，悬停放大的幅度不会被屏幕边缘吃掉。
+const DOCK_EDGE_CHOICES: { value: DockEdge; label: string }[] = [
+  { value: 'middle', label: '中间' },
+  { value: 'bottom', label: '下' },
+  { value: 'top', label: '上' }
+]
+// 键盘选中框（蓝框）自动隐藏：停止按方向键/Enter 这么久后就收起（连状态一起退出导航）
+const NAV_IDLE_MS = 5000
+// 悬停标签钳制时距容器边缘保留的余量：必须大于 CSS 里 .dock-inner 两端溶解遮罩的宽度
+// （40px），否则标签会被遮罩淡成半透明
+const LABEL_CLAMP_PAD = 48
 // 窗口高度（与主进程 createWindow 的 300 一致）。右键菜单不改变窗口尺寸
 // 高度上限按这个基准算，超出时内部滚动——避免透明窗口 resize 的白闪
 const BASE_WINDOW_H = 300
@@ -47,7 +123,7 @@ const isFileDragEvent = (e: React.DragEvent): boolean =>
 function App(): React.ReactElement {
   const [apps, setApps] = useState<AppEntry[]>([])
   // 新增按钮下拉菜单的锚点位置（按钮中心 x + 按钮顶部 y，视口坐标）；null 表示关闭。
-  // 菜单渲染在 Dock 滚动容器之外（fixed 定位），否则会被滚动容器的 overflow 裁剪。
+  // 菜单渲染在 Dock 滚动容器之外（脱离 overflow 裁剪），否则会被滚动容器的 overflow 裁剪。
   const [menuPos, setMenuPos] = useState<{ cx: number; top: number } | null>(null)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; appId: number } | null>(null)
   // 右键菜单编辑模式：editingId 非 null 时菜单切换为编辑表单（名称/参数/工作目录/图标）
@@ -65,6 +141,26 @@ function App(): React.ReactElement {
     const saved = localStorage.getItem('ql-theme')
     return saved === 'light' || saved === 'transparent' ? saved : 'dark'
   })
+  // 停靠位置：横向三档由主进程 setBounds + 事件原地切换（不重建窗口 → 瞬间生效）
+  const [edge, setEdge] = useState<DockEdge>(EDGE_INITIAL)
+  // 切换停靠位置后用它补一帧渲染，让浮层锚点用新布局重新测量（详见 onDockEdgeChanged 那段）
+  const [, setEdgeTick] = useState(0)
+  const isTop = edge === 'top'
+
+  useEffect(() => {
+    // 主进程原地改了停靠位置：跟着翻布局即可（窗口尺寸没变，不需要重载页面）。
+    // 末尾再触发一帧渲染：`data-edge` 是 commit 之后才生效的，而浮层锚点
+    // （overlayAnchor 用 getBoundingClientRect 量 .dock-bg）在渲染期就算好了，
+    // 不补这一帧的话，切位置那一帧量到的仍是旧布局
+    const off = window.api.onDockEdgeChanged((next) => {
+      setEdge(next)
+      requestAnimationFrame(() => setEdgeTick((n) => n + 1))
+    })
+    // dockEdge（argv）只是建窗时的快照：页面重载后（dev HMR / Ctrl+R）
+    // 主进程可能已经原地切到别的档，这里主动对齐一次
+    window.api.getDockEdge().then((cur) => { if (cur) setEdge(cur) }).catch(() => {})
+    return off
+  }, [])
 
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
@@ -105,6 +201,146 @@ function App(): React.ReactElement {
   // 新建分组后需要把 Dock 横向滚到末尾（待 apps 渲染完再执行）
   const scrollDockToEndRef = useRef(false)
 
+  // ─── 文件夹悬停预览卡片 ───────────────────────────────────────────────
+  // 与「此电脑」卡片同构：悬停 300ms 弹出全部子项（目录优先/最多 400 项），移开 150ms 后关
+  // （宽限期让鼠标能移到卡片上继续滚动查看）。列表秒回、真图标由 folder-icons 事件补齐。
+  const [folderCard, setFolderCard] = useState<FolderCardState | null>(null)
+  const folderCardTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const folderCardRef = useRef<HTMLDivElement>(null)
+  // 卡片水平位置：先按图标中心渲染，测量宽度后在 paint 前钳制进窗口（贴边缘时内收）
+  const [folderCardLeft, setFolderCardLeft] = useState<number | null>(null)
+
+  const closeFolderCard = useCallback(() => {
+    if (folderCardTimer.current) { clearTimeout(folderCardTimer.current); folderCardTimer.current = null }
+    setFolderCard(null)
+  }, [])
+
+  // 延迟关闭：鼠标从图标移到卡片上时会先离开图标，给 150ms 宽限（移到卡片即取消）
+  const scheduleCloseFolderCard = useCallback(() => {
+    if (folderCardTimer.current) clearTimeout(folderCardTimer.current)
+    folderCardTimer.current = setTimeout(() => {
+      folderCardTimer.current = null
+      setFolderCard(null)
+    }, 150)
+  }, [])
+
+  const openFolderCard = useCallback((app: AppEntry, anchorX: number) => {
+    if (folderCardTimer.current) clearTimeout(folderCardTimer.current)
+    // 悬停即预取：鼠标刚碰到图标就开始列目录 + 提首批图标（主进程会缓存 5s，
+    // 并对着同一目录的在途请求做去重），300ms 后卡片弹出时直接命中缓存
+    window.api.listFolder(app.targetPath).catch(() => {})
+    folderCardTimer.current = setTimeout(() => {
+      folderCardTimer.current = null
+      // 拖拽/拖入进行中不弹卡片（会挡住落点指示线）
+      if (dragStartedRef.current || fileDragOverRef.current) return
+      const same = normPath(app.targetPath)
+      // 同一目录且已加载完：保持内容只更新锚点（鼠标在 150ms 宽限里移出又移回时，
+      // 不要清成「读取中」再重新加载——那会闪一下，缓存过期时还要整目录重扫）
+      setFolderCard((prev) =>
+        prev && prev.data && normPath(prev.path) === same
+          ? { ...prev, anchorX }
+          : { path: app.targetPath, name: app.description || '未命名', anchorX, data: null })
+      // 无条件再取一次：命中主进程 5s 缓存时几乎零成本，同目录时正好把内容刷新回来
+      window.api.listFolder(app.targetPath)
+        .then((data) => setFolderCard((prev) =>
+          (prev && normPath(prev.path) === same ? { ...prev, data } : prev)))
+        .catch(() => {})
+    }, 300)
+  }, [])
+
+  // 图标分批补齐事件：按路径就地替换（卡片已关或已换目录则丢弃）
+  useEffect(() => window.api.onFolderIcons((p) => {
+    setFolderCard((prev) => {
+      if (!prev?.data || normPath(prev.path) !== normPath(p.path)) return prev
+      const icons: Record<string, string> = {}
+      for (const [k, v] of Object.entries(p.icons)) icons[normPath(k)] = v
+      return {
+        ...prev,
+        data: {
+          ...prev.data,
+          items: prev.data.items.map((it) => {
+            const icon = icons[normPath(it.path)]
+            return icon && icon !== it.iconDataUrl ? { ...it, iconDataUrl: icon } : it
+          })
+        }
+      }
+    })
+  }), [])
+
+  useEffect(() => () => {
+    if (folderCardTimer.current) clearTimeout(folderCardTimer.current)
+  }, [])
+
+  // 卡片宽度测量后钳制水平位置（useLayoutEffect：在 paint 前落位，不会看到跳一下）
+  useLayoutEffect(() => {
+    const el = folderCardRef.current
+    if (!el || !folderCard) return
+    const half = el.offsetWidth / 2
+    const min = half + 10
+    const max = Math.max(min, window.innerWidth - half - 10)
+    setFolderCardLeft(Math.min(Math.max(folderCard.anchorX, min), max))
+  }, [folderCard])
+
+  // 点卡片里的子项：按资源管理器双击的语义打开（文件夹 → 资源管理器；文件 → 关联程序）。
+  // 走 open-path（shell.openPath / ShellExecuteEx），**不能**用 run-app——那条路径用 execFile
+  // 直接 CreateProcess，对 .md/.txt/.png 这类非可执行文件必然失败，点了没反应。
+  const openFolderChild = (item: FolderChild): void => {
+    closeFolderCard()
+    window.api.openPath(item.path)
+  }
+
+  // ─── 驱动器信息（「此电脑」悬停卡片 + 图标用量条） ─────────────────────
+  const [drives, setDrives] = useState<DriveInfo[]>([])
+  // 悬停「此电脑」N 毫秒后弹出的盘符卡片；移开（含移出卡片）即关
+  const [showDrivesCard, setShowDrivesCard] = useState(false)
+  const drivesCardTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const loadDrives = useCallback(() => {
+    window.api.listDrives().then((list) => setDrives(list || [])).catch(() => {})
+  }, [])
+
+  // 启动时拉一次，之后每次打开卡片时再刷新（容量变化不常发生，无需轮询）
+  useEffect(() => { loadDrives() }, [loadDrives])
+
+  // 三个都用 useCallback 固定引用：它们会被 handleIconMouseDown / handleContextMenu 的
+  // useCallback 依赖引用，每次渲染换新函数会让那些回调的缓存失效
+  const openDrivesCard = useCallback(() => {
+    if (drivesCardTimer.current) clearTimeout(drivesCardTimer.current)
+    drivesCardTimer.current = setTimeout(() => {
+      drivesCardTimer.current = null
+      // 拖拽/拖入进行中不弹卡片（与文件夹卡片同一套守卫，避免卡片在拖动途中冒出来挡落点）
+      if (dragStartedRef.current || fileDragOverRef.current) return
+      loadDrives() // 打开时刷新，保证数字是当下的
+      setShowDrivesCard(true)
+    }, 300)
+  }, [loadDrives])
+
+  const closeDrivesCard = useCallback(() => {
+    if (drivesCardTimer.current) { clearTimeout(drivesCardTimer.current); drivesCardTimer.current = null }
+    setShowDrivesCard(false)
+  }, [])
+
+  // 延迟关闭：鼠标从图标移到卡片上时会先离开图标，给 150ms 宽限（移到卡片即取消）
+  const scheduleCloseDrivesCard = useCallback(() => {
+    if (drivesCardTimer.current) clearTimeout(drivesCardTimer.current)
+    drivesCardTimer.current = setTimeout(() => {
+      drivesCardTimer.current = null
+      setShowDrivesCard(false)
+    }, 150)
+  }, [])
+
+  useEffect(() => () => {
+    if (drivesCardTimer.current) clearTimeout(drivesCardTimer.current)
+  }, [])
+
+  // 汇总（固定盘 + 移动盘，容量已知的才计入）：图标底部细条与标签数字用它
+  const driveSummary = (() => {
+    const known = drives.filter((d) => d.total > 0)
+    const total = known.reduce((s, d) => s + d.total, 0)
+    const free = known.reduce((s, d) => s + d.free, 0)
+    return total > 0 ? { total, free, ratio: (total - free) / total } : null
+  })()
+
   // ─── 键盘导航 ─────────────────────────────────────────────────────────
   // navId 非 null 表示处于导航模式：Alt+Space 唤出 Dock 时由主进程通知进入（自动选中
   // 第一个图标）；鼠标按下图标、启动条目、Esc 于主 Dock 层都会退出
@@ -123,6 +359,8 @@ function App(): React.ReactElement {
   // 但整窗都拦截默认行为（见下方 document 级 preventDefault），否则 Chromium
   // 会把窗口导航到 file:// 变成白屏
   const [fileDragOver, setFileDragOver] = useState(false)
+  // 镜像 ref：rAF 的边缘自动滚动循环里要判断「当前是文件拖入」，不能读 state
+  const fileDragOverRef = useRef(false)
   // 拖放结果提示（「已添加 2 个，跳过 1 个」等），2.4s 后自动消失
   const [dropHint, setDropHint] = useState<string | null>(null)
   const dropHintTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -181,6 +419,69 @@ function App(): React.ReactElement {
     return centers.length
   }, [])
 
+  // 横向滚动边界状态（两端渐隐提示）：拖拽自动滚动与键盘导航都会用到，故声明在此处
+  const updateScrollState = useCallback(() => {
+    const el = dockInnerRef.current
+    if (!el) {
+      setScrollState({ left: false, right: false })
+      return
+    }
+    setScrollState({
+      left: el.scrollLeft > 1,
+      right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1
+    })
+  }, [])
+
+  // ─── 拖拽到两端自动滚动 ───────────────────────────────────────────────
+  // 用 rAF 循环而不是只在 mousemove 里滚：鼠标停在边缘不动时也要「持续」滚动。
+  // 速度随贴近程度线性递增；离开边缘区、松手、鼠标移出窗口都会停下。
+  const edgeRafRef = useRef<number | null>(null)
+  const edgeClientXRef = useRef(0) // 最近一次光标 x（rAF 里据此判定边缘并重算落点）
+
+  const stopEdgeScroll = useCallback(() => {
+    if (edgeRafRef.current !== null) {
+      cancelAnimationFrame(edgeRafRef.current)
+      edgeRafRef.current = null
+    }
+  }, [])
+
+  // 卸载时收掉可能在跑的自动滚动帧循环（鼠标按着不放时组件被卸载/StrictMode 重挂，
+  // 循环会一直排帧直到光标离开边缘区才自停）
+  useEffect(() => stopEdgeScroll, [stopEdgeScroll])
+
+  const stepEdgeScroll = useCallback(() => {
+    const el = dockInnerRef.current
+    if (!el) { edgeRafRef.current = null; return }
+    const rect = el.getBoundingClientRect()
+    const x = edgeClientXRef.current
+    // 左右两侧的贴近程度（0 = 在边缘区外，1 = 贴到边上）。
+    // 上下都要钳：光标跑到容器外（比如在 Dock 侧边留白或窗口外）时算出来会 >1，
+    // 那样每帧步长就突破 EDGE_MAX_SPEED 的约定上限
+    const left = Math.min(1, Math.max(0, 1 - (x - rect.left) / EDGE_ZONE))
+    const right = Math.min(1, Math.max(0, 1 - (rect.right - x) / EDGE_ZONE))
+    const strength = Math.max(left, right)
+    if (strength <= 0) { edgeRafRef.current = null; return } // 已离开边缘区：停
+
+    const before = el.scrollLeft
+    el.scrollLeft = before + (right > left ? 1 : -1) * Math.ceil(strength * EDGE_MAX_SPEED)
+    if (el.scrollLeft !== before) {
+      updateScrollState()
+      // 图标在光标下方移动了，落点要跟着重算（图标拖拽与拖入文件都适用）
+      if (dragStartedRef.current || fileDragOverRef.current) {
+        const idx = calcDropIndex(x)
+        dropIdxRef.current = idx
+        setDropIdx(idx)
+      }
+    }
+    edgeRafRef.current = requestAnimationFrame(stepEdgeScroll)
+  }, [calcDropIndex, updateScrollState])
+
+  // 记录光标并确保循环在跑（已在跑则不重复启动）
+  const pumpEdgeScroll = useCallback((clientX: number) => {
+    edgeClientXRef.current = clientX
+    if (edgeRafRef.current === null) edgeRafRef.current = requestAnimationFrame(stepEdgeScroll)
+  }, [stepEdgeScroll])
+
   // 命中测试：坐标落在哪个「分组图标」上（排除被拖拽项自身；分组不能嵌套）
   const hitTestGroup = useCallback((x: number, y: number, excludeId: number): number | null => {
     for (const [id, el] of iconRefs.current) {
@@ -218,6 +519,7 @@ function App(): React.ReactElement {
       setDragOverGroupId(null)
       dropIdxRef.current = null
       dragOverGroupRef.current = null
+      stopEdgeScroll() // 拖拽结束：停掉边缘自动滚动
       if (!wasDrag) return
 
       setApps((prev) => {
@@ -280,15 +582,20 @@ function App(): React.ReactElement {
       const idx = over === null ? calcDropIndex(e.clientX) : null
       dropIdxRef.current = idx
       setDropIdx(idx)
+      // 拖到两端自动滚动（鼠标停在边缘不动时也持续滚）
+      if (over === null) pumpEdgeScroll(e.clientX)
+      else stopEdgeScroll()
     }
 
     window.addEventListener('mouseup', handleMouseUp)
     window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseleave', stopEdgeScroll)
     return () => {
       window.removeEventListener('mouseup', handleMouseUp)
       window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseleave', stopEdgeScroll)
     }
-  }, [calcDropIndex, hitTestGroup])
+  }, [calcDropIndex, hitTestGroup, pumpEdgeScroll, stopEdgeScroll])
 
   const handleIconMouseDown = useCallback((e: React.MouseEvent, id: number) => {
     if (e.button !== 0) return // left-click only
@@ -297,7 +604,12 @@ function App(): React.ReactElement {
     suppressClickRef.current = false
     // 鼠标接管 → 退出键盘导航
     setNavId(null)
-  }, [])
+    // 盘符卡片与文件夹卡片都是只读浮层：一旦开始操作就收起。
+    // 必须用 closeDrivesCard（而不是 setShowDrivesCard(false)）——它还会清掉那支
+    // 300ms 的「悬停开卡片」计时器，否则卡片会在按下鼠标后自己弹出来
+    closeDrivesCard()
+    closeFolderCard()
+  }, [closeDrivesCard, closeFolderCard])
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -392,15 +704,16 @@ function App(): React.ReactElement {
       const maxExtra = 0.4
       if (dist < maxDist) {
         const s = 1 + (1 - dist / maxDist) * maxExtra
-        const y = -(dist < maxDist * 0.6 ? (1 - dist / (maxDist * 0.6)) * 8 : 0)
-        el.style.transform = `scale(${s}) translateY(${y}px)`
+        // 上浮方向朝 Dock 外侧：底部 Dock 向上顶出玻璃条，顶部 Dock 向下顶出
+        const lift = dist < maxDist * 0.6 ? (1 - dist / (maxDist * 0.6)) * 8 : 0
+        el.style.transform = `scale(${s}) translateY(${isTop ? lift : -lift}px)`
         el.style.zIndex = '10'
       } else {
         el.style.transform = ''
         el.style.zIndex = ''
       }
     })
-  }, [])
+  }, [isTop])
 
   const resetMagnify = useCallback((refs: Map<number, HTMLDivElement>) => {
     refs.forEach((el) => {
@@ -410,15 +723,44 @@ function App(): React.ReactElement {
   }, [])
 
   const handleDockMouseMove = useCallback((e: React.MouseEvent) => {
+    // 鼠标一动就说明改用鼠标了：收起键盘选中框（看不见的选中项不该还能被 Enter 启动）
+    setNavId(null)
     if (dragId !== null) return // disable magnification during drag
     magnify(dockRef.current, iconRefs.current, e.clientX)
   }, [dragId, magnify])
+
+  // 悬停标签横向钳制：标签是绝对定位居中悬浮在图标上方（完整显示不截断），靠边的图标
+  // 会让标签伸出滚动容器、被 overflow 裁掉半截（「此电脑」的「此电脑 · 可用 …」就是如此）。
+  // 悬停时量一次标签宽度，把溢出的部分用 --label-shift 推回来（CSS 里并入 translateX）。
+  //
+  // 两个坑：
+  //  ① 悬停时图标已被放大（magnify 给 .dock-item 设了 scale），量到的矩形与写回的位移
+  //     不在同一坐标系——写回的位移还会被父级 scale 再乘一次，所以要除以当前缩放。
+  //  ② 钳制余量必须大于滚动容器两端遮罩（mask-image 的溶解区）宽度，否则标签正好落在
+  //     渐隐区内，药丸会被淡成半透明。
+  const clampDockLabel = useCallback((itemEl: HTMLElement | null) => {
+    const label = itemEl?.querySelector<HTMLElement>('.dock-label')
+    if (!label || !itemEl) return
+    label.style.setProperty('--label-shift', '0px') // 先归零再量，否则会累积上一次的偏移
+    const box = (itemEl.closest('.dock-inner') ?? itemEl.closest('.group-panel-inner'))
+      ?.getBoundingClientRect()
+    if (!box) return
+    const r = label.getBoundingClientRect()
+    // 用布局宽度换算当前缩放（offsetWidth 不受 transform 影响，比解析 transform 字符串可靠）
+    const scale = itemEl.offsetWidth > 0 ? itemEl.getBoundingClientRect().width / itemEl.offsetWidth : 1
+    const pad = LABEL_CLAMP_PAD
+    let shift = 0
+    if (r.left < box.left + pad) shift = (box.left + pad - r.left) / (scale || 1)
+    else if (r.right > box.right - pad) shift = (box.right - pad - r.right) / (scale || 1)
+    if (shift) label.style.setProperty('--label-shift', `${Math.round(shift)}px`)
+  }, [])
 
   const handleDockMouseLeave = useCallback(() => {
     resetMagnify(iconRefs.current)
   }, [resetMagnify])
 
   const handlePanelMouseMove = useCallback((e: React.MouseEvent) => {
+    setNavId(null) // 与主 Dock 一致：鼠标接管就收起键盘选中框
     if (dragId !== null) return
     magnify(panelInnerRef.current, panelIconRefs.current, e.clientX)
   }, [dragId, magnify])
@@ -430,18 +772,7 @@ function App(): React.ReactElement {
   // ─── Horizontal scroll (icon overflow) ──────────────────────────────
   // 图标超过 Dock 宽度时，滚动容器横向滚动，滚轮 / 触控板左右滑动查看。
   // 两端渐隐遮罩提示还有更多图标（可滚动的那一侧显示）。
-
-  const updateScrollState = useCallback(() => {
-    const el = dockInnerRef.current
-    if (!el) {
-      setScrollState({ left: false, right: false })
-      return
-    }
-    setScrollState({
-      left: el.scrollLeft > 1,
-      right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1
-    })
-  }, [])
+  // 注：updateScrollState 声明在 calcDropIndex 之后（拖拽自动滚动也要用它）。
 
   // 必须用原生非被动监听：React 在 root 容器上以 `{ passive: true }` 注册 wheel
   // 在 onWheel 里调 preventDefault 是空操作（DevTools 还会报 passive 警告）
@@ -467,8 +798,10 @@ function App(): React.ReactElement {
     // 源（资源管理器）据此可能删除原文件；而本应用只读路径、不搬运文件
     e.dataTransfer.dropEffect = 'copy'
     if (!fileDragOver) setFileDragOver(true)
+    if (!fileDragOverRef.current) fileDragOverRef.current = true
     // 落点指示线复用拖拽排序的 dropIdx（与内部拖拽不会同时发生）
     setDropIdx(calcDropIndex(e.clientX))
+    pumpEdgeScroll(e.clientX) // 拖到两端同样自动滚动
   }
 
   const handleDockDragLeave = (e: React.DragEvent) => {
@@ -476,16 +809,20 @@ function App(): React.ReactElement {
     // 在 Dock 内部子元素之间移动也会触发 dragleave，relatedTarget 仍在 Dock 内则忽略
     const next = e.relatedTarget as Node | null
     if (next && e.currentTarget.contains(next)) return
+    fileDragOverRef.current = false
     setFileDragOver(false)
     setDropIdx(null)
+    stopEdgeScroll()
   }
 
   const handleDockDrop = async (e: React.DragEvent) => {
     if (!isFileDragEvent(e)) return
     e.preventDefault()
     const at = calcDropIndex(e.clientX)
+    fileDragOverRef.current = false
     setFileDragOver(false)
     setDropIdx(null)
+    stopEdgeScroll()
 
     // Electron 32+ 移除了 File.path，路径只能由 preload 的 webUtils.getPathForFile 提供
     const paths = Array.from(e.dataTransfer.files)
@@ -540,13 +877,6 @@ function App(): React.ReactElement {
 
   // ─── Add handlers ─────────────────────────────────────────────────────
 
-  // id 在 updater 外分配：React.StrictMode 会双调用 updater 检测副作用，
-  // 若在 updater 内 nextId++ 会被执行两次（跳号，虽无功能影响但属不纯写法）
-  const pushEntry = (entry: Omit<AppEntry, 'id'>) => {
-    const id = nextId++
-    setApps((prev) => [...prev, { ...entry, id }])
-  }
-
   // 打开/关闭新增菜单，记录「添加」按钮的视口坐标作为菜单锚点
   const handleAddToggle = useCallback(() => {
     if (menuPos) {
@@ -557,6 +887,9 @@ function App(): React.ReactElement {
     if (!btn) return
     const rect = btn.getBoundingClientRect()
     setMenuPos({ cx: rect.left + rect.width / 2, top: rect.top })
+    // 菜单打开时退出键盘导航（与右键菜单同理）：否则选中框被菜单盖住，
+    // 按 Enter 会启动那个看不见的选中项
+    setNavId(null)
     // 打开菜单时重置脏标记并同步状态（决定菜单项文案/开关）；若用户随后抢先点击，
     // 过期的读取结果会被脏标记拦截，不覆盖乐观更新
     autoStartDirtyRef.current = false
@@ -603,6 +936,15 @@ function App(): React.ReactElement {
     }
     setGlassPlan(next)
     applyTheme(next)
+  }
+
+  // 切换停靠位置：交给主进程「原地」应用（横向三档窗口尺寸相同 → setBounds + 事件翻布局，
+  // 不重建窗口、不重载页面，约 60ms 生效；将来左/右竖排换了窗口形状才会走重建）。
+  // 位置只由预设决定，所以这里不做短路，具体怎么切由主进程判断。
+  const handleEdgePick = (next: DockEdge) => {
+    setMenuPos(null)
+    setContextMenu(null)
+    window.api.setDockEdge(next).catch(() => {})
   }
 
   // 切换开机自启动（乐观更新：先切开关，IPC 返回后校正；写注册表 Run 登录项）。
@@ -702,6 +1044,13 @@ function App(): React.ReactElement {
     e.preventDefault()
     e.stopPropagation()
     setEditingId(null)
+    // 菜单打开时退出键盘导航：否则「选中框」还在（只是被菜单遮住/浮层盖住），
+    // 此时按 Enter 会启动那个看不见的选中项
+    setNavId(null)
+    // 与右键菜单互斥（closeDrivesCard 会一并清掉悬停开卡片的计时器，否则卡片会在
+    // 右键菜单弹出后自己冒出来）
+    closeDrivesCard()
+    closeFolderCard()
     setContextMenu({ x: e.clientX, y: e.clientY, appId: id })
   }
 
@@ -791,11 +1140,17 @@ function App(): React.ReactElement {
     )
   }
 
-  // 浮层底边锚点：分组面板与右键菜单都贴在 Dock 毛玻璃条上方 8px
-  // 用实测的 .dock-bg 位置而非硬编码常量——布局改动后自动跟随
+  // 浮层贴边锚点：分组面板 / 右键菜单 / 两种卡片都贴在 Dock 毛玻璃条外侧 8px。
+  // 底部 Dock 用 overlayBottom（距窗口底边），顶部 Dock 用 overlayTop（距窗口顶边）——
+  // 都用实测的 .dock-bg 位置算，布局改动后自动跟随
   const overlayBottom = useCallback(() => {
     const barTop = dockBgRef.current?.getBoundingClientRect().top
-    return barTop === undefined ? PANEL_BOTTOM : window.innerHeight - barTop + 8
+    return barTop === undefined ? PANEL_FALLBACK : window.innerHeight - barTop + 8
+  }, [])
+
+  const overlayTop = useCallback(() => {
+    const barBottom = dockBgRef.current?.getBoundingClientRect().bottom
+    return barBottom === undefined ? PANEL_FALLBACK : barBottom + 8
   }, [])
 
   // 面板滚轮 → 横向滚动（与主 Dock 一致：原生非被动监听，否则 preventDefault 无效）
@@ -868,25 +1223,40 @@ function App(): React.ReactElement {
   }, [])
 
   // 主进程通知：Alt+Space 唤出 Dock（托盘点击等鼠标路径不会触发）
+  // 唤出不直接画选中框——按用户要求：只有按 ←/→ 才亮；这里顺手清掉上一次的残留选中
   useEffect(() => {
     const unsubscribe = window.api.onNavEnter(() => {
       closeGroupPanel() // 回到主 Dock 层
-      setNavId(resumeNavId(appsRef.current))
+      setNavId(null)
     })
     return unsubscribe
-  }, [closeGroupPanel, resumeNavId])
+  }, [closeGroupPanel])
 
-  // 启动即进入导航模式：恢复到上次的位置（首次运行则是第一个图标）
-  // 名单可能来自 shortcuts.json，也可能首启时由桌面扫描补上，所以等第一个顶层条目出现再选
-  const navInitRef = useRef(false)
+  // 启动**不**选中任何条目：导航模式只在按 ←/→ 时进入（见 keydown 里的唤醒分支）。
+  // 之前这里是「启动即恢复到上次位置」，会让 Dock 一启动就挂着一个蓝框。
+
+  // 选中框自动隐藏：停止操作 NAV_IDLE_MS 后连状态一起退出导航——框看不见了就不该还能
+  // 被 Enter 启动（避免「盲按 Enter 启动了上次选中的程序」）。任何方向键/Enter 重新计时
+  const navIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const armNavIdle = useCallback(() => {
+    if (navIdleTimer.current) clearTimeout(navIdleTimer.current)
+    navIdleTimer.current = setTimeout(() => {
+      navIdleTimer.current = null
+      setNavId(null)
+    }, NAV_IDLE_MS)
+  }, [])
+
   useEffect(() => {
-    if (navInitRef.current) return
-    const first = apps.find((a) => !a.groupId && !a.isSeparator)
-    if (!first) return
-    navInitRef.current = true
-    // 传当前渲染的 apps（而非 appsRef）：此处镜像 effect 尚未跑过本轮数据
-    setNavId(resumeNavId(apps))
-  }, [apps, resumeNavId])
+    if (navId === null) {
+      if (navIdleTimer.current) { clearTimeout(navIdleTimer.current); navIdleTimer.current = null }
+      return
+    }
+    armNavIdle()
+  }, [navId, armNavIdle])
+
+  useEffect(() => () => {
+    if (navIdleTimer.current) clearTimeout(navIdleTimer.current)
+  }, [])
 
   // 选中的条目被删除（右键删除 / 解散分组 / 桌面清理）时退出导航
   useEffect(() => {
@@ -927,6 +1297,9 @@ function App(): React.ReactElement {
         setNavId(resume)
         return
       }
+
+      // 已进入导航模式：任何方向键/Enter 都重置自动隐藏计时（含「按了但位置没变」的情况）
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Enter') armNavIdle()
 
       // 「+」新增按钮（Dock 末尾的合成目标，不属于 apps）：← 回到最后一个图标，Enter 打开菜单
       if (navId === ADD_BTN_ID) {
@@ -977,6 +1350,8 @@ function App(): React.ReactElement {
         }
         case 'Enter': {
           e.preventDefault()
+          // 菜单打开时不响应 Enter：选中框可能被菜单/浮层盖住，启动会显得无缘无故
+          if (contextMenu || menuPos) return
           if (!current) return
           if (current.isGroup) {
             setOpenGroupId(current.id)
@@ -1005,7 +1380,7 @@ function App(): React.ReactElement {
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [navId, openGroupId, contextMenu, menuPos, closeGroupPanel, handleAddToggle])
+  }, [navId, openGroupId, contextMenu, menuPos, closeGroupPanel, handleAddToggle, armNavIdle])
 
   // ─── 分隔线 ───────────────────────────────────────────────────────────
   // 分隔线是一种特殊条目（isSeparator: true）：因此天然参与拖拽排序与持久化
@@ -1218,20 +1593,25 @@ function App(): React.ReactElement {
   const topLevel = apps.filter((a) => !a.groupId)
   const openGroupMembers = openGroupId === null ? [] : apps.filter((a) => a.groupId === openGroupId)
   const openGroup = openGroupId === null ? undefined : apps.find((a) => a.id === openGroupId)
-  // 浮层（面板 / 右键菜单）的底边锚点，渲染时算一次
+  // 浮层的贴边锚点与可用空间，渲染时算一次。方向感知：底部 Dock 贴上方（bottom），
+  // 顶部 Dock 贴下方（top）——五个浮层（此电脑卡片 / 文件夹卡片 / 「+」菜单 / 右键菜单 /
+  // 分组面板）共用这一份几何。
+  // 注意：**两轴都要显式写**（另一个写 auto）。这些浮层的 CSS 里留着历史兜底
+  // （.dropdown-menu 的 bottom: calc(100% + 8px)、.group-panel 的 bottom: 154px），
+  // 若只设 top，兜底的 bottom 仍在生效 → 高度 auto 的元素被算成
+  // height = 容器高 - top - bottom（负数）→ 只剩内边距，菜单被压成一条白线。
   const overlayBottomOffset = overlayBottom()
-  // 右键菜单的高度上限：Dock 栏上方可用空间（默认窗口高度下约 138px），超出时内部滚动
-  const menuAvail = Math.max(120, BASE_WINDOW_H - overlayBottomOffset - 8)
-  // 分组 → 成员列表（面板渲染用，含分隔线）
-  const groupMembersById = new Map<number, AppEntry[]>()
+  const overlayTopOffset = overlayTop()
+  const overlayAvail = Math.max(120, BASE_WINDOW_H - (isTop ? overlayTopOffset : overlayBottomOffset) - 8)
+  const overlayAnchor: React.CSSProperties = isTop
+    ? { top: overlayTopOffset, bottom: 'auto', maxHeight: overlayAvail, height: 'auto' }
+    : { bottom: overlayBottomOffset, top: 'auto', maxHeight: overlayAvail, height: 'auto' }
   // 分组 → 可显示成员（排除分隔线）：分组图标的缩略拼图与数量徽标用它，
-  // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大
+  // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大。
+  // （面板渲染用的是 openGroupMembers，不需要另建一份含分隔线的表）
   const groupIconMembersById = new Map<number, AppEntry[]>()
   for (const a of apps) {
     if (a.groupId === undefined) continue
-    const list = groupMembersById.get(a.groupId)
-    if (list) list.push(a)
-    else groupMembersById.set(a.groupId, [a])
     if (a.isSeparator) continue
     const iconList = groupIconMembersById.get(a.groupId)
     if (iconList) iconList.push(a)
@@ -1240,7 +1620,11 @@ function App(): React.ReactElement {
 
   return (
     <div
-      className={theme === 'light' ? 'app theme-light' : theme === 'transparent' ? 'app theme-transparent' : 'app'}
+      className={(theme === 'light' ? 'app theme-light' : theme === 'transparent' ? 'app theme-transparent' : 'app')
+        // 悬停卡片打开时加标记类：CSS 用它压掉图标悬浮标签（否则会透过半透明卡片叠字）
+        + (folderCard || showDrivesCard ? ' card-open' : '')}
+      // 停靠边：CSS 用它切换整套布局方向（顶部 Dock = 整套几何垂直镜像）
+      data-edge={edge}
       onMouseEnter={() => window.api.dockPointer(true)}
     >
       <div
@@ -1256,7 +1640,9 @@ function App(): React.ReactElement {
             顶部放大留白区是透明的，hover 放大时图标会顶出背景之上（类似 macOS）。 */}
         <div className="dock-bg" ref={dockBgRef} />
         <div
-          className="dock-inner"
+          // 两端还有图标可滚时加标记类：CSS 用遮罩让边缘的图标「溶解」而不是被硬切一刀
+          // （硬切的半个图标压在圆角边缘上，看着像探出了 Dock 轮廓）
+          className={'dock-inner' + (scrollState.left ? ' edge-left' : '') + (scrollState.right ? ' edge-right' : '')}
           ref={dockInnerRef}
           onScroll={updateScrollState}
         >
@@ -1275,7 +1661,6 @@ function App(): React.ReactElement {
                   }}
                   onMouseDown={(e) => handleIconMouseDown(e, app.id)}
                   onContextMenu={(e) => handleContextMenu(e, app.id)}
-                  title={app.description}
                 />
               ) : (
               <div
@@ -1291,7 +1676,23 @@ function App(): React.ReactElement {
                 onMouseDown={(e) => handleIconMouseDown(e, app.id)}
                 onClick={() => handleRun(app)}
                 onContextMenu={(e) => handleContextMenu(e, app.id)}
-                title={app.description}
+                // 「此电脑」：悬停 300ms 弹出盘符卡片（移开 150ms 后关，方便移到卡片上继续看）
+                // 文件夹条目：同一套时序弹出子项预览卡片（锚在该图标中心）
+                // 两者都先做一次标签钳制，保证贴边图标的悬浮标签不被容器裁掉
+                onMouseEnter={(e) => {
+                  clampDockLabel(e.currentTarget as HTMLElement)
+                  if (app.specialType === 'this-pc') {
+                    openDrivesCard()
+                  } else if (app.isFolder && app.targetPath) {
+                    const r = e.currentTarget.getBoundingClientRect()
+                    openFolderCard(app, r.left + r.width / 2)
+                  }
+                }}
+                onMouseLeave={app.specialType === 'this-pc'
+                  ? scheduleCloseDrivesCard
+                  : app.isFolder && app.targetPath ? scheduleCloseFolderCard : undefined}
+                // 不设 title：App 自己有胶囊悬浮标签，再叠加系统的原生 tooltip 会变成
+                // 光标下方多出一个灰色提示框（与标签重复，观感也差）
               >
                 <div className="dock-icon-wrap">
                   {app.isGroup && !app.iconDataUrl ? (
@@ -1326,8 +1727,24 @@ function App(): React.ReactElement {
                   {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 0 && (
                     <span className="dock-badge">{groupIconMembersById.get(app.id)!.length}</span>
                   )}
+                  {/* 「此电脑」：所有盘符的汇总用量细条（贴在图标框底部内侧） */}
+                  {app.specialType === 'this-pc' && driveSummary && (
+                    <span className="dock-usage" aria-hidden="true">
+                      <span
+                        className="dock-usage-fill"
+                        style={{
+                          width: `${Math.round(driveSummary.ratio * 100)}%`,
+                          background: usageColor(driveSummary.ratio)
+                        }}
+                      />
+                    </span>
+                  )}
                 </div>
-                <span className="dock-label">{app.description || '未命名'}</span>
+                <span className="dock-label">
+                  {app.specialType === 'this-pc' && driveSummary
+                    ? `此电脑 · 可用 ${fmtSize(driveSummary.free)} / ${fmtSize(driveSummary.total)}`
+                    : (app.description || '未命名')}
+                </span>
               </div>
               )}
               {dropIdx === idx + 1 && dragId !== app.id && (
@@ -1364,10 +1781,11 @@ function App(): React.ReactElement {
           className="group-panel"
           ref={panelRef}
           style={{
-            bottom: overlayBottomOffset,
-            // 右键菜单锚在 Dock 栏上方、与面板同处一条带（窗口只有 300px 高，面板上方
-            // 只剩十几像素，无法再往上叠）——菜单打开期间藏起面板；菜单一关闭（鼠标移出即关
-            // 即关，见菜单自动关闭 effect）面板同帧显示回来，不会出现重叠空档
+            // 两轴都写：.group-panel 的 CSS 兜底 bottom: 154px 若仍生效，只设 top 会把面板压扁
+            ...(isTop ? { top: overlayTopOffset, bottom: 'auto' } : { bottom: overlayBottomOffset, top: 'auto' }),
+            // 右键菜单锚在 Dock 栏外侧、与面板同处一条带（窗口只有 300px 高，面板另一侧
+            // 只剩十几像素，无法再叠）——菜单打开期间藏起面板；菜单一关闭（鼠标移出即关，
+            // 见菜单自动关闭 effect）面板同帧显示回来，不会出现重叠空档
             visibility: contextMenu ? 'hidden' : 'visible'
           }}
         >
@@ -1390,7 +1808,6 @@ function App(): React.ReactElement {
                   }}
                   onMouseDown={(e) => handleIconMouseDown(e, m.id)}
                   onContextMenu={(e) => handleContextMenu(e, m.id)}
-                  title={m.description}
                 />
               ) : (
               <div
@@ -1403,7 +1820,8 @@ function App(): React.ReactElement {
                 onMouseDown={(e) => handleIconMouseDown(e, m.id)}
                 onClick={() => handleRun(m)}
                 onContextMenu={(e) => handleContextMenu(e, m.id)}
-                title={m.description}
+                onMouseEnter={(e) => clampDockLabel(e.currentTarget as HTMLElement)}
+                // 同主 Dock：不设 title，避免系统原生 tooltip 与胶囊标签重复
               >
                 <div className="dock-icon-wrap">
                   <img className="dock-icon" src={m.iconDataUrl} alt="" draggable={false} />
@@ -1421,14 +1839,134 @@ function App(): React.ReactElement {
         </div>
       )}
 
-      {/* 拖入提示 / 拖放结果提示：fixed 定位于 Dock 上方（脱离滚动容器，不被裁剪） */}
+      {/* 「此电脑」悬停卡片：列出各盘符与用量条。复用面板/菜单的浮层几何
+          （贴在 Dock 毛玻璃条外侧，高度上限 = 可用空间），不改变窗口尺寸 */}
+      {showDrivesCard && (
+        <div
+          className="drives-card"
+          style={{
+            ...overlayAnchor,
+            // 浮层互斥：五块浮层（两张卡片 / 「+」菜单 / 右键菜单 / 分组面板）同处 Dock 外侧
+            // 一条带，窗口只有 300px 高叠不开。卡片 z-index 最高（200 > 面板 150 > 菜单 100），
+            // 不做互斥就会盖住菜单项/面板成员并抢走点击
+            visibility: menuPos || contextMenu || openGroup ? 'hidden' : 'visible'
+          }}
+          onMouseEnter={() => {
+            // 鼠标移进卡片：取消正在计时的关闭/打开，保持展开
+            if (drivesCardTimer.current) { clearTimeout(drivesCardTimer.current); drivesCardTimer.current = null }
+          }}
+          onMouseLeave={closeDrivesCard}
+        >
+          <div className="drives-card-title">
+            此电脑 · 驱动器{driveSummary ? `（可用 ${fmtSize(driveSummary.free)}）` : ''}
+          </div>
+          {drives.length === 0 && <div className="drives-empty">未检测到驱动器</div>}
+          {drives.map((d) => {
+            const ratio = usedRatio(d)
+            return (
+              <div className="drive-row" key={d.name}>
+                <div className="drive-row-head">
+                  <span className="drive-name">{d.name}</span>
+                  <span className="drive-type">{d.label || driveTypeText(d.type)}</span>
+                  <span className="drive-nums">
+                    {d.total > 0 ? `${fmtSize(d.free)} 可用 / ${fmtSize(d.total)}` : '容量未知'}
+                  </span>
+                </div>
+                <span className="drive-bar">
+                  <span
+                    className="drive-bar-fill"
+                    style={{ width: `${Math.round(ratio * 100)}%`, background: usageColor(ratio) }}
+                  />
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* 文件夹悬停预览卡片：与「此电脑」卡片同一套浮层几何与玻璃观感（复用 .drives-card），
+          水平锚在悬停图标中心并钳制在窗口内；内容超出可用高度时卡片内部滚动（可见滚动条） */}
+      {folderCard && (
+        <div
+          ref={folderCardRef}
+          className="drives-card folder-card"
+          style={{
+            left: folderCardLeft ?? folderCard.anchorX,
+            ...overlayAnchor,
+            // 与「+」菜单 / 右键菜单 / 分组面板互斥（同一条带，窗口只有 300px 高，叠不开）
+            visibility: menuPos || contextMenu || openGroup ? 'hidden' : 'visible'
+          }}
+          onMouseEnter={() => {
+            if (folderCardTimer.current) { clearTimeout(folderCardTimer.current); folderCardTimer.current = null }
+          }}
+          onMouseLeave={closeFolderCard}
+        >
+          <div className="folder-card-head">
+            <div className="folder-card-title">
+              <span className="folder-card-name">{folderCard.name}</span>
+              <span className="folder-card-path" title={folderCard.path}>{folderCard.path}</span>
+            </div>
+            <div
+              className="folder-card-open"
+              title="在资源管理器中打开"
+              onClick={() => {
+                closeFolderCard()
+                window.api.openPath(folderCard.path)
+              }}
+            >
+              打开
+            </div>
+          </div>
+          {!folderCard.data && <div className="drives-empty">读取中…</div>}
+          {folderCard.data?.error && (
+            <div className="drives-empty">
+              {folderCard.data.error === 'missing' ? '文件夹不存在（可能已删除或移动）'
+                : folderCard.data.error === 'denied' ? '无法读取（权限不足）'
+                  : '这不是一个文件夹'}
+            </div>
+          )}
+          {folderCard.data && !folderCard.data.error && (
+            <>
+              <div className="folder-card-sub">
+                {folderCard.data.folders} 个文件夹 · {folderCard.data.files} 个文件
+              </div>
+              {folderCard.data.items.length === 0 && <div className="drives-empty">空文件夹</div>}
+              {folderCard.data.items.map((it) => (
+                <div
+                  className={'folder-row' + (it.isDir ? ' dir' : '')}
+                  key={it.path}
+                  title={it.name}
+                  onClick={() => openFolderChild(it)}
+                >
+                  <span className="folder-row-icon">
+                    {it.iconDataUrl
+                      ? <img src={it.iconDataUrl} alt="" draggable={false} />
+                      : <span className="folder-row-glyph" />}
+                  </span>
+                  <span className="folder-row-name">{it.name}</span>
+                  <span className="folder-row-meta">
+                    {it.isDir ? '文件夹' : (fmtFileSize(it.size) || '文件')}
+                  </span>
+                </div>
+              ))}
+              {folderCard.data.truncated > 0 && (
+                <div className="folder-card-more">
+                  还有 {folderCard.data.truncated} 项未列出（打开文件夹查看）
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 拖入提示 / 拖放结果提示：脱离滚动容器定位在 Dock 外侧（不被裁剪） */}
       {(fileDragOver || dropHint) && (
         <div className={`drop-hint${fileDragOver ? ' active' : ''}`}>
           {fileDragOver ? '松开即添加' : dropHint}
         </div>
       )}
 
-      {/* 新增按钮下拉菜单：渲染在滚动容器之外（fixed 定位），避免被 overflow 裁剪。
+      {/* 新增按钮下拉菜单：渲染在滚动容器之外（脱离 overflow 裁剪）。
           锚点：水平居中对齐「添加」按钮，菜单底边在按钮上方 8px。 */}
       {menuPos && (
         <div
@@ -1438,12 +1976,10 @@ function App(): React.ReactElement {
             // 水平钳制在窗口内：菜单以按钮中心为锚点居中，若按钮靠近窗口右缘，
             // 菜单会伸出窗口被裁掉右角（圆角变直角）。钳到距边缘 100px 内保证完整。
             left: Math.min(Math.max(menuPos.cx, 100), window.innerWidth - 100),
-            // 底边用与右键菜单相同的锚点（Dock 毛玻璃条上方 8px）——若锚在「+」按钮顶部，
-            // 菜单底边正好贴在玻璃条顶边上，看起来完全没有间距
-            bottom: overlayBottomOffset,
-            transform: 'translateX(-50%)',
-            // 不超过 Dock 栏上方可用空间（与右键菜单一致），超出时内部滚动
-            maxHeight: menuAvail
+            // 贴边锚点与右键菜单一致（Dock 毛玻璃条外侧 8px）——若锚在「+」按钮内侧，
+            // 菜单边会正好贴在玻璃条边上，看起来完全没有间距
+            ...overlayAnchor,
+            transform: 'translateX(-50%)'
           }}
         >
           <button className="dropdown-item" onClick={handleAdd}>
@@ -1461,6 +1997,22 @@ function App(): React.ReactElement {
             {/* 开关指示器：开=绿色轨道+圆球在右，关=灰色轨道+圆球在左；纯展示，点击整个菜单项切换 */}
             <span className={`item-switch${autoStart ? ' on' : ''}`} />
           </button>
+          <div className="dropdown-divider" />
+          {/* 停靠位置分段选择器（中间 / 下 / 上）：切换由主进程原地应用
+              （横向三档尺寸相同 → setBounds + 布局事件，约 60ms、不重载页面）；
+              位置只由预设决定，点哪一档就归到那一档的标准位置 */}
+          <div className="theme-seg" role="group" aria-label="Dock 停靠位置">
+            {DOCK_EDGE_CHOICES.map(({ value, label }) => (
+              <button
+                key={value}
+                type="button"
+                className={'theme-seg-btn' + (edge === value ? ' active' : '')}
+                onClick={() => handleEdgePick(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="dropdown-divider" />
           {/* 主题分段选择器（纯 flex 分段控件，无绝对定位）：主行 透明|毛玻璃，
               毛玻璃激活时下方展开 黑夜|白天 子行；选择后菜单保持打开可连续预览 */}
@@ -1515,12 +2067,10 @@ function App(): React.ReactElement {
             ...(contextMenu.x + 4 + (editingId === contextMenu.appId ? 280 : 170) > window.innerWidth
               ? { right: Math.max(8, window.innerWidth - contextMenu.x - 8) }
               : { left: Math.max(4, contextMenu.x - 8) }),
-            // 向上弹出，底边贴在 Dock 毛玻璃栏上方 8px（锚在光标上的话，光标位于图标内部，
-            // 菜单底边会压进 Dock 栏里）
-            bottom: overlayBottomOffset,
-            // 高度上限按「未加高」的窗口算（右键菜单不做 resize，避免透明窗口白闪）；
-            // 菜单项多时内部滚动
-            maxHeight: menuAvail
+            // 朝 Dock 外侧弹出，贴边贴在玻璃栏外侧 8px（锚在光标上的话，光标位于图标内部，
+            // 菜单边会压进 Dock 栏里）；高度上限按「未加高」的窗口算（右键菜单不做 resize，
+            // 避免透明窗口白闪），菜单项多时内部滚动
+            ...overlayAnchor
           }}
         >
           {ctxApp?.isSeparator ? (
