@@ -12,8 +12,9 @@ files:
 extraResources:
   - from: resources/icon.ico
     to: icon.ico
-  - from: resources/tray-icon.png
-    to: tray-icon.png
+  # 托盘图标用多尺寸 ICO（16/20/24/32），由外壳按当前显示器缩放挑原生尺寸
+  - from: resources/tray-icon.ico
+    to: tray-icon.ico
 win:
   executableName: QuickLaunch
   icon: resources/icon.ico

@@ -42,10 +42,11 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏宽 ≤ 1200px）——水平方向**恒为主显示器工作区居中**，垂直方向由停靠位置预设决定
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
 - **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
-  1. `blur` 事件（点击其他窗口失去焦点）→ 立即 `setAlwaysOnTop(false)` + `sendToBottom()`（点击其他软件是有意让位）；**窗口已隐藏（`isVisible()` 为 false）时跳过**——`run-app` 隐藏到托盘触发的 blur 不再白跑一次 PowerShell 沉底
+  1. `blur` 事件（点击其他窗口失去焦点）→ **延迟 120ms 复核**再 `setAlwaysOnTop(false)` + `sendToBottom()`：这一拍是为了滤掉启动/重建窗口等场景的焦点抖动，期间若焦点已回到 Dock、窗口被隐藏或 `sinkSeq` 代际变了就整条取消（点击其他窗口后焦点不会在 120ms 内回来，正常让位不受影响）；**窗口已隐藏（`isVisible()` 为 false）或已收在托盘（`dockTrayHidden`）时直接跳过**——不为一次由隐藏引起的 blur 白跑一个 PowerShell 进程
   2. `run-app` 启动目标后**自动隐藏到托盘**（`mainWindow.hide()`，不退出进程）——用户点开图标后 Dock 彻底让出桌面；托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回（`toggleWindow` 按 `isVisible()` 判断，隐藏状态下任一唤回路径均显示并恢复置顶）
 - **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
-- **恢复置顶**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）→ `setAlwaysOnTop(true)` + `moveTop()`
+- **恢复置顶（v1.11.0 起统一走 `recoverDock()`）**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）、`toggleWindow` 显示分支、启动失败恢复、`second-instance` 都调它——置顶 + `moveTop` + 120ms 后再补一次，末尾接 `verifyDockOnTop()` 自愈巡检
+- **沉底与恢复的竞态防护（v1.11.0，改这块必须先读）**：沉底是**异步**的（新起 `powershell.exe` + `Add-Type` 编译 C#，实测滞后 200ms~1s），这段时间里任何「拉回」操作都会与它打架。防护分四层：① 单调递增的 `sinkSeq`——`toggleWindow` 的**显示与隐藏两条分支**、`dock-pointer`、`focus`、启动失败恢复、`second-instance` 全部 `++`，在途沉底在启动前与回调里各比对一次，代际不符即整条放弃；② 同一窗口的沉底任务**串行化**（已有任务在跑时 180ms 后重试，不再起第二个进程）；③ 迟到的 `SetWindowPos(HWND_BOTTOM)` 补偿**不能再用 `isAlwaysOnTop()` 判断**——恢复路径会把它设回 `true`，原写法恒真、形同虚设；④ `verifyDockOnTop()` 自愈巡检：`moveTop()` 只把窗口提到「同一组内的顶部」、并不重新断言置顶位（实测恢复后 `WS_EX_TOPMOST` 有约 300ms 为 `False`），所以「窗口可见 + 未收托盘 + `sinkSeq` 未变」却没拿到焦点时补一次置顶断言，最多 4 次
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
 - **停靠位置三档（中间 / 下 / 上）**：类型 `DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'`，但 `IMPLEMENTED_EDGES` 只放行 `bottom`/`top`/`middle`——左/右竖排窗口尺寸不同，需要重建窗口（`recreateWindowForEdge` 已留好），是下一阶段的事。坐标由 `presetPosition(edge)` 在主显示器工作区上算：`top` 贴工作区顶边、`bottom` 贴工作区底边、`middle` 垂直居中；三者都水平居中、窗口尺寸（85% 屏宽 ≤ 1200px × 300px）完全相同，所以切换是**原地 `setBounds` + `webContents.send('dock-edge-changed')`**（实测 ~62ms，不重建窗口、不重载页面、无白闪），只有尺寸真的变了才走 `recreateWindowForEdge`。持久化在 `{userData}/window-position.json`（只存 `{"edge":"..."}`，**文件名沿用旧版**；旧版写的 `{x,y,displayId}` 直接忽略；读入与写入都把未实现档位归一化回 `DEFAULT_EDGE` = `middle`，防止手改配置文件改出竖排尺寸的窗口）。`setDockEdge` 对同档位（±2px 内）提前返回时**仍然重发事件**——页面重载过的 renderer 拿的是启动时 argv 里的旧边，不重发它的布局会一直停在旧位置；renderer 挂载时另外用 `get-dock-edge` 主动同步一次。首次参数走 preload 读的 `--ql-edge=<edge>` argv 常量，首帧就是正确方向，不会先画底部再翻上去
 - **窗口不可自由拖动**：代码里没有任何 `-webkit-app-region: drag`（CSS 里只剩两处解释性注释），也没有 `move`/`moved` 监听或位置巡检。原因：透明窗口下 Dock 栏要么贴窗口上沿、要么贴下沿，窗口位置一动就得补偿布局，实测表现为**明显跳动**（做过「边缘区域判定 + 拖动过程中不切位置 + 松手平滑收尾」也压不住），于是位置**只由预设决定**。不要再引入拖拽/位置记忆
@@ -59,13 +60,13 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **分隔线**：`isSeparator` 特殊条目——1px 渐变柔线（比图标矮、两端淡出、随主题变色），只从图标右键「在此之前插入分隔线」创建；可拖拽排序、随 `shortcuts.json` 持久化；不启动、不参与桌面扫描去重/清理/键盘导航/悬停放大。命中区做成 9px（可视竖线仅 1px）+ `z-index: 20`：1px 太细时旁边放大中的图标（`magnify` 给图标设 `z-index: 10`）会压住它，右键点不中
 - **键盘导航**：`Alt+Space` 唤出 Dock 时主进程 `webContents.send('nav-enter')` → renderer 进入导航模式（`navId`）。`←/→` 不循环移动、`Enter` 启动、`Esc` 退出；分组上 `→`/`Enter` 展开面板并把选中移入第一个**非分隔线**成员、`←`/`Esc` 返回主 Dock；可导航到末尾的「+」按钮（`ADD_BTN_ID = -1` 哨兵，Enter 打开菜单）。选中位置写入 localStorage `ql-nav-last`，启动/唤出/方向键唤醒都恢复到它（条目失效则回落第一个）。选中态是左右两条渐变竖框（`.dock-item.selected` / `.drop-target` 共用），并靠 `.dock-item { scroll-margin-inline: 44px }` 保留滚动余量——否则 `scrollIntoView({ inline: 'nearest' })` 会把容器内边距一起滚掉，最左图标的左框被裁。**菜单打开时必须清掉 `navId`**（`handleContextMenu` / `handleAddToggle` 都 `setNavId(null)`）并把 `Enter` 让给菜单——否则选中框不可见却仍是活的，按 Enter 会启动看不见的条目
 
-### 系统托盘 + 快捷键
+### 系统托盘 + 快捷键（v1.11.0 起托盘图标为多尺寸 ICO）
 
 - **Alt+Space** 全局快捷键：隐藏/不可见时按 → 唤回置顶；可见（置顶或沉底）时按 → 隐藏到托盘。`toggleWindow()` 用**自维护意图状态 `dockTrayHidden`**（非 `isAlwaysOnTop()`——桌面无其他窗口时前台锁会拒绝激活，Dock 获得焦点约 500ms 后被抢回产生虚假 `blur` 沉底，读置顶位会陷入「显示→被压底→再显示」死循环，v1.7.1 修复）。`dockTrayHidden` 在所有显示/隐藏路径同步维护（run-app 隐藏、close 到托盘、`--autostart` 启动、second-instance、托盘「显示窗口」、dock-pointer、focus）。优先注册 Alt+Space，失败自动回退 `Ctrl+Alt+Space`；Ctrl+Alt 在 Windows 上等同 AltGr，易被输入法/键盘布局占用。**键盘唤出**（`toggleWindow(true)`，仅全局快捷键路径；托盘点击不传该参数）时额外 `webContents.send('nav-enter')`，renderer 据此进入键盘导航模式
 - 关闭窗口 → 隐藏到系统托盘（不退出）
 - 托盘左键单击 → `toggleWindow()`（同上逻辑）
 - 托盘右键菜单 →「显示窗口」/「退出」
-- 托盘图标：[`resources/tray-icon.png`](resources/tray-icon.png)（16×16）
+- 托盘图标：[`resources/tray-icon.ico`](resources/tray-icon.ico)（16/20/24/32 多尺寸）。**必须用多尺寸 ICO，不能用单尺寸 PNG**：显示器缩放 125% 时托盘需要 20 物理像素、150% 需要 24、200% 需要 32，单尺寸 PNG 会被系统拉伸成模糊（v1.11.0 之前是 16×16 PNG，在 125% 下必然发虚）。图形为「蓝色圆角块 + 白色加号」——16px 下唯一还看得清的符号；原始 2×3 图标布局缩到 16px 时每块只剩约 4px，会糊成一片蓝斑
 - 应用图标：[`resources/icon.ico`](resources/icon.ico)
 
 ### 开机自启动
@@ -123,7 +124,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **开机自启动开关**：菜单打开时 `getAutoStart()` 读取注册表状态决定开关开/关（`.item-switch`），点击 `setAutoStart()` 乐观更新（先切开关，IPC 返回后校正，**不关闭菜单**）；写注册表 `HKCU\...\Run` 登录项
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
-- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。**菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步全透明**（背景/毛玻璃/边框置空，保留悬浮投影），文字固定近黑 `#1f2430` + 白色光晕投影（曾试过 desktopCapturer 采样壁纸亮度自适应黑/白字，已按需求移除——透明就是透明），加号白 0.92 + 双层深投影，编辑输入框浅白底 + 深字
+- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。**菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步全透明**（背景/毛玻璃/边框置空，保留悬浮投影），文字固定近黑 `#1f2430` + **白色描边**（详见下方「透明风格文字可读性」），编辑输入框浅白底 + 深字
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**（`data-edge='top'` 时整套浮层改由 `overlayTop()` 锚在玻璃条**下沿外侧**8px，向下弹出、`maxHeight` 按窗口剩余高度算），底边固定在实测的 Dock 毛玻璃条外侧 8px（`overlayBottom()` / `overlayTop()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
@@ -132,6 +133,22 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **分组（Stack）**：`isGroup` 条目点击展开面板而不启动；成员用 `groupId` 归属（**扁平模型，不嵌套**——桌面扫描/缺失清理/持久化全部沿用原逻辑）。右键图标「新建分组」创建空组并横向滚动到末尾；分组图标默认渲染**组内前 4 个非分隔线成员的缩略拼图**（0 个成员回退 2×2 网格图标、1 个放大单图、用户换过图标则用自定义图标），右下角 `.dock-badge` 显示成员数（徽标贴图标框内侧：负偏移会被滚动容器裁掉下沿）。拖到分组图标上即归组（插到该组现有成员之后），从面板拖到 Dock 条内即移出，删除分组=解散（成员回顶层、保留相对位置）；编辑表单对分组只留名称 + 图标
 - **分组面板（迷你 Dock）**：与主 Dock 同构——顶部透明放大区 + 玻璃条，条目**直接复用 `.dock-item` 系列样式**、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听；宽度 `max-content`（有几个图标就多宽，超出窗口宽度才滚动），**高度固定**，因此完全不改变窗口尺寸（这也是透明窗口 resize 白闪的根治手段）。菜单打开期间面板用 `visibility: hidden` 隐藏——两者同处 Dock 栏上方一条带，而窗口只有 300px 高，无法叠放
 - **数组不变量**：分组成员在扁平数组里**紧跟其分组条目之后**（归组时插到该组现有成员末尾）。桌面扫描合并的 `rest` 保持相对顺序，所以成员区不会被扫描打散；任何顶层插入/重排都必须经 `topAnchorId` 换算，否则会插进成员区块中间
+
+### 透明风格文字可读性（v1.11.0）
+
+透明模式下文字直接压在壁纸上，必须有一圈与底色反差的外轮廓才读得清。**三种写法都实测过**（定义在 `App.css` 的「透明风格的文字可读性」段）：
+
+| 写法 | 结论 |
+|---|---|
+| 单个方向的柔和白晕（`0 0 6px rgba(255,255,255,.3)`） | **不可行**——既不够亮以形成轮廓，颜色也和壁纸混在一起，中灰/复杂壁纸上文字直接融进背景 |
+| 四向硬晕 + 柔晕（`text-shadow` 四个方向 1px + 一圈 blur） | 能看清，但那是**一圈模糊光晕**，文字边缘发毛、观感发糊（已按用户要求废弃） |
+| **白色描边（现行）** | `-webkit-text-stroke: 0.65px rgba(255,255,255,.92)` + `paint-order: stroke fill`——在字形背后画一圈实心描边，**完全没有模糊**，边缘锐利，缩到 11px 也清楚 |
+
+- **`paint-order: stroke fill` 是关键**：默认描边压在填充之上会把字吃细（发白/发糊）；改成先描边后填充，描边完整垫在字形底下
+- **粗细有实测的平衡点：0.65px**。描边是骑在字形轮廓上画的，**越粗笔画越细**——0.5px 以下笔画开始缺，0.8px 以上字形被吃掉一圈显虚发粗（1.1px 明显过粗，用户反馈的第一版）
+- 小字号（卡片副行、文件大小、面板空态）收细到 `0.5px`——同样 0.65px 压在 11px 的字上会显粗
+- **透明模式下必须 `text-shadow: none`**：基础 `.dock-label` 自带深色投影（那是给毛玻璃主题用的，压在壁纸上只会脏），`.dock-item:hover .dock-label` 悬停还会再叠一层（不压掉的话悬停反而更糊）
+- **新增透明模式下的文字元素时要挂上描边并清掉 text-shadow**（卡片这一组曾完全漏掉，是「字融进背景」最严重的地方）；壁纸亮度自适应方案已废弃——透明就是透明，靠描边保证可读性
 
 ### 特殊项目（此电脑 / 回收站）
 
@@ -181,7 +198,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 
 [`electron-builder.yml`](electron-builder.yml) 定义构建产物：
 - appId: `com.quicklaunch.app`
-- 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.png` → `tray-icon.png`
+- 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.ico` → `tray-icon.ico`
 - Windows：`executableName: QuickLaunch`，图标 `resources/icon.ico`
 - 排除源码和配置文件，仅打包编译输出
 - `electronDist: ./electron-v*.zip`：用项目根目录**手动下载**的 Electron 分发包打包，跳过网络下载（日志出现 `using custom electronDist zip file` 即为生效）。zip 已被 `.gitignore` 的 `electron-v*.zip` 规则忽略；需与 `package.json` 的 Electron 版本一致，换机器打包前删掉该行或用 `ELECTRON_MIRROR` 环境变量
@@ -232,6 +249,6 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.10.0`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.10.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.11.0`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.11.0），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

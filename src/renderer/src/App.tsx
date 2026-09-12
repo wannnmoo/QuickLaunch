@@ -1832,7 +1832,17 @@ function App(): React.ReactElement {
             ))}
             {openGroupMembers.length === 0 && (
               <div className="group-panel-empty">
-                空分组 —— 把 Dock 上的图标拖到分组图标上即可加入
+                {/* 线性图标与整体风格（细描边、圆头）一致；直接内联，不引图标库 */}
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="3" width="7.5" height="7.5" rx="2" />
+                  <rect x="13.5" y="3" width="7.5" height="7.5" rx="2" />
+                  <rect x="3" y="13.5" width="7.5" height="7.5" rx="2" />
+                  <line x1="14" y1="17.2" x2="21" y2="17.2" />
+                  <line x1="17.5" y1="13.7" x2="17.5" y2="20.7" />
+                </svg>
+                <span className="es-main">空分组</span>
+                <span className="es-sub">把图标拖到分组图标上即可加入</span>
               </div>
             )}
           </div>
@@ -1860,7 +1870,18 @@ function App(): React.ReactElement {
           <div className="drives-card-title">
             此电脑 · 驱动器{driveSummary ? `（可用 ${fmtSize(driveSummary.free)}）` : ''}
           </div>
-          {drives.length === 0 && <div className="drives-empty">未检测到驱动器</div>}
+          {drives.length === 0 && (
+            <div className="drives-empty">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3.5" width="18" height="8" rx="2" />
+                <rect x="3" y="12.5" width="18" height="8" rx="2" />
+                <line x1="7" y1="7.5" x2="7.01" y2="7.5" />
+                <line x1="7" y1="16.5" x2="7.01" y2="16.5" />
+              </svg>
+              <span className="es-main">未检测到驱动器</span>
+            </div>
+          )}
           {drives.map((d) => {
             const ratio = usedRatio(d)
             return (
@@ -1917,12 +1938,34 @@ function App(): React.ReactElement {
               打开
             </div>
           </div>
-          {!folderCard.data && <div className="drives-empty">读取中…</div>}
+          {!folderCard.data && (
+            <>
+              <div className="folder-loading">
+                <svg className="spinner" width="13" height="13" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+                  <path d="M12 3a9 9 0 1 0 9 9" />
+                </svg>
+                读取中…
+              </div>
+              {/* 骨架行：和 .folder-row 同高（26px），真列表填入时不会跳动 */}
+              <div className="folder-loading"><span className="skeleton" style={{ width: '58%' }} /></div>
+              <div className="folder-loading"><span className="skeleton" style={{ width: '74%' }} /></div>
+              <div className="folder-loading"><span className="skeleton" style={{ width: '46%' }} /></div>
+            </>
+          )}
           {folderCard.data?.error && (
             <div className="drives-empty">
-              {folderCard.data.error === 'missing' ? '文件夹不存在（可能已删除或移动）'
-                : folderCard.data.error === 'denied' ? '无法读取（权限不足）'
-                  : '这不是一个文件夹'}
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <line x1="12" y1="7.5" x2="12" y2="13" />
+                <line x1="12" y1="16.5" x2="12.01" y2="16.5" />
+              </svg>
+              <span className="es-main">
+                {folderCard.data.error === 'missing' ? '文件夹不存在（可能已删除或移动）'
+                  : folderCard.data.error === 'denied' ? '无法读取（权限不足）'
+                    : '这不是一个文件夹'}
+              </span>
             </div>
           )}
           {folderCard.data && !folderCard.data.error && (
@@ -1930,7 +1973,15 @@ function App(): React.ReactElement {
               <div className="folder-card-sub">
                 {folderCard.data.folders} 个文件夹 · {folderCard.data.files} 个文件
               </div>
-              {folderCard.data.items.length === 0 && <div className="drives-empty">空文件夹</div>}
+              {folderCard.data.items.length === 0 && (
+                <div className="drives-empty">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 7.5a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                  </svg>
+                  <span className="es-main">空文件夹</span>
+                </div>
+              )}
               {folderCard.data.items.map((it) => (
                 <div
                   className={'folder-row' + (it.isDir ? ' dir' : '')}

@@ -21,8 +21,8 @@ if (!gotSingleInstanceLock) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show()
       dockTrayHidden = false
-      mainWindow.setAlwaysOnTop(true)
-      mainWindow.moveTop()
+      sinkSeq++
+      recoverDock(mainWindow)
       mainWindow.focus()
     }
   })
@@ -35,6 +35,56 @@ if (!gotSingleInstanceLock) {
 // 「显示→被压底→再次显示→再次被压底」的死循环，Alt+Space 永远无法隐藏（v1.7.1 修复）。
 let dockTrayHidden = false
 
+// ─── 沉底/恢复的意图代数（v1.11.0 竞态修复）─────────────────────────────
+// 沉底不是同步的：blur 里先 setAlwaysOnTop(false)，再由 PowerShell（首次 Add-Type
+// 要编译 C#，实测 200ms~1s）异步调 SetWindowPos(HWND_BOTTOM)。这段时间里任何
+// 「把 Dock 拉回来」的操作（Alt+Space / 托盘 / 鼠标移回 / 启动失败恢复）都可能发生。
+// 原实现只在 PS 回调里补一次 `isAlwaysOnTop()` 判断，但那只能挡住「已恢复置顶」这一种
+// 情况——**挡不住 toggleWindow 的隐藏分支**：窗口被 hide() 后 PS 回调可能把 HWND_BOTTOM
+// 钉在一个隐藏窗口上，之后再 show() 就埋在别的窗口底下（可见却不在前台的「卡住」状态，
+// 只能靠最小化/回桌面才恢复）。改为单调递增的代数：任何「拉回/隐藏」都 ++，
+// 沉底任务在启动前与回调里各比对一次，并对同一目标串行化。
+let sinkSeq = 0
+/** 目标窗口当前是否有沉底任务在跑（用于串行化，避免一次 blur 起一个 powershell.exe） */
+let sinkState: { win: BrowserWindow; seq: number } | null = null
+
+/** 把 Dock 拉回前台。统一入口：置顶 + moveTop，并在 120ms 后再补一次——
+ *  Windows 的前台激活锁可能拒绝首次激活（尤其刚从 explorer.exe 交接时），
+ *  一次性 moveTop 会被 Explorer 的窗口重排盖掉。 */
+function recoverDock(win: BrowserWindow): void {
+  win.setAlwaysOnTop(true)
+  win.moveTop()
+  setTimeout(() => {
+    if (!win.isDestroyed() && win.isVisible()) win.moveTop()
+  }, 120)
+  // 兜底自愈：上面两步都是异步生效的（setAlwaysOnTop 走的是消息队列，moveTop 只把窗口
+  // 提到「同一组内的顶部」，并不重新断言置顶位），而沉底那侧是一个滞后几百毫秒的
+  // PowerShell。任何一次顺序错位都会留下「窗口可见、但不置顶、沉在别的窗口下面」的
+  // 粘滞状态——用户看到的就是「快捷键怎么按都不出来，只有回桌面才恢复」。
+  // 这里主动核实一次，详见 verifyDockOnTop。
+  verifyDockOnTop(win, sinkSeq, 0)
+}
+
+/** 自愈巡检：窗口「可见、且没有收在托盘里」就应该置顶并持有焦点。
+ *  判定用两个信号，缺一不可：
+ *   ① dockTrayHidden —— 用户主动收起（Alt+Space / 关窗），不该拉回来；
+ *   ② sinkSeq 未变 —— 期间没有发生新的「让位」意图。用户点了别的软件会触发 blur →
+ *      sinkSeq++，此时绝不能把窗口拽回来（那就成了和用户对着干）。
+ *  两者都满足却仍没拿到焦点，说明是竞态留下的错位状态：补一次置顶断言并复查，
+ *  最多 4 次后放弃（永不无限重试）。 */
+function verifyDockOnTop(win: BrowserWindow, startSeq: number, attempt: number): void {
+  if (attempt > 4) return
+  setTimeout(() => {
+    if (win.isDestroyed() || win !== mainWindow) return
+    if (dockTrayHidden || !win.isVisible()) return
+    if (sinkSeq !== startSeq) return // 期间有更新的让位/唤回意图，交给那条路径
+    if (win.isFocused() && win.isAlwaysOnTop()) return // 已经正常，收工
+    win.setAlwaysOnTop(true)
+    win.moveTop()
+    verifyDockOnTop(win, startSeq, attempt + 1)
+  }, 250)
+}
+
 /**
  * 显示/隐藏 Dock。fromKeyboard=true（Alt+Space）时，显示后额外通知 renderer 进入
  * 键盘导航模式（恢复到上次选中的位置，没有记忆则第一个图标）；托盘点击等鼠标路径不进入导航。
@@ -44,9 +94,9 @@ function toggleWindow(fromKeyboard = false): void {
   if (dockTrayHidden || !mainWindow.isVisible()) {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
     dockTrayHidden = false
+    sinkSeq++ // 声明意图：立刻作废在途的沉底（否则它迟到执行会把这扇刚显示的窗钉到底部）
     mainWindow.show()
-    mainWindow.setAlwaysOnTop(true)
-    mainWindow.moveTop()
+    recoverDock(mainWindow)
     mainWindow.focus()
     if (fromKeyboard && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('nav-enter')
@@ -54,6 +104,7 @@ function toggleWindow(fromKeyboard = false): void {
   } else {
     // 可见（置顶或被沉底）→ 隐藏到托盘
     dockTrayHidden = true
+    sinkSeq++ // 隐藏同样作废在途沉底：不能让它去操作一扇已隐藏的窗口
     mainWindow.hide()
   }
 }
@@ -825,9 +876,9 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     // 或没有关联程序，用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回
     if (mainWindow && !mainWindow.isDestroyed()) {
       dockTrayHidden = false
+      sinkSeq++ // 作废在途沉底：Dock 被还给用户后不能再被压到底部
       mainWindow.show()
-      mainWindow.setAlwaysOnTop(true)
-      mainWindow.moveTop()
+      recoverDock(mainWindow)
     }
     // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
     // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
@@ -1314,14 +1365,27 @@ function resolveResource(filename: string): string {
 ipcMain.on('dock-pointer', (_e, inside: boolean) => {
   if (!mainWindow || mainWindow.isDestroyed() || !inside) return
   dockTrayHidden = false
-  mainWindow.setAlwaysOnTop(true)
-  mainWindow.moveTop()
+  sinkSeq++ // 作废在途沉底：鼠标已经回到 Dock 上，不该再被压到底部
+  recoverDock(mainWindow)
   mainWindow.focus()
 })
 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
 // 只能通过 SetWindowPos 调 Windows API 实现真正沉底。
+//
+// 注意这条路径的**时间尺度**：每次都要起一个新的 powershell.exe，加上
+// `-TypeDefinition` 触发的一次性 C# 编译（首次约 200ms~1s），真正落地的
+// SetWindowPos 往往在 blur 之后近一秒才执行。这就是下面整套代数校验存在的原因。
 function sendToBottom(win: BrowserWindow): void {
+  if (win.isDestroyed()) return
+  const startSeq = sinkSeq
+  // 同一扇窗口已有沉底任务在跑：不重复起进程。延迟重试（180ms）而不是直接放弃——
+  // 谁后到谁说了算，最后一次 blur 的意图必须被满足
+  if (sinkState && sinkState.win === win) {
+    setTimeout(() => { if (sinkState?.win === win) sendToBottom(win) }, 180)
+    return
+  }
+
   const buf = win.getNativeWindowHandle()
   const hwnd = buf.length >= 8
     ? `0x${buf.readBigUInt64LE(0).toString(16)}`
@@ -1338,16 +1402,25 @@ public static class WinZ {
 '@
 # HWND_BOTTOM=1, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
 [WinZ]::SetWindowPos([IntPtr]::new(${hwnd}), [IntPtr]::new(1), 0, 0, 0, 0, 0x0002 -bor 0x0001 -bor 0x0010) | Out-Null`
-  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err) => {
+
+  sinkState = { win, seq: startSeq }
+
+  /** 这次沉底是否还应当生效：期间没有更晚的「拉回/隐藏」意图，窗口也还在原位 */
+  const stillWanted = (): boolean =>
+    sinkState?.win === win && sinkSeq === startSeq &&
+    !win.isDestroyed() && win.isVisible() && !win.isFocused() && !dockTrayHidden
+
+  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 4000 }, (err) => {
+    if (sinkState?.win === win) sinkState = null
     if (err) {
       console.error('[dock] sendToBottom failed:', err.message)
       return
     }
-    // PS 异步执行 HWND_BOTTOM 有延迟：若期间用户已通过 dock-pointer/focus 恢复置顶，
-    // 迟到的 SetWindowPos(HWND_BOTTOM) 会把 Dock 压底，这里检测到置顶态则 moveTop() 拉回抵消
-    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isAlwaysOnTop()) {
-      mainWindow.moveTop()
-    }
+    // 迟到的 HWND_BOTTOM 补偿：PS 执行期间用户可能已经把 Dock 拉回来了
+    // （Alt+Space 唤回 / 托盘 / 鼠标移回 / 启动失败恢复）。这里不能再用
+    // isAlwaysOnTop() 判断——恢复路径会把它设回 true，原写法恒真、形同虚设。
+    if (stillWanted()) return
+    if (!win.isDestroyed() && win.isVisible()) recoverDock(win)
   })
 }
 
@@ -1395,8 +1468,12 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     // 是否显示只看 startHidden（调用方给出的「原本显示 / 原本收在托盘里」）。
     // 曾经这里还判断 startedAtLogin，那是整进程常量：开机自启会话里永远为真，
     // 于是切位置重建出来的窗口一律不显示——Dock 会直接消失进托盘。
-    if (!startHidden) mainWindow?.show()
-    else dockTrayHidden = true
+    if (!startHidden) {
+      mainWindow?.show()
+      // 首次显示后核实一次 z-order：启动瞬间终端/资源管理器正在抢前台，
+      // 只依赖 show() + focus() 有概率停在「可见但不在最前」（v1.11.0 自愈）
+      if (mainWindow && !mainWindow.isDestroyed()) verifyDockOnTop(mainWindow, sinkSeq, 0)
+    } else dockTrayHidden = true
   })
 
   // Hide to tray instead of closing
@@ -1419,18 +1496,29 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     if (dialogOpen) return
     // 窗口已隐藏（如 run-app 启动后自动隐藏到托盘，hide() 会触发 blur）：不可见窗口无需沉底
     if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return
-    mainWindow.setAlwaysOnTop(false)
-    sendToBottom(mainWindow)
+    // 已经收在托盘里：不需要为一次由隐藏引起的 blur 再起一个 PowerShell 进程
+    if (dockTrayHidden) return
+    const startSeq = sinkSeq
+    // blur 与「用户真的点了别的软件」之间存在噪声：首次启动、run-app 隐藏、切换停靠位置
+    // 重建窗口等都会伴随一次焦点抖动。延迟一拍再确认——期间若焦点已回到 Dock
+    // （或用户按了 Alt+Space 唤回、窗口被隐藏），就整条取消。
+    // 这一拍也是要给「真的点了别的软件」留出判定窗口：用户点击别的窗口后
+    // 焦点不会在 120ms 内回到 Dock，所以正常让位行为不受影响。
+    setTimeout(() => {
+      if (sinkSeq !== startSeq) return
+      if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return
+      if (dockTrayHidden || mainWindow.isFocused()) return
+      mainWindow.setAlwaysOnTop(false)
+      sendToBottom(mainWindow)
+    }, 120)
   })
 
   // 获得焦点（点击 Dock / Alt+Space / 托盘唤出）时恢复置顶。
   // run-app 启动后窗口隐藏到托盘，唤回时由这里恢复置顶并拉回顶层。
   mainWindow.on('focus', () => {
     dockTrayHidden = false
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setAlwaysOnTop(true)
-      mainWindow.moveTop()
-    }
+    sinkSeq++ // 拿到焦点就是最明确的「我要它在上面」信号，作废在途沉底
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) recoverDock(mainWindow)
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -1459,7 +1547,10 @@ app.whenReady().then(() => {
   startDesktopWatch()
 
   // System tray
-  const trayIcon = nativeImage.createFromPath(resolveResource('tray-icon.png'))
+  // 用多尺寸 ICO 而不是 16×16 的 PNG：显示器缩放 125% 时托盘需要 20 物理像素、
+  // 150% 需要 24、200% 需要 32，单尺寸 PNG 会被系统拉伸成模糊（实测原 16px 图标
+  // 在 125% 下必然发虚）。ICO 里 16/20/24/32 都是原生绘制，由外壳按当前 DPI 挑。
+  const trayIcon = nativeImage.createFromPath(resolveResource('tray-icon.ico'))
   tray = new Tray(trayIcon)
   tray.setToolTip('快捷方式面板')
   tray.on('click', () => toggleWindow())

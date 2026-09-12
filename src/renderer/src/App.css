@@ -36,17 +36,43 @@ html, body {
   background: transparent;
 
   /* 黑夜（默认） */
-  --dock-bg-top: rgba(44, 50, 70, 0.68);
-  --dock-bg-bottom: rgba(27, 32, 46, 0.6);
+  /* 第 9 条色温微调：原来 rgba(44,50,70,.68) 偏蓝灰、略显「洗过」，
+     改成更靛一点的冷色（色相往蓝紫偏、底部稍深），玻璃更通透。
+     想回原色调：--dock-bg-top: rgba(44,50,70,.68); --dock-bg-bottom: rgba(27,32,46,.6);
+     想试中性档：--dock-bg-top: rgba(46,52,66,.62); --dock-bg-bottom: rgba(28,33,45,.55); */
+  --dock-bg-top: rgba(38, 44, 64, 0.7);
+  --dock-bg-bottom: rgba(23, 28, 42, 0.62);
   --dock-border: rgba(255, 255, 255, 0.12);
+  /* 描边上下分段：玻璃的受光面亮、背光面暗，1px 单色描边会显得像贴纸边缘。
+     顶部用较亮的白勾出「上棱」，底部用近黑收边（配合下方 inset 的深色暗线） */
+  --dock-border-top: rgba(255, 255, 255, 0.22);
+  --dock-border-bottom: rgba(0, 0, 0, 0.3);
+  /* 第 8 条：渐变描边。top/bottom-color 只能给两档平色，
+     渐变能一路过渡，1px 也能看出「上亮下暗」的连续性。
+     拆成首尾两个色标（而不是整条 gradient）：.dock-bg 的 background
+     简写里只接受 <image>，把 color 单列出来便于按主题直接改首尾 */
+  --dock-border-grad-a: rgba(255, 255, 255, 0.5);
+  --dock-border-grad-b: rgba(255, 255, 255, 0.12);
   --sep-color: rgba(255, 255, 255, 0.34); /* 分隔线竖线中段色（黑夜） */
   --dock-border-hover: rgba(255, 255, 255, 0.2);
+  /* inset 高光/暗线单独提成变量：白天主题的明暗方向相同、但强度要弱得多，
+     写死在这里就无法按主题调（透明主题则整层不渲染） */
+  --dock-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  --dock-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.3);
+  /* 第 6 条：底部反射光——模拟桌面把光反打到玻璃下沿（冷色调，只属于黑夜） */
+  --dock-rim-glow: inset 0 -14px 24px -18px rgba(120, 170, 255, 0.25);
   --dock-shadow:
     0 12px 32px rgba(0, 0, 0, 0.45),
     0 2px 8px rgba(0, 0, 0, 0.3),
-    inset 0 1px 0 rgba(255, 255, 255, 0.1),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+    var(--dock-rim-light),
+    var(--dock-rim-dark),
+    var(--dock-rim-glow);
   --dock-edge: rgba(18, 22, 34, 0.75);
+  /* 第 10 条：浮层（菜单/右键菜单/分组面板/卡片）共用一档毛玻璃饱和度。
+     Dock 是 1.7（主视觉，壁纸透亮感值得），浮层压到 1.4——
+     浮层里有文字，饱和度太高会让彩色壁纸透过时压住可读性。
+     抽成变量便于后续按主题调，也统一了原来「菜单/面板/卡片各写各的 blur」的现状 */
+  --glass-sat: 1.4;
   --label-color: rgba(255, 255, 255, 0.62);
   --label-color-hover: #fff;
   --label-pill-bg: rgba(12, 16, 28, 0.55); /* 黑夜：深藏青药丸衬底（悬停显示标签） */
@@ -54,6 +80,10 @@ html, body {
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
   --add-btn-color: rgba(255, 255, 255, 0.25);
   --add-btn-hover-color: rgba(255, 255, 255, 0.7);
+  /* 「+」按钮底衬（黑夜：几乎透明，只做一点点存在感） */
+  --add-btn-bg: rgba(255, 255, 255, 0.03);
+  --add-btn-hover-bg: rgba(255, 255, 255, 0.12);
+  --add-btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度），
      仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层 */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
@@ -76,17 +106,34 @@ html, body {
 }
 
 .app.theme-light {
-  /* 白天 */
-  --dock-bg-top: rgba(255, 255, 255, 0.75);
-  --dock-bg-bottom: rgba(240, 242, 248, 0.65);
-  --dock-border: rgba(0, 0, 0, 0.12);
+  /* 白天：不要在纯白上做玻璃——半透明白压在浅色壁纸上会「飘」且轮廓发虚。
+     提高不透明度（.88/.78 → 实际取 .92/.74：同时拉开上下落差，玻璃才有体积感），
+     描边相应减弱（.12 → .10），避免白玻璃出现脏边。 */
+  --dock-bg-top: rgba(252, 252, 254, 0.92);
+  --dock-bg-bottom: rgba(238, 241, 248, 0.74);
+  --dock-border: rgba(0, 0, 0, 0.1);
+  /* 白天同样分段描边，但明暗强度都要弱：上棱用近白（浅底上仍是「受光」），
+     下缘只给极淡的黑，否则白玻璃底部会脏 */
+  --dock-border-top: rgba(255, 255, 255, 0.95);
+  --dock-border-bottom: rgba(0, 0, 0, 0.08);
+  /* 白天渐变描边：上棱近白、下缘淡黑。梯度比黑夜更陡，
+     让 1px 的上下差异在白玻璃上也能立住 */
+  --dock-border-grad-a: rgba(255, 255, 255, 0.95);
+  --dock-border-grad-b: rgba(0, 0, 0, 0.1);
   --sep-color: rgba(0, 0, 0, 0.26); /* 分隔线竖线中段色（白天） */
   --dock-border-hover: rgba(0, 0, 0, 0.22);
+  /* 白天的高光/暗线：顶部本来就亮，用 0.9 的白做上棱；底部只留极轻的一条 */
+  --dock-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --dock-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+  /* 第 6 条的冷色反射光只属于黑夜玻璃，白天显脏，显式关掉 */
+  --dock-rim-glow: inset 0 0 0 rgba(0, 0, 0, 0);
+  /* 白天浮层饱和度：白玻璃下再拉高饱和会让彩色壁纸透出时发灰发脏，压到 1.25 */
+  --glass-sat: 1.25;
   --dock-shadow:
     0 12px 32px rgba(0, 0, 0, 0.16),
     0 2px 8px rgba(0, 0, 0, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+    var(--dock-rim-light),
+    var(--dock-rim-dark);
   /* 右侧渐隐的实色端：取玻璃条自身的底色（--dock-bg-bottom 系）而不是近白实色，
      否则这块遮罩比玻璃条更亮更实，会把右端描边盖掉、看着像 Dock 到这里就结束了 */
   --dock-edge: rgba(240, 242, 248, 0.8);
@@ -97,6 +144,14 @@ html, body {
   --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.04) 100%);
   --add-btn-color: rgba(0, 0, 0, 0.4);
   --add-btn-hover-color: rgba(0, 0, 0, 0.75);
+  /* 「+」按钮底衬：白天要「悬停变深」才符合直觉（原来复用黑夜的白色底衬 = 变亮） */
+  --add-btn-bg: rgba(0, 0, 0, 0.03);
+  --add-btn-hover-bg: rgba(0, 0, 0, 0.08);
+  --add-btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  /* 图标瓷砖：白天主题此前**没有**定义这一对变量，一直在用黑夜的 9% 白，
+     叠在白玻璃上就是一个发灰的方块。改成淡灰（悬停加深），与白玻璃契合 */
+  --icon-wrap-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.055) 0%, rgba(0, 0, 0, 0.02) 100%);
+  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.13) 0%, rgba(0, 0, 0, 0.06) 100%);
   /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(0, 0, 0, 0.12);
@@ -138,13 +193,81 @@ html, body {
   top: 70px; /* 图标顶上方留 8px（与 .dock-inner 的 70px 透明区一致） */
   bottom: 0; /* 图标底下方留 8px（图标底 139，dock 底 146） */
   z-index: 0;
-  background: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
+  /* 三层背景，自下而上（多重背景的第一层画在最上面）：
+     ① 描边层（第 8 条渐变描边）：四边 1px 的线性渐变，clip 到 border-box；
+     ② 玻璃厚度径向高光（第 2 条）：受光面在玻璃上沿，给 1px 平面加出体积；
+     ③ 整体色调垂直渐变（原有的 --dock-bg-top/bottom）。
+     ②③ 都 clip 到 padding-box，这样 ① 的描边不会被色调层盖住——
+     这也是不把渐变描边交给 border-image 的原因（border-image 会接管圆角、
+     且 slice 切片方向对上下边不可控）。 */
+  background:
+    linear-gradient(180deg, var(--dock-border-grad-a) 0%, var(--dock-border-grad-b) 100%) border-box,
+    radial-gradient(120% 180% at 50% -40%, rgba(255, 255, 255, 0.14), transparent 60%) padding-box,
+    linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%) padding-box;
   backdrop-filter: blur(36px) saturate(1.7);
   -webkit-backdrop-filter: blur(36px) saturate(1.7);
-  border: 1px solid var(--dock-border);
+  /* 描边颜色交给上面的渐变层渲染，透明边框只用来占位（1px 的绘制区域）。
+     悬停时 .dock:hover .dock-bg 仍可整体换掉 border-color，但被渐变层盖住——
+     平色留给 .dock-bg 的 border-color 兜底与将来取消渐变时复用 */
+  border-color: transparent;
   border-radius: 24px;
   box-shadow: var(--dock-shadow);
   transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+/* 第 5 条细噪点纹理 + 第 9 条缓移光带，合成同一层（伪元素只有 ::before/::after 两个，
+   而 .dock-bg 上已经要放噪声与光带两种装饰）：
+   background-image 里噪声在前、光带在后，background-position/size/repeat 三组值一一对应。
+   噪声是静态贴满的底，光带是一条 120px 宽的窄带，靠 transform 平移扫过。 */
+.dock-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit; /* 跟随玻璃条 24px 圆角，噪声与光带都被裁进轮廓内 */
+  pointer-events: none;
+  background-image:
+    /* ① 细噪点（第 5 条）：半透明大圆角 + 背景模糊在浅色壁纸上会出现色带（banding），
+       采样噪声压住台阶，观感从「塑料」变「磨砂玻璃」。内联 SVG data-URI
+       （feTurbulence）只生成一次、无额外请求，也不引入任何 JS */
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E"),
+    /* ② 缓移光带（第 9 条）：一条竖向的柔光窄带，斜切 18° 后横向扫过 */
+    linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.5) 50%, transparent 100%);
+  background-size: 140px 140px, 120px 100%;
+  background-position: 0 0, -220px 0;
+  background-repeat: repeat, no-repeat;
+  /* 透明度作用在整层（噪声与光带）上：噪声只需极淡，光带再乘一次自己的 alpha。
+     要单独调噪声浓度就改这个值，要单独调光带亮度就改上面渐变的 0.5 */
+  opacity: 0.028;
+  /* 光带默认静止（停在 ::after 的 background-position 起始处＝左侧屏外）：
+     常态下玻璃是「静态磨砂」，鼠标进入 Dock 才开始缓慢扫过一次。
+     :hover 里用 animation-play-state 启停，不重排、不重绘模糊层 */
+  animation: dock-sweep 30s linear infinite;
+  animation-play-state: paused;
+}
+
+/* 光带扫过：从左侧屏外平移到右侧屏外（100vw + 自身宽度足够覆盖任意窗口宽度） */
+@keyframes dock-sweep {
+  from { transform: translateX(0) skewX(-18deg); }
+  to { transform: translateX(calc(100vw + 320px)) skewX(-18deg); }
+}
+
+.dock:hover .dock-bg::after {
+  animation-play-state: running;
+}
+
+/* 无障碍：偏好减少动效时彻底移除光带动画（不是暂停——暂停后仍会占一个合成层） */
+@media (prefers-reduced-motion: reduce) {
+  .dock-bg::after {
+    animation: none;
+  }
+}
+/* 玻璃装饰总开关：在 index.html 的 <html> 上加 data-glass-fx="off" 即可一键关掉
+   第 5 条的噪点与第 9 条的扫光（保留描边/高光/反射光）。
+   用途：怀疑「玻璃层内的动画/噪声」导致渲染卡顿时做二分定位——
+   backdrop-filter 元素内部的动画排查成本很高，留一个不改 CSS 就能关的开关。 */
+html[data-glass-fx='off'] .dock-bg::after {
+  background-image: none;
+  animation: none;
 }
 
 .dock:hover .dock-bg {
@@ -254,15 +377,45 @@ html, body {
   position: relative; /* 分组数量徽标（.dock-badge）定位参照 */
   border-radius: 18px;
   background: var(--icon-wrap-bg);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  /* 外缘 1px 内描边：没有它时瓷砖与玻璃条背景交界处是「渐变糊在一起」的，
+     有了这圈亮线瓷砖才有实体边界（暗色玻璃上尤其明显） */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
 }
 
+/* 顶部镜面：模拟玻璃反光。用伪元素而不用 background 层，是为了能独立淡入
+   （opacity 过渡）；z-index 0 + 图标 z-index 1 保证它铺在图标下面 */
+.dock-icon-wrap::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), transparent 45%);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.dock-icon-wrap .dock-icon,
+.dock-icon-wrap .dock-group-preview,
+.dock-icon-wrap .dock-usage {
+  position: relative;
+  z-index: 1;
+}
+
+/* 悬停：底衬提亮 + 内描边加重 + 顶部镜面淡入 + 冷色辉光（原来只有一层纯黑影，
+   「弹出来」的感觉出不来）。辉光取强调色，和选中框/插入线同一套视觉语言 */
 .dock-item:hover .dock-icon-wrap {
   background: var(--icon-wrap-hover-bg);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.14),
-    0 6px 20px rgba(0, 0, 0, 0.35);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 6px 20px rgba(0, 0, 0, 0.35),
+    0 0 22px -6px rgba(96, 165, 238, 0.45);
+}
+
+.dock-item:hover .dock-icon-wrap::before {
+  opacity: 1;
 }
 
 .dock-icon {
@@ -271,7 +424,8 @@ html, body {
   border-radius: 12px;
   pointer-events: none;
   image-rendering: auto;
-  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35));
+  /* 双层投影：近距实影贴合边缘（保留原有的清晰轮廓），远距虚影让图标从玻璃面上「浮起来」 */
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35)) drop-shadow(0 8px 16px rgba(0, 0, 0, 0.25));
 }
 
 /* macOS 式悬停标签：绝对定位悬浮在图标上方（不再占用图标下方的布局行，
@@ -299,8 +453,11 @@ html, body {
   transition: opacity 0.16s ease, color 0.2s;
 }
 
+/* 悬停淡入（与下面的 color 合并成一条：同选择器分两处写会让中间的
+   .dock-add / .app.card-open 覆盖规则变得依赖源序，改起来极易踩空） */
 .dock-item:hover .dock-label {
   opacity: 1;
+  color: var(--label-color-hover);
 }
 
 /* 「+」添加按钮不显示悬浮标签（图标本身已足够自明） */
@@ -315,10 +472,6 @@ html, body {
   opacity: 0;
 }
 
-.dock-item:hover .dock-label {
-  color: var(--label-color-hover);
-}
-
 /* ─── Drag & drop ──────────────────────────────────────────────────── */
 
 .dock-item.dragging {
@@ -326,13 +479,40 @@ html, body {
   transform: scale(0.95) !important;
 }
 
+/* ─── 数字与路径的排印基线 ──────────────────────────────────────────────
+   驱动器容量、图标统计这类数字每次刷新都可能变宽窄，比例数字会让后面的文字
+   左右抖动；等宽数字（tabular-nums）钉住字宽。路径用等宽字体更好认 */
+.drive-nums,
+.drive-bar + .drive-nums,
+.dock-usage + .dock-label {
+  font-variant-numeric: tabular-nums;
+}
+
+.drive-row-head,
+.folder-card-sub {
+  font-variant-numeric: tabular-nums;
+}
+
+.folder-card-path {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  letter-spacing: -0.01em;
+}
+
+/* 拖拽插入指示线：与选中框（❲❳ 渐变竖框）统一成「两端淡出 + 柔和光晕」，
+   原来是一条纯蓝硬边竖条，两套指示语言不一致 */
 .drop-indicator {
   width: 3px;
   height: 60px;
   align-self: center;
-  border-radius: 2px;
-  background: #3a7bd5;
-  box-shadow: 0 0 10px rgba(58, 123, 213, 0.6);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    rgba(58, 123, 213, 0) 0%,
+    rgba(96, 165, 238, 1) 22%,
+    rgba(96, 165, 238, 1) 78%,
+    rgba(58, 123, 213, 0) 100%
+  );
+  box-shadow: 0 0 10px rgba(58, 123, 213, 0.55);
   margin: 0 4px;
   flex-shrink: 0;
 }
@@ -344,9 +524,12 @@ html, body {
 }
 
 .dock-add-btn {
-  background: rgba(255, 255, 255, 0.03) !important;
+  /* 底衬与悬停底衬按主题给（--add-btn-bg / --add-btn-hover-bg）。
+     原来是硬编码的 rgba(255,255,255,.03) + !important：白天主题下「悬停变亮」是反的，
+     透明主题还得再写一条 !important 去抵消它。收进变量后三处 !important 一并消失 */
+  background: var(--add-btn-bg, rgba(255, 255, 255, 0.03));
   color: var(--add-btn-color);
-  transition: background 0.2s, color 0.2s, box-shadow 0.2s !important;
+  transition: background 0.2s, color 0.2s, box-shadow 0.2s;
 }
 
 .dock-add-btn svg {
@@ -354,9 +537,9 @@ html, body {
 }
 
 .dock-add-btn:hover {
-  background: rgba(255, 255, 255, 0.1) !important;
+  background: var(--add-btn-hover-bg, rgba(255, 255, 255, 0.1));
   color: var(--add-btn-hover-color);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  box-shadow: var(--add-btn-hover-shadow, 0 4px 16px rgba(0, 0, 0, 0.3));
 }
 
 .dock-add-btn:hover svg {
@@ -372,8 +555,8 @@ html, body {
   transform: translateX(-50%);
   min-width: 155px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
   border-radius: 16px;
   padding: 6px 0;
@@ -548,8 +731,8 @@ html, body {
   /* 宽度上限：超长名称也不至于顶出窗口；菜单项 nowrap，正常文案都占一行不折行 */
   max-width: 280px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
   border-radius: 16px;
   padding: 6px 0;
@@ -676,6 +859,10 @@ html, body {
   --icon-wrap-hover-bg: rgba(255, 255, 255, 0.12);
   --add-btn-color: rgba(255, 255, 255, 0.92); /* 纯白高不透明度：浅色壁纸上加号仍可见 */
   --add-btn-hover-color: #fff;
+  /* 透明风格本来就是「没有玻璃」：瓷砖不参与，`.dock-item:hover .dock-icon-wrap`
+     里那条常驻冷色辉光也要一起关掉，否则图标会拖着一团蓝雾 */
+  --add-btn-bg: transparent;
+  --add-btn-hover-bg: transparent;
   /* 菜单文字近黑（浅色壁纸上最清晰），悬停/分隔线同步浅色系；
      深色壁纸下靠白色光晕托住黑字 */
   --menu-text: #1f2430;
@@ -686,6 +873,12 @@ html, body {
   --label-pill-bg: rgba(0, 0, 0, 0.30); /* 透明：中性深灰药丸衬底（悬停显示标签） */
   --switch-on-bg: rgba(0, 0, 0, 0.75); /* 透明：深色轨道（与近黑菜单文字统一） */
   --switch-on-knob: #fff;
+  /* 透明白菜单背景与 Dock 解耦（--menu-bg 不再引用 --dock-bg-*） */
+  --menu-bg: transparent;
+  --menu-border: transparent;
+  /* 透明风格不做噪点、也不做扫光：图标直接悬浮桌面，玻璃层不存在，
+     纹理与光带都没有可附着的底。变量仍定义（列表项保持一致） */
+  --glass-sat: 1;
   /* 主题嵌套选择器配色（透明，浅色壁纸） */
   --nt-ink: #1f2430;
   --nt-ink-on: #fff;
@@ -698,11 +891,19 @@ html, body {
 }
 
 .app.theme-transparent .dock-bg {
-  background: transparent;
+  background: none; /* 同时去掉描边层、径向高光与垂直渐变三层 */
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   border-color: transparent;
   box-shadow: none;
+}
+
+/* 透明风格（第 5/9 条的共同收口）：不做噪点也不做扫光——
+   图标直接悬浮桌面，玻璃层不存在，纹理与光带都没有可附着的底。
+   一并置空 background-image（噪点 + 光带两层）与动画，避免残留合成层 */
+.app.theme-transparent .dock-bg::after {
+  background-image: none;
+  animation: none;
 }
 
 .app.theme-transparent .dock-icon-wrap {
@@ -710,27 +911,33 @@ html, body {
   box-shadow: none;
 }
 
-/* 悬停图标时给轻微底衬 + 外阴影，增强「可点击」的可感知性 */
+/* 瓷砖的顶部镜面也不参与（贴图瓷砖本身是透明的，反光没有承载体） */
+.app.theme-transparent .dock-icon-wrap::before {
+  display: none;
+}
+
+/* 悬停图标时给轻微底衬 + 外阴影，增强「可点击」的可感知性。
+   这里显式关掉通用规则里的冷色辉光——透明风格图标直接浮在壁纸上，
+   一层蓝色光晕会看着像显示器漏光 */
 .app.theme-transparent .dock-item:hover .dock-icon-wrap {
   background: var(--icon-wrap-hover-bg);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
 }
 
+/* 透明风格图标贴花在壁纸上，近距实影是唯一的轮廓来源，比默认的双层更实 */
 .app.theme-transparent .dock-icon {
-  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.45));
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.5)) drop-shadow(0 8px 16px rgba(0, 0, 0, 0.28));
 }
 
-.app.theme-transparent .dock-add-btn,
-.app.theme-transparent .dock-add-btn:hover {
-  background: transparent !important;
-}
+/* 添加按钮：底衬现在由 --add-btn-bg / --add-btn-hover-bg 变量给（透明主题两个值都是
+   transparent），原来这里那条 !important 抵消规则可以删掉了 */
 
 /* 添加按钮在白底壁纸上不可见时，用双层深投影勾出轮廓 */
 .app.theme-transparent .dock-add-btn svg {
   filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.9)) drop-shadow(0 0 8px rgba(0, 0, 0, 0.45));
 }
 
-/* 菜单与软件背景同步：透明风格下菜单全透明，文字用近黑（配白色光晕托底） */
+/* 菜单与软件背景同步：透明风格下菜单全透明 */
 .app.theme-transparent .dropdown-menu,
 .app.theme-transparent .context-menu {
   background: transparent;
@@ -740,10 +947,59 @@ html, body {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 
+/* ─── 透明风格的文字可读性（核心难点）───────────────────────────────────
+   背景全透明时文字直接压在壁纸上，必须有一圈与底色反差的外轮廓才读得清。
+   试过的三种写法与实测结论：
+     ① 单个方向的柔和白晕（0 0 6px rgba(255,255,255,.3)）——**不可行**：既不够亮
+        以形成轮廓，颜色也和壁纸混在一起，中灰/复杂壁纸上文字直接融进背景；
+     ② 四向硬晕 + 柔晕（text-shadow 四个方向 1px + 一圈 blur）——能看清，但那是
+        **一圈模糊光晕**，文字边缘发毛、观感发糊（已按需求废弃）；
+     ③ **白色描边（现行）**：-webkit-text-stroke + paint-order: stroke fill ——
+        在字形背后画一圈实心描边，**完全没有模糊**，边缘锐利，缩到 11px 也清楚。
+   `paint-order: stroke fill` 是关键：默认描边压在填充之上会把字吃细（发白/发糊），
+   改成先描边后填充，描边就完整地垫在字形底下。 */
+.app.theme-transparent .dock-label,
+.app.theme-transparent .drop-hint,
 .app.theme-transparent .dropdown-item,
 .app.theme-transparent .context-menu-item,
-.app.theme-transparent .edit-label {
-  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.55), 0 0 6px rgba(255, 255, 255, 0.3);
+.app.theme-transparent .edit-label,
+.app.theme-transparent .drives-card,
+.app.theme-transparent .folder-card,
+.app.theme-transparent .group-panel-empty {
+  /* 0.65px 是实测的平衡点：0.5 以下笔画开始缺、0.8 以上字形被描边吃掉显虚发粗
+     （描边是骑在字形轮廓上画的，越粗笔画越细） */
+  -webkit-text-stroke: 0.65px rgba(255, 255, 255, 0.92);
+  paint-order: stroke fill;
+}
+
+/* 小字号（卡片副行、文件大小、面板空态）再收一档：
+   同样 0.65px 压在 11px 的字上会显粗，把笔画挤细反而更难读 */
+.app.theme-transparent .folder-card-path,
+.app.theme-transparent .folder-row-meta,
+.app.theme-transparent .folder-card-sub,
+.app.theme-transparent .folder-card-more,
+.app.theme-transparent .drives-card-title,
+.app.theme-transparent .drive-nums {
+  -webkit-text-stroke-width: 0.5px;
+}
+/* 描边会随 color 一起继承给内联 SVG 图标（空态图标、加载转圈、加号）：
+   图标本身是 currentColor 细描边（1.7px），再叠 0.65px 白描边会整体变粗发糊；
+   加号本来就有双层深投影，叠白边后更明显。这里在图标上把描边整个清掉。 */
+.app.theme-transparent .drives-empty svg,
+.app.theme-transparent .folder-loading svg,
+.app.theme-transparent .group-panel-empty svg,
+.app.theme-transparent .dock-add-btn svg {
+  -webkit-text-stroke: 0;
+}
+
+/* 透明模式不需要任何投影：轮廓已经由白色描边保证。这里覆盖两个残留来源——
+   ① 基础 .dock-label 自带的深色投影（那是给黑夜/白天毛玻璃用的，压在壁纸上只会脏）；
+   ② `.dock-item:hover .dock-label` 在 hover 时叠加的一层（不压掉的话悬停反而更糊）。 */
+.app.theme-transparent .dock-label,
+.app.theme-transparent .dock-item:hover .dock-label,
+.app.theme-transparent .drop-hint,
+.app.theme-transparent .group-panel-empty {
+  text-shadow: none;
 }
 
 /* 编辑输入框浅色底 + 深色文字（与菜单黑字风格一致） */
@@ -886,8 +1142,8 @@ html, body {
   z-index: 0;
   border-radius: 24px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
   border: 1px solid var(--dock-border);
   box-shadow: var(--dock-shadow);
 }
@@ -910,13 +1166,95 @@ html, body {
   display: none;
 }
 
-/* 空分组提示（作为唯一 flex 项，面板宽度随之收缩） */
+/* 空状态：图标 + 主文案 + 副文案（原来是光秃秃一行小灰字） */
+.drives-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px 2px;
+  font-size: 0.75rem;
+  color: var(--label-color);
+  opacity: 0.85;
+}
+
+.drives-empty svg {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+
+.drives-empty .es-main {
+  white-space: nowrap;
+}
+
+.drives-empty .es-sub {
+  font-size: 0.7rem;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+/* 分组面板里的空态（唯一 flex 项，面板宽度随之收缩） */
 .group-panel-empty {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   padding: 0 8px 14px;
   font-size: 12px;
   color: var(--label-color);
-  opacity: 0.75;
+  opacity: 0.78;
   white-space: nowrap;
+}
+
+.group-panel-empty svg {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+
+/* ─── 加载态 ──────────────────────────────────────────────────────────────
+   文件夹卡片是「列表先到、真图标后台分批补」，所以加载期间用骨架行占位，
+   比「读取中…」三个字更接近最终形态，也不会在图标换入时跳动 */
+.folder-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 6px 0 4px;
+  font-size: 0.72rem;
+  color: var(--label-color);
+  opacity: 0.75;
+}
+
+.drives-empty .spinner,
+.folder-loading .spinner {
+  animation: ql-spin 0.8s linear infinite;
+}
+
+@keyframes ql-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes ql-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+.skeleton {
+  height: 10px;
+  border-radius: 5px;
+  /* 用遮罩做流光，条纹被 border-radius 直接裁进圆角，不会露出直角 */
+  background: linear-gradient(90deg, rgba(127, 127, 127, 0.18) 0%, rgba(127, 127, 127, 0.4) 50%, rgba(127, 127, 127, 0.18) 100%);
+  background-size: 200% 100%;
+  -webkit-mask-image: linear-gradient(#000, #000);
+  mask-image: linear-gradient(#000, #000);
+  animation: ql-shimmer 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .drives-empty .spinner,
+  .folder-loading .spinner {
+    animation: none;
+  }
 }
 
 /* 透明主题：面板同步全透明（与下拉/右键菜单一致） */
@@ -1000,8 +1338,8 @@ html, body {
   padding: 10px 14px;
   border-radius: 18px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
   border: 1px solid var(--dock-border);
   box-shadow: var(--dock-shadow);
   overflow-y: auto;
@@ -1066,13 +1404,6 @@ html, body {
   height: 100%;
   border-radius: 2px;
   transition: width 0.2s;
-}
-
-.drives-empty {
-  padding: 4px 0;
-  font-size: 0.75rem;
-  color: var(--label-color);
-  opacity: 0.8;
 }
 
 /* 透明风格：卡片同步全透明（与菜单一致） */
