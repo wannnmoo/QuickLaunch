@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react'
 
 interface AppEntry {
   id: number
@@ -116,9 +116,76 @@ const LABEL_CLAMP_PAD = 48
 // 高度上限按这个基准算，超出时内部滚动——避免透明窗口 resize 的白闪
 const BASE_WINDOW_H = 300
 
+// ─── 文件夹图标的共享哨兵 ────────────────────────────────────────────────
+// 桌面扫描出来的文件夹图标对每个条目都是同一张图（主进程只提取一次 shell32 index 4，
+// 所有条目共用同一个 base64 串）。但**每个条目各存一份**的代价是实打实的：
+// renderer state 里几十份字符串、每次 IPC（load/save/scan/check）各传几十份、
+// shortcuts.json 里几十份、每次保存还要重新 JSON 序列化几十份。
+// 这里改成存一个短哨兵：状态里只留 'ql-shared-folder-icon'，渲染前统一换成共享常量
+// （JS 字符串按引用比较与传递，等于全应用只留一份内存）。
+// 磁盘格式也保持可读：主进程 save-shortcuts 写盘前会把哨兵换回真实 data URL，
+// load-shortcuts 读入后再归一化回哨兵（旧文件、手改文件都照旧能用）。
+const FOLDER_ICON_SENTINEL = 'ql-shared-folder-icon'
+/** 第一个带真实文件夹图标的条目里那份 data URL —— 启动加载后立刻填上，作为共享引用源 */
+let sharedFolderIcon = ''
+const isSentinel = (url: string): boolean => url === FOLDER_ICON_SENTINEL
+/** 持久化/展示用的真实图标（哨兵 → 共享引用；其余原样） */
+const realIcon = (url: string): string => (isSentinel(url) ? sharedFolderIcon : url)
+/** 状态里存的紧凑形式（真实文件夹图标 → 哨兵；其余原样） */
+const compactIcon = (url: string): string =>
+  sharedFolderIcon && url === sharedFolderIcon ? FOLDER_ICON_SENTINEL : url
+
 // 外部拖入的是「文件」而非页面内元素/文本：DataTransfer.types 里含 'Files'
 const isFileDragEvent = (e: React.DragEvent): boolean =>
   Array.from(e.dataTransfer?.types ?? []).includes('Files')
+
+// ─── Dock 几何缓存（放大效果 / 落点换算共用的热点）──────────────────────────
+// 放大效果原来每个 mousemove 都对**每个**图标调一次 getBoundingClientRect，紧接着又写
+// inline transform —— 读-写-读-写交替触发强制同步布局（layout thrashing），图标越多越
+// 卡，几十个图标时单帧能到十几毫秒，鼠标移动肉眼可见掉帧。
+// 这里改成：布局变化时（apps / 图标增删 / 换停靠边 / 换主题 / 容器尺寸变化）量一次
+// 各图标中心点存成数字数组，之后每次鼠标移动只做算术 —— 零次布局读取（除了容器那一次
+// getBoundingClientRect，它每帧只调一次且此时没有待处理的样式写入）。
+// 走的是「中心点排序数组 + 影响范围」的写法：鼠标只影响左右各 140px 内的图标，
+// 落到数组上就是从 lo 到 hi 的一小段，其余元素只在「上一帧被放大过」时才需要复位。
+type DockCenter = { id: number; cx: number; el: HTMLDivElement }
+
+function measureCenters(
+  refs: Map<number, HTMLDivElement>,
+  container: HTMLElement | null
+): DockCenter[] {
+  if (!container) return []
+  const box = container.getBoundingClientRect()
+  const out: DockCenter[] = []
+  refs.forEach((el, id) => {
+    if (el.dataset.sep) return // 分隔线不参与放大
+    const rect = el.getBoundingClientRect()
+    out.push({ id, cx: rect.left - box.left + rect.width / 2, el })
+  })
+  out.sort((a, b) => a.cx - b.cx)
+  return out
+}
+
+/** 把某个图标的放大状态落到 DOM 上。用 WeakMap 记住上一次写进去的值，
+ *  值没变就完全不动 DOM —— 原来每帧对每个图标无条件写 transform/zIndex，
+ *  即使数值与上一帧一模一样也会让浏览器重新做样式解析与合成。 */
+const appliedZoom = new WeakMap<HTMLElement, number>()
+function applyZoom(el: HTMLElement, scale: number, lift: number): void {
+  const prev = appliedZoom.get(el)
+  if (prev === scale) return
+  if (scale <= 1) {
+    el.style.transform = ''
+    el.style.zIndex = ''
+    appliedZoom.delete(el)
+    return
+  }
+  el.style.transform = `scale(${scale}) translateY(${lift}px)`
+  el.style.zIndex = '10'
+  appliedZoom.set(el, scale)
+}
+
+const MAGNIFY_RANGE = 140
+const MAGNIFY_EXTRA = 0.4
 
 function App(): React.ReactElement {
   const [apps, setApps] = useState<AppEntry[]>([])
@@ -168,8 +235,7 @@ function App(): React.ReactElement {
   const dockBgRef = useRef<HTMLDivElement>(null)
   const dockInnerRef = useRef<HTMLDivElement>(null)
   const addBtnRef = useRef<HTMLDivElement>(null)
-  const iconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
-  // 菜单打开期间用户是否已手动切换过开关：防止过期的异步读取（getAutoStart /
+  const iconRefs = useRef<Map<number, HTMLDivElement>>(new Map())  // 菜单打开期间用户是否已手动切换过开关：防止过期的异步读取（getAutoStart /
   // getDesktopIconsHidden）覆盖乐观更新的状态（陈旧响应竞态）
   const autoStartDirtyRef = useRef(false)
   const desktopIconsDirtyRef = useRef(false)
@@ -181,6 +247,9 @@ function App(): React.ReactElement {
   const dragStartedRef = useRef(false)
   // 拖拽结束后吞掉紧随其后的 click，防止误启动图标
   const suppressClickRef = useRef(false)
+  // 上一次「启动条目」的时刻：吸收启动瞬间的连点（Dock 隐藏前用户容易多点几下，
+  // 每次点击都会真的 CreateProcess 开一个新实例）
+  const lastRunAtRef = useRef(0)
   const [dragId, setDragId] = useState<number | null>(null)
   const [dropIdx, setDropIdx] = useState<number | null>(null)
   // 拖拽中命中的分组图标（高亮提示「松手即归入该组」）
@@ -224,6 +293,10 @@ function App(): React.ReactElement {
     }, 150)
   }, [])
 
+  // openFolderCard 每次渲染都要变（依赖挂载时借来的 apps），但真正需要「新鲜 apps」的
+  // 只有卡片打开时的名字兜底一项，所以把它放进 ref 里读——回调本身保持稳定引用，
+  // 不会让 handleIconMouseDown 之类的下游 useCallback 每次渲染都失效
+  const appsRef = useRef<AppEntry[]>([])
   const openFolderCard = useCallback((app: AppEntry, anchorX: number) => {
     if (folderCardTimer.current) clearTimeout(folderCardTimer.current)
     // 悬停即预取：鼠标刚碰到图标就开始列目录 + 提首批图标（主进程会缓存 5s，
@@ -233,37 +306,43 @@ function App(): React.ReactElement {
       folderCardTimer.current = null
       // 拖拽/拖入进行中不弹卡片（会挡住落点指示线）
       if (dragStartedRef.current || fileDragOverRef.current) return
-      const same = normPath(app.targetPath)
+      // 条目可能已经被删除/改名（桌面实时同步、右键编辑）：从最新列表里取，
+      // 免得卡片标题停在旧名字上
+      const fresh = appsRef.current.find((a) => a.id === app.id) ?? app
+      const same = normPath(fresh.targetPath)
       // 同一目录且已加载完：保持内容只更新锚点（鼠标在 150ms 宽限里移出又移回时，
       // 不要清成「读取中」再重新加载——那会闪一下，缓存过期时还要整目录重扫）
       setFolderCard((prev) =>
         prev && prev.data && normPath(prev.path) === same
           ? { ...prev, anchorX }
-          : { path: app.targetPath, name: app.description || '未命名', anchorX, data: null })
+          : { path: fresh.targetPath, name: fresh.description || fresh.targetPath.split('\\').pop() || '未命名', anchorX, data: null })
       // 无条件再取一次：命中主进程 5s 缓存时几乎零成本，同目录时正好把内容刷新回来
-      window.api.listFolder(app.targetPath)
+      window.api.listFolder(fresh.targetPath)
         .then((data) => setFolderCard((prev) =>
           (prev && normPath(prev.path) === same ? { ...prev, data } : prev)))
         .catch(() => {})
     }, 300)
   }, [])
 
-  // 图标分批补齐事件：按路径就地替换（卡片已关或已换目录则丢弃）
+  // 图标分批补齐事件：按路径就地替换（卡片已关 / 已换目录 / 本批没有命中项则原样返回）。
+  // 每个目录的后台补图标会推好几批（每批 24 个），原来每批都对 400 行做一次
+  // Object.entries + normPath + map 建新对象，其中绝大多数条目根本不在本批里 ——
+  // 现在先把本批路径与当前卡片对齐（不同目录的批次直接整批丢弃），再只改动命中的几行。
   useEffect(() => window.api.onFolderIcons((p) => {
     setFolderCard((prev) => {
-      if (!prev?.data || normPath(prev.path) !== normPath(p.path)) return prev
+      const data = prev?.data
+      if (!data || normPath(data.path) !== normPath(p.path)) return prev
       const icons: Record<string, string> = {}
       for (const [k, v] of Object.entries(p.icons)) icons[normPath(k)] = v
-      return {
-        ...prev,
-        data: {
-          ...prev.data,
-          items: prev.data.items.map((it) => {
-            const icon = icons[normPath(it.path)]
-            return icon && icon !== it.iconDataUrl ? { ...it, iconDataUrl: icon } : it
-          })
-        }
-      }
+      let changed = false
+      const items = data.items.map((it) => {
+        const icon = icons[normPath(it.path)]
+        if (!icon || icon === it.iconDataUrl) return it
+        changed = true
+        return { ...it, iconDataUrl: icon }
+      })
+      if (!changed) return prev // 没有任何一行命中：不产生新对象，React 直接 bail out
+      return { ...prev!, data: { ...data, items } }
     })
   }), [])
 
@@ -396,25 +475,79 @@ function App(): React.ReactElement {
     }
   }, [])
 
+  // ─── Dock 几何缓存 ─────────────────────────────────────────────────────
+  // 几何在「apps / 主题 / 停靠边 / 面板开关」变化时都会变，但**不能只靠 ResizeObserver**：
+  // 图标增删只是改变容器内容的排布，容器的盒子尺寸（clientWidth）不一定变 ——
+  // 观察者不会回调，缓存就会留在旧的中心点，表现为「加了图标之后放大效果对不上位置」。
+  // 所以用两条失效通道合起来：
+  //   ① 显式的 layout effect（apps.length / theme / edge / openGroupId）——确定性失效；
+  //   ② ResizeObserver——兜住「尺寸变了但依赖没变」的情况（DPI 缩放、字体、面板撑宽）。
+  //
+  // 两个实现细节：
+  //   * 观察者挂在 **ref 回调**里（useEffect 在 ref 回调之后才跑，挂载那一帧会漏掉）；
+  //   * 观察者就绪时**先主动测一次**：ResizeObserver 只在「观察之后尺寸发生变化」时
+  //     回调，光挂上去没有初始通知，不补这一刀启动后第一次悬停会没有放大效果。
+  const [geometryTick, setGeometryTick] = useState(0)
+  const geoSeq = useRef(0)
+  const geoObservedSeq = useRef(-1)
+  const geoObserver = useRef<ResizeObserver | null>(null)
+
+  const setDockInnerRef = useCallback((el: HTMLDivElement | null) => {
+    dockInnerRef.current = el
+    geoObserver.current?.disconnect()
+    geoObserver.current = null
+    if (!el) return
+    geoSeq.current += 1
+    const ro = new ResizeObserver(() => {
+      geoSeq.current += 1
+      setGeometryTick(geoSeq.current)
+    })
+    ro.observe(el)
+    geoObserver.current = ro
+  }, [])
+
+  // 卸载时断开观察者（StrictMode 双挂载下会重挂，观察者必须自己收掉，否则泄漏）
+  useEffect(() => () => { geoObserver.current?.disconnect(); geoObserver.current = null }, [])
+
+  /** 主 Dock 各图标的中心点（按 x 排序）。只在几何真的变了的那一次渲染里重新测量，
+   *  其余渲染直接命中 ref 里的缓存 —— 不产生任何布局读取。 */
+  const dockCenters = useRef<DockCenter[]>([])
+  if (geoObservedSeq.current !== geoSeq.current) {
+    geoObservedSeq.current = geoSeq.current
+    dockCenters.current = measureCenters(iconRefs.current, dockInnerRef.current)
+  }
+
+  // 分组面板的同款缓存：只在「面板刚打开 / 换了分组 / 容器尺寸变了」时量一次。
+  // 面板高度固定、宽度最多几百像素，不需要自己的 ResizeObserver。
+  const panelCenters = useRef<DockCenter[]>([])
+  const panelMeasuredKey = useRef('')
+  const panelKey = `${openGroupId}:${geoSeq.current}`
+  if (panelMeasuredKey.current !== panelKey) {
+    panelMeasuredKey.current = panelKey
+    panelCenters.current = measureCenters(panelIconRefs.current, panelInnerRef.current)
+  }
+
+  // 显式失效：这些依赖一变就让两处几何缓存全部重建（见上方注释 ①）
+  useLayoutEffect(() => {
+    geoSeq.current += 1
+    setGeometryTick(geoSeq.current)
+  }, [apps.length, theme, edge, openGroupId])
+
   // Calculate which insertion index the cursor is closest to
   // 返回的是「位置」（在渲染出来的顶层图标中排序后的下标），不是数组下标
   // 组内成员不在 Dock 里渲染，所以这里与 topAnchorId 的下标空间一致
   const calcDropIndex = useCallback((clientX: number): number => {
     const dock = dockRef.current
-    if (!dock) return iconRefs.current.size
-    const dockRect = dock.getBoundingClientRect()
-    const mx = clientX - dockRect.left
-
-    const centers: number[] = []
-    iconRefs.current.forEach((el) => {
-      const rect = el.getBoundingClientRect()
-      centers.push(rect.left - dockRect.left + rect.width / 2)
-    })
-    centers.sort((a, b) => a - b)
+    const centers = dockCenters.current
+    if (!dock) return centers.length
+    // 拖拽过程中图标会被放大 1.4×、还会被 auto/-insertion 指示线撑开，中心点与缓存
+    // 会有几像素偏差；但落点判定本来就只有「最近两个图标之间」的粒度，偏差不影响
+    // 结果，而每帧重新量一遍全部图标才是真正的开销来源
+    const mx = clientX - dock.getBoundingClientRect().left
 
     // Find where the cursor falls between/around icon centers
     for (let i = 0; i < centers.length; i++) {
-      if (mx < centers[i]) return i
+      if (mx < centers[i].cx) return i
     }
     return centers.length
   }, [])
@@ -649,7 +782,16 @@ function App(): React.ReactElement {
       setMenuPos(null)
       setContextMenu(null)
     }
-    const handleMouseMove = (e: MouseEvent) => {
+    // elementFromPoint 会强制一次样式/布局计算，而 mousemove 一秒能来几百条
+    // （高刷鼠标/触控板），每条都算一次纯属浪费。用 rAF 合并成「每帧最多判定一次」，
+    // 判定结果与逐条处理完全一致（关不关菜单只取决于光标当下在哪）。
+    let raf = 0
+    let last: MouseEvent | null = null
+    const evaluate = () => {
+      raf = 0
+      const e = last
+      last = null
+      if (!e) return
       const el = document.elementFromPoint(e.clientX, e.clientY)
       const inMenu = menuRef.current ? menuRef.current.contains(el) : false
       // 鼠标停在「添加」按钮上也保持菜单打开
@@ -680,54 +822,87 @@ function App(): React.ReactElement {
         if (!near(ctxRef.current) && !near(menuRef.current)) closeMenus()
       }
     }
-    const handleWindowLeave = () => closeMenus()
+    const handleMouseMove = (e: MouseEvent) => {
+      last = e
+      if (raf === 0) raf = requestAnimationFrame(evaluate)
+    }
+    const handleWindowLeave = () => {
+      last = null
+      if (raf !== 0) { cancelAnimationFrame(raf); raf = 0 }
+      closeMenus()
+    }
     document.addEventListener('mousemove', handleMouseMove)
     window.addEventListener('mouseleave', handleWindowLeave)
     return () => {
       document.removeEventListener('mousemove', handleMouseMove)
       window.removeEventListener('mouseleave', handleWindowLeave)
+      if (raf !== 0) cancelAnimationFrame(raf)
     }
   }, [menuPos, contextMenu])
 
   // ─── Dock magnification（主 Dock 与分组面板共用：面板就是迷你 Dock） ───
+  // 几何来自 measureCenters 的缓存（见文件上方「Dock 几何缓存」），每次鼠标移动只做
+  // 算术：先二分定位光标落在中心点数组的哪一格，再只遍历左右各 140px 内的那一小段
+  // （升序数组上就是从 lo 到 hi 的连续区间），区间外只有「上一帧刚被放大过」的元素
+  // 才需要复位。整体是一次容器布局读取 + 少量样式写入，不再逐图标读写交替。
 
-  const magnify = useCallback((container: HTMLElement | null, refs: Map<number, HTMLDivElement>, clientX: number) => {
-    if (!container) return
-    const box = container.getBoundingClientRect()
-    const mx = clientX - box.left
-    refs.forEach((el) => {
-      if (el.dataset.sep) return // 分隔线不参与放大
-      const rect = el.getBoundingClientRect()
-      const cx = rect.left - box.left + rect.width / 2
+  /** 镜像 navId 供 mousemove 回调判断：鼠标一动就收起键盘选中框，但不想为了读一个
+   *  布尔量把 navId 塞进回调依赖（那会让整套 window 监听在每次导航变化时重挂）。 */
+  const navIdRef = useRef<number | null>(null)
+  navIdRef.current = navId
+
+  /** 上一次放大过的元素（只有它们可能需要复位，避免每帧遍历全部图标） */
+  const magnified = useRef<Set<HTMLElement>>(new Set())
+
+  const magnifyAt = useCallback((container: HTMLElement | null, centers: DockCenter[], clientX: number) => {
+    const active = magnified.current
+    if (!container || centers.length === 0) {
+      active.forEach((el) => applyZoom(el, 1, 0))
+      active.clear()
+      return
+    }
+    const mx = clientX - container.getBoundingClientRect().left
+
+    // 升序中心点里找第一个 >= mx 的位置（二分：几十个图标也别线性扫）
+    let lo = 0
+    let hi = centers.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (centers[mid].cx < mx) lo = mid + 1
+      else hi = mid
+    }
+    let start = lo
+    while (start > 0 && mx - centers[start - 1].cx < MAGNIFY_RANGE) start--
+    const next = new Set<HTMLElement>()
+    for (let i = start; i < centers.length; i++) {
+      const { cx, el } = centers[i]
       const dist = Math.abs(mx - cx)
-      const maxDist = 140
-      const maxExtra = 0.4
-      if (dist < maxDist) {
-        const s = 1 + (1 - dist / maxDist) * maxExtra
-        // 上浮方向朝 Dock 外侧：底部 Dock 向上顶出玻璃条，顶部 Dock 向下顶出
-        const lift = dist < maxDist * 0.6 ? (1 - dist / (maxDist * 0.6)) * 8 : 0
-        el.style.transform = `scale(${s}) translateY(${isTop ? lift : -lift}px)`
-        el.style.zIndex = '10'
-      } else {
-        el.style.transform = ''
-        el.style.zIndex = ''
-      }
-    })
+      if (dist >= MAGNIFY_RANGE) break
+      const s = 1 + (1 - dist / MAGNIFY_RANGE) * MAGNIFY_EXTRA
+      // 上浮方向朝 Dock 外侧：底部 Dock 向上顶出玻璃条，顶部 Dock 向下顶出
+      const liftRange = MAGNIFY_RANGE * 0.6
+      const lift = dist < liftRange ? (1 - dist / liftRange) * 8 : 0
+      applyZoom(el, s, isTop ? lift : -lift)
+      next.add(el)
+    }
+    // 上一帧放大、这一帧不在范围内的图标复位
+    active.forEach((el) => { if (!next.has(el)) applyZoom(el, 1, 0) })
+    magnified.current = next
   }, [isTop])
 
-  const resetMagnify = useCallback((refs: Map<number, HTMLDivElement>) => {
-    refs.forEach((el) => {
-      el.style.transform = ''
-      el.style.zIndex = ''
-    })
+  const clearMagnify = useCallback(() => {
+    magnified.current.forEach((el) => applyZoom(el, 1, 0))
+    magnified.current.clear()
   }, [])
 
   const handleDockMouseMove = useCallback((e: React.MouseEvent) => {
-    // 鼠标一动就说明改用鼠标了：收起键盘选中框（看不见的选中项不该还能被 Enter 启动）
-    setNavId(null)
+    // 鼠标一动就说明改用鼠标了：收起键盘选中框（看不见的选中项不该还能被 Enter 启动）。
+    // 用 ref 判断，避免每次移动都调一次 setNavId —— 那会让整个 App（含全部图标与
+    // 面板成员）跟着重渲染，是鼠标划过 Dock 时最大的一笔渲染开销。
+    if (navIdRef.current !== null) setNavId(null)
     if (dragId !== null) return // disable magnification during drag
-    magnify(dockRef.current, iconRefs.current, e.clientX)
-  }, [dragId, magnify])
+    magnifyAt(dockInnerRef.current, dockCenters.current, e.clientX)
+  }, [dragId, magnifyAt])
 
   // 悬停标签横向钳制：标签是绝对定位居中悬浮在图标上方（完整显示不截断），靠边的图标
   // 会让标签伸出滚动容器、被 overflow 裁掉半截（「此电脑」的「此电脑 · 可用 …」就是如此）。
@@ -756,18 +931,19 @@ function App(): React.ReactElement {
   }, [])
 
   const handleDockMouseLeave = useCallback(() => {
-    resetMagnify(iconRefs.current)
-  }, [resetMagnify])
+    clearMagnify()
+  }, [clearMagnify])
 
   const handlePanelMouseMove = useCallback((e: React.MouseEvent) => {
-    setNavId(null) // 与主 Dock 一致：鼠标接管就收起键盘选中框
+    // 与主 Dock 一致：鼠标接管就收起键盘选中框（同样先用 ref 拦一道，避免无谓重渲染）
+    if (navIdRef.current !== null) setNavId(null)
     if (dragId !== null) return
-    magnify(panelInnerRef.current, panelIconRefs.current, e.clientX)
-  }, [dragId, magnify])
+    magnifyAt(panelInnerRef.current, panelCenters.current, e.clientX)
+  }, [dragId, magnifyAt])
 
   const handlePanelMouseLeave = useCallback(() => {
-    resetMagnify(panelIconRefs.current)
-  }, [resetMagnify])
+    clearMagnify()
+  }, [clearMagnify])
 
   // ─── Horizontal scroll (icon overflow) ──────────────────────────────
   // 图标超过 Dock 宽度时，滚动容器横向滚动，滚轮 / 触控板左右滑动查看。
@@ -1036,8 +1212,17 @@ function App(): React.ReactElement {
     }
     // 分隔符：不启动任何东西（点击/Enter 均无效）
     if (app.isSeparator) return
+    // 防连点：启动是「先隐藏 Dock 再 CreateProcess」，Dock 隐藏前用户很可能又点了两下，
+    // 那会真的把程序开成三份。用一个短窗口吸收这段时间内的重复点击。
+    const now = Date.now()
+    if (now - lastRunAtRef.current < 700) return
+    lastRunAtRef.current = now
+    // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
+    // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
-  }, [dragId, openGroupId, closeGroupPanel])
+      .then((ok) => { if (ok === false) showDropHint('启动失败：目标不存在或无法运行') })
+      .catch(() => showDropHint('启动失败：目标不存在或无法运行'))
+  }, [dragId, openGroupId, closeGroupPanel, showDropHint])
 
   // 右键条目：stopPropagation 防止冒泡到 .dock 的空白区菜单（否则两个菜单状态互相覆盖）
   const handleContextMenu = (e: React.MouseEvent, id: number) => {
@@ -1443,9 +1628,10 @@ function App(): React.ReactElement {
 
   // ─── 桌面文件夹同步：清理缺失 + 扫描合并（启动与实时事件共用）───────────
 
-  // 最新列表镜像 ref：fs.watch 事件回调里避免读到过期闭包里的旧 apps
-  const appsRef = useRef<AppEntry[]>([])
-  useEffect(() => { appsRef.current = apps }, [apps])
+  // appsRef 已在上面声明（openFolderCard 需要读最新列表）。这里只做镜像更新——
+  // 用 useLayoutEffect 而不是 useEffect：提交后立刻同步，fs.watch 回调与键盘导航
+  // 读到的都已经是本轮的值
+  useLayoutEffect(() => { appsRef.current = apps }, [apps])
   // 清理/扫描进行中时跳过重复事件（debounce 只聚合了 watch 事件，扫描自身耗时可更长）
   const desktopSyncBusyRef = useRef(false)
 
@@ -1466,7 +1652,11 @@ function App(): React.ReactElement {
       // 联合类型，下面 add.filter((e) => e.specialType) 会在缺该字段的分支上报 TS2339
       const entries: AppEntry[] = fresh.map((f) => ({
         id: nextId++,
-        iconDataUrl: f.iconDataUrl,
+        // 桌面扫描出来的文件夹图标**全都一模一样**（主进程一次提取、全量共用）。每个条目
+        // 各存一份 base64 意味着：renderer 状态里几十份、每次 IPC 传几十份、
+        // shortcuts.json 里几十份、每次保存再序列化几十份。
+        // 存成哨兵串、渲染时换回共享常量（见 FOLDER_ICON_SENTINEL），内存与文件都只留一份。
+        iconDataUrl: f.specialType ? f.iconDataUrl : FOLDER_ICON_SENTINEL,
         targetPath: f.path,
         arguments: '',
         workingDirectory: '',
@@ -1520,7 +1710,11 @@ function App(): React.ReactElement {
     window.api.loadShortcuts().then((saved) => {
       if (cancelled) return
       if (saved && saved.length > 0) {
-        setApps(saved)
+        // 先认下「共享文件夹图标」是哪一份（所有文件夹条目的图标都相同，取第一份即可），
+        // 再把列表里重复的图标归一化成哨兵——这一步直接把 N 份 base64 压成 1 份
+        const withFolderIcon = saved.find((a) => a.isFolder && a.iconDataUrl)
+        if (withFolderIcon) sharedFolderIcon = withFolderIcon.iconDataUrl
+        setApps(saved.map((a) => ({ ...a, iconDataUrl: compactIcon(a.iconDataUrl) })))
         nextId = Math.max(-1, ...saved.map((a) => a.id)) + 1
       }
       // 加载完成即解锁保存（不等同步结束，启动早期用户操作也能正常持久化）
@@ -1562,11 +1756,45 @@ function App(): React.ReactElement {
     return unsubscribe
   }, [pruneMissingFolders, mergeDesktopScan])
 
+  // 保存：**必须防抖**。拖动排序每帧都会产生一次 apps 变更，原来每次都立刻
+  // `saveShortcuts(apps)` —— 整个数组（含全部图标 data URL）被结构化克隆跨进程传一遍，
+  // 主进程再 JSON.stringify 整个数组写盘一次。拖一次图标就是几十次全量序列化 +
+  // 几十次磁盘写入，是「拖动时卡顿 + 磁盘 io 尖峰」的主要来源之一。
+  // 400ms 内合并成一次；退出时由主进程的 flush-pending-save 兜底，不会丢数据。
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingSave = useRef<AppEntry[] | null>(null)
+
+  /** 把一份列表写盘。写盘前把哨兵换成真实图标：磁盘格式保持与旧版本一致（可读、可手改）。 */
+  const writeShortcuts = useCallback((data: AppEntry[]): void => {
+    window.api.saveShortcuts(data.map((a) => ({ ...a, iconDataUrl: realIcon(a.iconDataUrl) })))
+  }, [])
+
+  /** 立刻把待保存的列表写盘（退出前由主进程的 flush-pending-save 触发）。 */
+  const flushSave = useCallback((): void => {
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
+    const data = pendingSave.current
+    pendingSave.current = null
+    if (data) writeShortcuts(data)
+  }, [writeShortcuts])
+
   useEffect(() => {
     // 初始加载完成前不保存（见 loadedRef 注释：防止挂载时 save([]) 清空磁盘数据）
     if (!loadedRef.current) return
-    window.api.saveShortcuts(apps)
-  }, [apps])
+    pendingSave.current = apps
+    if (saveTimer.current) return
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null
+      const data = pendingSave.current
+      pendingSave.current = null
+      if (data) writeShortcuts(data)
+    }, 400)
+  }, [apps, writeShortcuts])
+
+  // 主进程在退出前通知：把还在防抖窗口里的最后一次变更立刻落盘
+  useEffect(() => window.api.onFlushPendingSave(flushSave), [flushSave])
+
+  // 组件卸载（页面重载 / 窗口重建）时也不能丢：能发就发一次
+  useEffect(() => () => { flushSave() }, [flushSave])
 
   // 图标增删 / 初始加载后刷新两侧渐隐提示（此时 DOM 已更新，scrollWidth 可用）
   // 顺带处理「新建分组后滚动到末尾」的待办标记
@@ -1590,8 +1818,11 @@ function App(): React.ReactElement {
   // 右键菜单对应的条目
   const ctxApp = contextMenu ? apps.find((a) => a.id === contextMenu.appId) : undefined
   // Dock 顶层图标（组内成员只在面板里渲染）+ 当前展开分组的成员
-  const topLevel = apps.filter((a) => !a.groupId)
-  const openGroupMembers = openGroupId === null ? [] : apps.filter((a) => a.groupId === openGroupId)
+  const topLevel = useMemo(() => apps.filter((a) => !a.groupId), [apps])
+  const openGroupMembers = useMemo(
+    () => (openGroupId === null ? [] : apps.filter((a) => a.groupId === openGroupId)),
+    [apps, openGroupId]
+  )
   const openGroup = openGroupId === null ? undefined : apps.find((a) => a.id === openGroupId)
   // 浮层的贴边锚点与可用空间，渲染时算一次。方向感知：底部 Dock 贴上方（bottom），
   // 顶部 Dock 贴下方（top）——五个浮层（此电脑卡片 / 文件夹卡片 / 「+」菜单 / 右键菜单 /
@@ -1609,14 +1840,37 @@ function App(): React.ReactElement {
   // 分组 → 可显示成员（排除分隔线）：分组图标的缩略拼图与数量徽标用它，
   // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大。
   // （面板渲染用的是 openGroupMembers，不需要另建一份含分隔线的表）
-  const groupIconMembersById = new Map<number, AppEntry[]>()
-  for (const a of apps) {
-    if (a.groupId === undefined) continue
-    if (a.isSeparator) continue
-    const iconList = groupIconMembersById.get(a.groupId)
-    if (iconList) iconList.push(a)
-    else groupIconMembersById.set(a.groupId, [a])
-  }
+  // useMemo：每次渲染都重建这张 Map 会随着图标数量线性变贵，而 App 的渲染次数
+  // 在鼠标划过 Dock 时会明显增加（放大、选中、菜单命中判定都会 setState）
+  const groupIconMembersById = useMemo(() => {
+    const map = new Map<number, AppEntry[]>()
+    for (const a of apps) {
+      if (a.groupId === undefined) continue
+      if (a.isSeparator) continue
+      const iconList = map.get(a.groupId)
+      if (iconList) iconList.push(a)
+      else map.set(a.groupId, [a])
+    }
+    return map
+  }, [apps])
+  // 渲染用的列表：把文件夹图标的哨兵换成共享常量。JS 里字符串是按引用传递的，
+  // 于是「N 个文件夹图标」在内存里实际只占一份；状态里也始终只有哨兵。
+  // 只在 apps 变化时重建，不会每次渲染都 map 一遍。
+  const viewApps = useMemo(
+    () => (apps.some((a) => isSentinel(a.iconDataUrl))
+      ? apps.map((a) => (isSentinel(a.iconDataUrl) ? { ...a, iconDataUrl: sharedFolderIcon } : a))
+      : apps),
+    [apps]
+  )
+  const viewById = useMemo(() => {
+    if (viewApps === apps) return null // 没有哨兵时直接用原对象，省一次建表
+    return new Map(viewApps.map((a) => [a.id, a]))
+  }, [viewApps, apps])
+  const viewOf = (a: AppEntry): AppEntry => viewById?.get(a.id) ?? a
+  const viewTopLevel = useMemo(() => topLevel.map(viewOf), [topLevel, viewById])
+  const viewGroupMembers = useMemo(() => openGroupMembers.map(viewOf), [openGroupMembers, viewById])
+  const viewOpenGroup = openGroup ? viewOf(openGroup) : undefined
+  const viewCtxApp = ctxApp ? viewOf(ctxApp) : undefined
 
   return (
     <div
@@ -1643,12 +1897,12 @@ function App(): React.ReactElement {
           // 两端还有图标可滚时加标记类：CSS 用遮罩让边缘的图标「溶解」而不是被硬切一刀
           // （硬切的半个图标压在圆角边缘上，看着像探出了 Dock 轮廓）
           className={'dock-inner' + (scrollState.left ? ' edge-left' : '') + (scrollState.right ? ' edge-right' : '')}
-          ref={dockInnerRef}
+          ref={setDockInnerRef}
           onScroll={updateScrollState}
         >
           {dropIdx === 0 && <div className="drop-indicator" />}
 
-          {topLevel.map((app, idx) => (
+          {viewTopLevel.map((app, idx) => (
             <div key={app.id} style={{ display: 'contents' }}>
               {app.isSeparator ? (
                 // 分隔线：不参与悬停放大（data-sep），可拖拽、可右键
@@ -1776,7 +2030,7 @@ function App(): React.ReactElement {
       {/* 分组面板：主 Dock 同构的迷你 Dock —— 图标尺寸/悬停放大/悬浮标签全部复用
           .dock-item 系列的样式，宽度随图标数量伸缩，超出窗口时横向滚动；高度固定。
           因此不改变窗口尺寸（无 resize 白闪）。 */}
-      {openGroup && (
+      {viewOpenGroup && (
         <div
           className="group-panel"
           ref={panelRef}
@@ -1796,7 +2050,7 @@ function App(): React.ReactElement {
             onMouseMove={handlePanelMouseMove}
             onMouseLeave={handlePanelMouseLeave}
           >
-            {openGroupMembers.map((m) => (
+            {viewGroupMembers.map((m) => (
               m.isSeparator ? (
                 <div
                   key={m.id}
@@ -1830,7 +2084,7 @@ function App(): React.ReactElement {
               </div>
               )
             ))}
-            {openGroupMembers.length === 0 && (
+            {viewGroupMembers.length === 0 && (
               <div className="group-panel-empty">
                 {/* 线性图标与整体风格（细描边、圆头）一致；直接内联，不引图标库 */}
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -2124,10 +2378,10 @@ function App(): React.ReactElement {
             ...overlayAnchor
           }}
         >
-          {ctxApp?.isSeparator ? (
+          {viewCtxApp?.isSeparator ? (
             // 分隔线自己的菜单：只有删除
-            <button className="context-menu-item" onClick={() => handleDelete(ctxApp.id)}>删除</button>
-          ) : editingId === contextMenu.appId && ctxApp ? (
+            <button className="context-menu-item" onClick={() => handleDelete(viewCtxApp.id)}>删除</button>
+          ) : editingId === contextMenu.appId && viewCtxApp ? (
             <>
               <div className="edit-fields">
                 <label className="edit-label">
@@ -2136,11 +2390,11 @@ function App(): React.ReactElement {
                     className="edit-input"
                     value={editFields.description}
                     onChange={(e) => setEditFields({ ...editFields, description: e.target.value })}
-                    placeholder={ctxApp.description || '名称'}
+                    placeholder={viewCtxApp.description || '名称'}
                   />
                 </label>
                 {/* 分组没有启动参数/工作目录，表单只留名称 + 图标 */}
-                {!ctxApp.isGroup && (
+                {!viewCtxApp.isGroup && (
                   <>
                     <label className="edit-label">
                       参数
@@ -2169,28 +2423,28 @@ function App(): React.ReactElement {
                 <button className="context-menu-item edit-action" onClick={handleCancelEdit}>取消</button>
               </div>
             </>
-          ) : ctxApp?.isGroup ? (
+          ) : viewCtxApp?.isGroup ? (
             <>
-              <button className="context-menu-item" onClick={() => handleEdit(ctxApp)}>编辑</button>
+              <button className="context-menu-item" onClick={() => handleEdit(viewCtxApp)}>编辑</button>
               <div className="context-menu-divider" />
-              <button className="context-menu-item" onClick={() => handleDissolveGroup(ctxApp.id)}>解散分组</button>
+              <button className="context-menu-item" onClick={() => handleDissolveGroup(viewCtxApp.id)}>解散分组</button>
             </>
           ) : (
             <>
-              {ctxApp && (
+              {viewCtxApp && (
                 <>
-                  <button className="context-menu-item" onClick={() => handleEdit(ctxApp)}>编辑</button>
-                  {isFileSystemPath(ctxApp) && (
-                    <button className="context-menu-item" onClick={() => handleOpenLocation(ctxApp)}>打开文件位置</button>
+                  <button className="context-menu-item" onClick={() => handleEdit(viewCtxApp)}>编辑</button>
+                  {isFileSystemPath(viewCtxApp) && (
+                    <button className="context-menu-item" onClick={() => handleOpenLocation(viewCtxApp)}>打开文件位置</button>
                   )}
-                  {!ctxApp.isFolder && !ctxApp.specialType && isFileSystemPath(ctxApp) && (
-                    <button className="context-menu-item" onClick={() => handleRunAdmin(ctxApp)}>以管理员身份运行</button>
+                  {!viewCtxApp.isFolder && !viewCtxApp.specialType && isFileSystemPath(viewCtxApp) && (
+                    <button className="context-menu-item" onClick={() => handleRunAdmin(viewCtxApp)}>以管理员身份运行</button>
                   )}
-                  {ctxApp.targetPath && (
-                    <button className="context-menu-item" onClick={() => handleCopyPath(ctxApp)}>复制路径</button>
+                  {viewCtxApp.targetPath && (
+                    <button className="context-menu-item" onClick={() => handleCopyPath(viewCtxApp)}>复制路径</button>
                   )}
                   <button className="context-menu-item" onClick={handleCreateGroup}>新建分组</button>
-                  <button className="context-menu-item" onClick={() => handleInsertSeparator(ctxApp.id)}>在此之前插入分隔线</button>
+                  <button className="context-menu-item" onClick={() => handleInsertSeparator(viewCtxApp.id)}>在此之前插入分隔线</button>
                   <div className="context-menu-divider" />
                 </>
               )}

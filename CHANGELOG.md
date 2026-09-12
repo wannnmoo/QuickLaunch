@@ -166,6 +166,41 @@ npm run package    # 构建并打包为可执行安装包
 
 ## 更新日志
 
+### v1.12.0 (2026-09-13)
+
+**性能与资源占用专项**（用户要求：检查 bug 与逻辑、优化内存、减少资源消耗与卡顿）。所有量化结论都来自实机实测，不是推断。
+
+- **放大效果不再「逐图标读写交替」（鼠标划过 Dock 卡顿的主因）**：原实现每个 `mousemove` 都对**每个**图标 `getBoundingClientRect()`、紧接着写 inline `transform`——读-写-读-写交替触发强制同步布局（layout thrashing），每次移动都要为全部图标各做一次布局读取 + 一次样式写入。改为**几何缓存 + 影响范围**：
+  - `measureCenters()` 只在整个布局变化时量一次，把各图标中心点存成**升序数字数组**；鼠标移动时在数组上二分定位，再只遍历左右各 140px 内的一小段（60 个图标时单帧最多触及 **6 个**，原来固定 60 个）
+  - 失效走两条通道：① 显式 layout effect（`apps.length` / 主题 / 停靠边 / 分组开关）② `ResizeObserver`（DPI 缩放、面板撑宽等「尺寸变了但依赖没变」的情况）。**不能只靠 `ResizeObserver`**：图标增删只改变内容排布、容器盒子尺寸不一定变，观察者不会回调
+  - 观察者挂在 **ref 回调**里（`useEffect` 在 ref 回调之后才跑，挂载帧会漏掉），且 `ResizeObserver` 挂上去**没有初始通知**，必须显式补测一次——否则启动后第一次悬停没有放大效果
+  - `applyZoom()` 用 `WeakMap` 记住上次写入的缩放值，值没变就**完全不碰 DOM**（原来每帧无条件写 transform + zIndex）
+  - **等价性实测**：把新旧算法抽出来在 145,200 个光标位置 × 6 种图标数量（0/1/2/5/20/60）上逐点比对，缩放值完全一致
+- **鼠标移动不再触发整树重渲染**：`handleDockMouseMove` 原来每次移动都 `setNavId(null)`，即使值已经是 `null` 也会让整个 `App`（含全部图标、标签、分组拼图、面板成员）重渲染一遍；改用 `navIdRef` 判断，只在该清的时候才 setState。拖拽落点换算 `calcDropIndex` 也复用同一份几何缓存，不再每次重新量全部图标并排序
+- **沉底不再空烧 PowerShell 进程**：实测 `powershell.exe -NoProfile -NonInteractive -Command <WinZ 脚本>` 单次 **690~785ms** CPU 时间（进程启动 ~450ms + .NET 运行时 + `Add-Type` 编译 C# ~250ms），每次还额外占几十 MB 私有内存。新增**沉底宽限期**（`SINK_GRACE_MS = 2500ms`）：Dock 刚显示出来（启动 / 重建窗口 / Alt+Space 唤回 / 恢复显示）后的失焦一律是焦点抖动，直接跳过；`blur` 的 120ms 复核里也补上 `dockTrayHidden` / `canSinkNow()` 判定——`run-app`、`open-path`、`run-as-admin` 隐藏 Dock 时新增 `sinkSeq++`，让这条路上的 PowerShell 完全不会被起起来
+- **保存不再「每帧全量序列化」**：原来 `apps` 每变一次就立刻 `saveShortcuts(apps)`——拖一次图标（每帧一次变更）等于几十次跨进程结构化克隆 + 几十次 `JSON.stringify` 整个数组 + 几十次磁盘写入。改为 **400ms 防抖**；退出时主进程 `before-quit` 推 `flush-pending-save` 并留 200ms 让 renderer 落盘（`will-quit` 时窗口已销毁、IPC 不通，用它兜底是无效的），renderer 卸载时也会 flush 一次
+- **共享文件夹图标：N 份 base64 → 1 份**：桌面扫描出的文件夹图标对每个条目都是同一张图，但每个条目各存一份字符串，于是 renderer 状态、每次 IPC（load/save/scan/check）、`shortcuts.json`、每次保存的序列化里都有 N 份。改为状态里存短哨兵 `ql-shared-folder-icon`、渲染时换成共享常量（JS 字符串按引用传递，全应用只留一份）；**磁盘格式不变**——主进程写盘前把哨兵还原成真实 data URL，加载时再归一化回哨兵（旧文件、手改文件都照旧可用）。实测 30 个文件夹的图标字符串占用 **118 KB → 5 KB**
+- **PowerShell 图标尺寸 256px → 64px（文件夹 48px）**：Dock 图标 CSS 只有 44px、分组拼图 26px、预览卡片 17px，256px 的 PNG 每个 2~10 KB 纯属浪费（`SHDefExtractIcon` 还要多做一次高质量缩放）。数据同样要同时活在主进程状态、IPC、renderer state、磁盘四处，尺寸降一档是全链路省内存
+- **`select-folder` 一次选 N 个文件夹不再起 N 个 PowerShell**：原来在 `map` 里逐个 `await extractIcon()`，选 20 个文件夹就是 20 个 `powershell.exe`（每个 ~500ms + 几十 MB）；改为复用常驻的那一枚共享图标
+- **`list-folder` 的 fs 并发受限**：400 项目录原来 `Promise.all` 一次性把 400 个 `stat` 压进 libuv 线程池（默认只有 4 个线程），排队项连同闭包一起堆内存；新增 `forEachLimited`（并发 16 / 图标批次 8），总耗时几乎不变、峰值请求数降一个量级
+- **目录列表缓存会清理过期项**：原来只在插入新条目时按插入序踢掉最旧一条，长期没有新目录进来时过期条目会一直挂着（每个 400 项目录带着上百个 base64 图标常驻）；改为先踢过期、再按上限踢最旧，并在每批后台图标推完后刷新保鲜期（打开着的卡片不会被误踢）
+- **浮层渲染不再每次全量重算**：`groupIconMembersById`（分组缩略拼图/徽标）与顶层/成员列表改为 `useMemo`；文件夹卡片收 `folder-icons` 分批事件时先比对本批路径是否命中本目录，**整批不命中就直接返回原状态**（React 直接 bail out）——原来每批都对 400 行做一次遍历 + 建新对象
+- **`elementFromPoint` 每帧最多算一次**：菜单「移出即关」的命中判定原来每条 `mousemove` 都强制一次样式/布局计算（高刷鼠标一秒几百条），改用 rAF 合并，判定结果不变
+- **CSS 合成层与长列表**：`.dock-item` 的常驻 `will-change: transform` 改为仅 `:hover` 时生效（常驻会给每个图标留一个合成层，图标越多显存/内存越高）；文件夹卡片最多 400 行，每行加 `content-visibility: auto` + `contain-intrinsic-size: auto 26px`，屏外行跳过渲染，观感不变
+- **修复的 bug**：
+  - `run-app` 把「进程起来了但退出码非零」当成启动失败，会把 Dock 拽回来（很多应用/启动器带参数启动后立刻以非零码退出）。现在只有 `err.code` 是字符串（真正的 spawn 级失败：ENOENT/EACCES/EPERM/UNKNOWN…）才算失败
+  - `run-app` 打开文件夹分支是 fire-and-forget：目标被删掉时 `shell.openPath` 明明返回了错误串，Dock 却已经收起；改为 await 并在失败时恢复显示
+  - `fillFolderIcons` 先 `sender.send` 再检查 `sender.isDestroyed()`——对已销毁的 WebContents 调 send 本身就会抛错；改为先检查再发，且失效时先删缓存（缓存里的对象**已经被就地改过图标**，留着会让下次 `list-folder` 命中「半截图标」的旧数据而不再补批）
+  - 启动失败恢复分支没调 `markDockShown()`（新增宽限期后会导致刚恢复的 Dock 立刻又能被沉底）
+  - `parse-lnk` / `select-folder` / `pick-icon` 三个系统对话框打开期间，Dock 窗口仍可交互（能再点开菜单，把弹层状态搞乱）；统一收口到 `showOpenDialogSafe()`：`dialogOpen` 标记 + `disabled: mainWindow` 让对话框成为**真模态子窗口**
+  - 连点启动：Dock 隐藏到托盘前用户容易多点几下，每次都会真的 `CreateProcess` 开一个新实例；加 700ms 启动节流 + 失败提示
+  - `describe-paths` 用 `metas.find()` 逐个线性查找（O(n²)），一次拖入上百个文件纯属白烧 CPU；改为建索引
+  - `select-folder` / `describe-paths` 的图标提取结果不再重复读取（一次提取、全条目共用）
+  - 所有 PowerShell 调用补上 `-NonInteractive`（漏掉时脚本遇到交互式提示会挂到超时，白占一个进程），并统一收口到 `runPowerShell()` helper
+  - `startedAtLogin` 是整进程常量，重命名为 `startHiddenAtLogin` 并只在 `whenReady` 用一次，避免后来者再次误用（v1.10.0 那次窗口消失事故的根因就是这个）
+  - 桌面目录 `fs.watch` 在退出时不关闭；新增 `stopDesktopWatch()` 在 `will-quit` 收掉
+- **验证**：`npm run typecheck`、`npm run build` 通过；放大算法等价性 145,200 个采样点逐点比对一致；哨兵持久化往返（旧文件 → 归一化 → 写盘 → 二次往返幂等 → 自定义图标不被误压）由独立脚本逐条断言通过
+
 ### v1.11.0 (2026-09-12)
 
 - **修复：Dock 沉底竞态导致「唤不回来」**（用户实测反馈：首次启动后 Dock 先浮在浏览器上、很快沉下去，此后按 `Alt+Space` 卡住不动，只有最小化/回桌面才恢复）。根因是沉底本身是异步的——`blur` 里先 `setAlwaysOnTop(false)`，再由 PowerShell 调 `SetWindowPos(HWND_BOTTOM)`（每次新起 `powershell.exe` + `Add-Type` 编译 C#，实测滞后 200ms~1s）。这个窗口期内任何「把 Dock 拉回来」的操作都会与迟到的沉底打架，而原实现的补偿只在 PS 回调里判一次 `isAlwaysOnTop()`——**恢复路径恰好会把它设回 `true`，该判断恒真、形同虚设**。修复分四层：

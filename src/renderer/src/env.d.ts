@@ -74,6 +74,8 @@ interface Window {
     scanDesktopFolders: () => Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]>
     checkMissingFolders: (paths: string[]) => Promise<string[]>
     onDesktopChanged: (callback: () => void) => () => void
+    /** 退出前落盘：renderer 的保存有防抖，主进程退出时会推这条事件 */
+    onFlushPendingSave: (callback: () => void) => () => void
     onNavEnter: (callback: () => void) => () => void
     getDesktopIconsHidden: () => Promise<boolean>
     toggleDesktopIcons: () => Promise<boolean>

@@ -13,8 +13,11 @@ let dialogOpen = false
 
 // 单实例锁：防止重复启动（开机自启已在运行、用户又手动启动 exe）时出现两个 Dock。
 // 后启动的实例直接退出，并唤起已有实例的窗口。必须在 app ready 前调用。
+// 开发模式下除了 electron.exe 实例，还可能出现 `electron-vite dev` 自己拉起的实例，
+// 拿不到锁时静默退出会让人以为「点了没反应」，所以留一行日志说明。
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 if (!gotSingleInstanceLock) {
+  console.log('[app] 已有实例在运行，本次启动退出')
   app.quit()
 } else {
   app.on('second-instance', () => {
@@ -35,6 +38,28 @@ if (!gotSingleInstanceLock) {
 // 「显示→被压底→再次显示→再次被压底」的死循环，Alt+Space 永远无法隐藏（v1.7.1 修复）。
 let dockTrayHidden = false
 
+// ─── 沉底节流：绝不在「窗口刚露头」时起 PowerShell ──────────────────────────
+// 实测（本机 PowerShell 5.1）：`powershell.exe -NoProfile -NonInteractive -Command <WinZ 脚本>`
+// 单次 690~785ms CPU 时间——进程启动 ~450ms + .NET 运行时初始化 + Add-Type 编译 C# ~250ms，
+// 每次还要额外占几十 MB 私有内存。而 blur 在以下场景里是「假让位」：显示器/DPI 变化重建
+// 窗口、开机自启那一下、Dock 被唤回后系统把前台还给原来的窗口。这些都不是用户在点别的软件。
+// 所以把「启动/唤回之后 2.5s 内」的 blur 一律忽略：这段时间里 Dock 本来就还没进入
+// 稳定置顶态，沉底要么立刻被恢复逻辑撤销（白跑一个进程），要么把 Dock 压到底。
+let dockShownAt = 0
+const SINK_GRACE_MS = 2500
+
+/** 记录一次「Dock 应该在上面」的显示时机：恢复置顶与显示窗口的所有路径都要调用它。
+ *  它同时是沉底节流的时间基准（见 SINK_GRACE_MS）。 */
+function markDockShown(): void {
+  dockShownAt = Date.now()
+}
+
+/** 现在是否允许沉底：刚显示出来的 2.5s 内不沉（那段时间的 blur 都是焦点抖动）。
+ *  这是**省资源**的守卫，不是正确性守卫——真正的正确性由 sinkSeq 代数保证。 */
+function canSinkNow(): boolean {
+  return Date.now() - dockShownAt > SINK_GRACE_MS
+}
+
 // ─── 沉底/恢复的意图代数（v1.11.0 竞态修复）─────────────────────────────
 // 沉底不是同步的：blur 里先 setAlwaysOnTop(false)，再由 PowerShell（首次 Add-Type
 // 要编译 C#，实测 200ms~1s）异步调 SetWindowPos(HWND_BOTTOM)。这段时间里任何
@@ -52,6 +77,7 @@ let sinkState: { win: BrowserWindow; seq: number } | null = null
  *  Windows 的前台激活锁可能拒绝首次激活（尤其刚从 explorer.exe 交接时），
  *  一次性 moveTop 会被 Explorer 的窗口重排盖掉。 */
 function recoverDock(win: BrowserWindow): void {
+  markDockShown()
   win.setAlwaysOnTop(true)
   win.moveTop()
   setTimeout(() => {
@@ -95,6 +121,7 @@ function toggleWindow(fromKeyboard = false): void {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
     dockTrayHidden = false
     sinkSeq++ // 声明意图：立刻作废在途的沉底（否则它迟到执行会把这扇刚显示的窗钉到底部）
+    markDockShown() // 刚开始显示：接下来 2.5s 内的 blur 都是焦点抖动，不沉底
     mainWindow.show()
     recoverDock(mainWindow)
     mainWindow.focus()
@@ -160,13 +187,31 @@ public static class IconExtractor {
 '@`
 
 
-/** Run PowerShell to extract an icon from a DLL/EXE and return a data: URL. */function extractIcon(iconFile: string, iconIndex: number, size = 256): Promise<string> {
+/** 抽取尺寸：Dock 图标 CSS 里只有 44px（分组拼图 26px、预览卡片 17px），
+ *  256px 的 PNG 每个 2~10KB，而 64px 只有 1/4 左右。base64 数据要同时活在
+ *  主进程状态、IPC 消息、renderer state 与 shortcuts.json 四处字符串里，
+ *  每次保存还要重序列化一遍——尺寸降一档是这里性价比最高的省内存手段。 */
+const ICON_SIZE = 64
+/** 文件夹图标（黄色文件夹）尺寸再小一档：卡片行只有 17px，Dock 上也是 44px 缩放显示 */
+const FOLDER_ICON_SIZE = 48
+
+/** 统一的 PowerShell 调用入口：一次把参数拼装收口，避免每处手写（漏掉
+ *  `-NonInteractive` 时脚本遇到任何交互式提示都会挂到超时，白占一个进程）。 */
+const PS_ARGS = ['-NoProfile', '-NonInteractive', '-Command'] as const
+type PSResult = { err: Error | null; stdout: string; stderr: string }
+function runPowerShell(psScript: string, timeout: number, done: (r: PSResult) => void): void {
+  execFile('powershell', [...PS_ARGS, psScript], { timeout }, (err, stdout, stderr) => {
+    done({ err, stdout, stderr })
+  })
+}
+
+/** Run PowerShell to extract an icon from a DLL/EXE and return a data: URL. */function extractIcon(iconFile: string, iconIndex: number, size = ICON_SIZE): Promise<string> {
   return new Promise((resolve) => {
     const psScript = `${ICON_EXTRACTOR_CS}
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $b64 = [IconExtractor]::GetIconBase64('${iconFile.replace(/'/g, "''")}', ${iconIndex}, ${size})
 Write-Output $b64`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 10000 }, (err, stdout) => {
+    runPowerShell(psScript, 10000, ({ err, stdout }) => {
       if (err || !stdout.trim()) { resolve(''); return }
       const b64 = stdout.trim()
       resolve(b64 ? 'data:image/png;base64,' + b64 : '')
@@ -310,7 +355,7 @@ if (-not $displayName -and -not $isUrl -and $targetPath) {
   isUrl = $isUrl
 } | ConvertTo-Json -Compress
 `
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 10000 }, (err, stdout) => {
+    runPowerShell(psScript, 10000, ({ err, stdout }) => {
       if (err) { reject(err); return }
       try {
         const data = JSON.parse(stdout.trim())
@@ -326,27 +371,34 @@ if (-not $displayName -and -not $isUrl -and $targetPath) {
   })
 }
 
+/** 弹系统文件/文件夹对话框（三个 IPC 共用）。
+ *  ① 对话框打开期间置 dialogOpen + 把 Dock 顶到最前：模态对话框跟随父窗口层级，
+ *     否则会被其他软件压下去；
+ *  ② `disabled: mainWindow` 让对话框成为窗口的**真模态子窗口**——不仅挡住 Dock 的
+ *     输入（避免用户在对话框开着时又点开菜单/右键菜单，把弹层状态搞乱），
+ *     Windows 也会把对话框排进父窗口的 z-order 组，不再需要靠 setAlwaysOnTop 硬顶。 */
+function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
+  dialogOpen = true
+  mainWindow?.setAlwaysOnTop(true)
+  mainWindow?.moveTop()
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+  return dialog
+    .showOpenDialog(parent!, { ...options, ...(parent ? { disabled: true } : {}) })
+    .finally(() => { dialogOpen = false })
+}
+
 ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
   if (!filePath) {
-    // 对话框打开期间保持 Dock 置顶（模态对话框跟随父窗口层级，否则会被压到其他软件下面）
-    dialogOpen = true
-    mainWindow?.setAlwaysOnTop(true)
-    mainWindow?.moveTop()
-    let result: Electron.OpenDialogReturnValue
-    try {
-      result = await dialog.showOpenDialog(mainWindow!, {
-        title: '选择快捷方式文件',
-        defaultPath: DEFAULT_DIALOG_PATH,
-        filters: [
-          { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
-          { name: '全部文件', extensions: ['*'] }
-        ],
-        // openFile + multiSelections：Win32 原生（IFileOpenDialog）支持多选
-        properties: ['openFile', 'multiSelections']
-      })
-    } finally {
-      dialogOpen = false
-    }
+    const result = await showOpenDialogSafe({
+      title: '选择快捷方式文件',
+      defaultPath: DEFAULT_DIALOG_PATH,
+      filters: [
+        { name: '所有快捷方式', extensions: ['lnk', 'url', 'pif'] },
+        { name: '全部文件', extensions: ['*'] }
+      ],
+      // openFile + multiSelections：Win32 原生（IFileOpenDialog）支持多选
+      properties: ['openFile', 'multiSelections']
+    })
     if (result.canceled || result.filePaths.length === 0) return []
     // 多选：逐个解析快捷方式，单个解析失败不影响其余
     const parsed = await Promise.all(
@@ -523,6 +575,10 @@ ipcMain.handle('load-shortcuts', () => {
     return raw.map((entry) => {
       if (!entry || typeof entry !== 'object') return entry
       const e = entry as Record<string, unknown>
+      // 记住这份文件夹图标：renderer 传入哨兵时要靠它还原成真实 data URL
+      if (typeof e.iconDataUrl === 'string' && e.iconDataUrl.startsWith('data:image/') && e.isFolder) {
+        lastFolderIconDataUrl = e.iconDataUrl
+      }
       // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
       if (e.separator) {
         const { separator: _legacy, ...rest } = e
@@ -535,34 +591,55 @@ ipcMain.handle('load-shortcuts', () => {
   }
 })
 
+/** renderer 用哨兵串代替「共享的文件夹图标」以省内存（N 个文件夹只留一份 base64）。
+ *  磁盘上仍写真实 data URL —— 文件格式与旧版本完全一致，可读、可手改、可回退。 */
+const FOLDER_ICON_SENTINEL = 'ql-shared-folder-icon'
+/** 最近一次写盘时的「真实文件夹图标」，用来回落哨兵（renderer 一定会先写一次带真图标的版本） */
+let lastFolderIconDataUrl = ''
+
+function writeShortcuts(data: unknown[]): void {
+  const out: unknown[] = []
+  for (const entry of data) {
+    if (!entry || typeof entry !== 'object') { out.push(entry); continue }
+    const e = entry as Record<string, unknown>
+    if (e.iconDataUrl === FOLDER_ICON_SENTINEL) {
+      out.push({ ...e, iconDataUrl: lastFolderIconDataUrl })
+      continue
+    }
+    if (typeof e.iconDataUrl === 'string' && e.iconDataUrl.startsWith('data:image/') && e.isFolder) {
+      lastFolderIconDataUrl = e.iconDataUrl
+    }
+    out.push(entry)
+  }
+  writeFileSync(shortcutsPath, JSON.stringify(out), 'utf-8')
+}
+
 ipcMain.handle('save-shortcuts', (_event, data: unknown) => {
   if (!Array.isArray(data)) return
-  try { writeFileSync(shortcutsPath, JSON.stringify(data), 'utf-8') } catch {}
+  try { writeShortcuts(data) } catch {}
 })
 
 // ─── IPC: select a folder ───────────────────────────────────────────────────
 
 ipcMain.handle('select-folder', async () => {
-  dialogOpen = true
-  mainWindow?.setAlwaysOnTop(true)
-  mainWindow?.moveTop()
-  let result: Electron.OpenDialogReturnValue
-  try {
-    result = await dialog.showOpenDialog(mainWindow!, {
-      title: '选择文件夹',
-      defaultPath: DEFAULT_DIALOG_PATH,
-      // multiSelections + openDirectory：Win32 原生（IFileOpenDialog）支持文件夹多选
-      properties: ['openDirectory', 'multiSelections']
-    })
-  } finally {
-    dialogOpen = false
-  }
+  const result = await showOpenDialogSafe({
+    title: '选择文件夹',
+    defaultPath: DEFAULT_DIALOG_PATH,
+    // multiSelections + openDirectory：Win32 原生（IFileOpenDialog）支持文件夹多选
+    properties: ['openDirectory', 'multiSelections']
+  })
   if (result.canceled || result.filePaths.length === 0) return []
 
-  // 每个选中的文件夹提取系统黄色文件夹图标
-  return Promise.all(result.filePaths.map(async (folderPath) => {
-    const iconDataUrl = await extractIcon('C:\\Windows\\System32\\shell32.dll', 4, 256)
-    return { path: folderPath, name: basename(folderPath), iconDataUrl }
+  // 每个选中的文件夹提取系统黄色文件夹图标。图标对所有文件夹都是同一个，
+  // 所以复用常驻的那一枚（ensureFolderIcon 内部只提取一次）再让所有条目共用——
+  // 原来是在 map 里逐个 await extractIcon，一次选 20 个文件夹就要起 20 个
+  // powershell.exe（每个 ~500ms、几十 MB 内存）
+  await ensureFolderIcon()
+  const sharedIcon = folderIcon ?? ''
+  return result.filePaths.map((folderPath) => ({
+    path: folderPath,
+    name: basename(folderPath),
+    iconDataUrl: sharedIcon
   }))
 })
 
@@ -601,9 +678,9 @@ if (Test-Path -LiteralPath $desktop) {
 }
 
 # 2) 文件夹共享图标：黄色文件夹 → 通用文档兜底（只提取一次）
-$folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, 256)
+$folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, ${FOLDER_ICON_SIZE})
 if (-not $folderIcon) {
-  $folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256)
+  $folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, ${FOLDER_ICON_SIZE})
 }
 
 # 3) 系统位置：此电脑 / 回收站（注册表 CLSID 图标，失败逐级回退）
@@ -626,7 +703,7 @@ foreach ($sp in $specials) {
       $iconIdx = 0
     }
   }
-  $iconB64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, 256)
+  $iconB64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, ${FOLDER_ICON_SIZE})
   if (-not $iconB64) { $iconB64 = $folderIcon }
   $results += @{ path = $sp.shell; name = $sp.name; specialType = $sp.type; iconBase64 = $iconB64 }
 }
@@ -639,7 +716,7 @@ foreach ($r in $results) {
 if ($results.Count -gt 0) {
   $results | ConvertTo-Json -Compress -Depth 3
 }`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 20000 }, (err, stdout) => {
+    runPowerShell(psScript, 20000, ({ err, stdout }) => {
       if (err || !stdout.trim()) { resolve([]); return }
       try {
         const items: { path: string; name: string; iconBase64?: string; specialType?: 'this-pc' | 'recycle-bin' }[] =
@@ -687,6 +764,14 @@ function startDesktopWatch(): void {
   } catch (err) {
     console.error('[desktop-watch] failed to start:', err)
   }
+}
+
+/** 收掉桌面监听与在途的 debounce 定时器。非持久化时留着 FSWatcher 只会在退出阶段
+ *  多触发一次 flush 前的回调（此时窗口可能已经销毁），显式关闭更干净。 */
+function stopDesktopWatch(): void {
+  if (desktopWatchTimer) { clearTimeout(desktopWatchTimer); desktopWatchTimer = null }
+  try { desktopWatcher?.close() } catch {}
+  desktopWatcher = null
 }
 
 // ─── IPC: hide/show desktop icons ───────────────────────────────────────────
@@ -744,7 +829,7 @@ if ($lv -eq [IntPtr]::Zero) {
 } else {
   if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
 }`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err, stdout) => {
+    runPowerShell(psScript, 5000, ({ err, stdout }) => {
       if (err || !stdout.trim()) { resolve(false); return }
       resolve(stdout.trim() === '1')
     })
@@ -770,7 +855,7 @@ if ($dv -eq [IntPtr]::Zero) {
     if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
   }
 }`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 5000 }, (err, stdout, stderr) => {
+    runPowerShell(psScript, 5000, ({ err, stdout, stderr }) => {
       if (err) {
         console.error('[desktop-icons] PS error:', err.message, '| stderr:', stderr?.slice(0, 300))
         resolve(false)
@@ -810,8 +895,10 @@ ipcMain.handle('get-auto-start', () => getAutoStartSetting())
 ipcMain.handle('set-auto-start', (_event, enabled: boolean) => setAutoStartSetting(!!enabled))
 
 // 通过 Run 登录项（--autostart 参数）启动时，窗口默认隐藏到托盘，不打扰登录后的桌面；
-// Alt+Space / 托盘图标随时唤出
-const startedAtLogin = process.argv.includes('--autostart')
+// Alt+Space / 托盘图标随时唤出。
+// 这里只在 whenReady 处读一次，不导出成模块常量：整进程常量会让「切位置重建窗口」
+// 也以为自己是开机自启（dockTrayHidden 直接置真 → 新窗口永远不显示）。
+const startHiddenAtLogin = process.argv.includes('--autostart')
 
 // ─── IPC: launch an executable, URL, shell location, or open a folder ───────
 
@@ -844,6 +931,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // 意图状态判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
   if (mainWindow && !mainWindow.isDestroyed()) {
     dockTrayHidden = true
+    sinkSeq++ // 隐藏即作废在途沉底（hide() 引发的 blur 不该再起 PowerShell）
     mainWindow.hide()
   }
 
@@ -853,10 +941,16 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     return true
   }
 
-  // Open folder in Explorer
+  // Open folder in Explorer：与 open-path 一致，await 之后才知道有没有打开成功
+  // （原来直接 fire-and-forget，目标被删掉时用户看到的是「Dock 消失、什么都没打开」）
   try {
     if (statSync(targetPath).isDirectory()) {
-      shell.openPath(targetPath)
+      const msg = await shell.openPath(targetPath)
+      if (msg) {
+        console.error('[launcher] openPath (folder) failed:', msg)
+        restoreDockAfterFailedLaunch()
+        return false
+      }
       return true
     }
   } catch {
@@ -872,14 +966,16 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // Executable
   execFile(targetPath, args ? splitArgs(args) : [], { cwd: workingDir || undefined }, (err) => {
     if (!err) return
-    // 启动失败就把 Dock 还回来：点图标时已经先隐藏到托盘了，若目标已被删除/移动（ENOENT）
-    // 或没有关联程序，用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      dockTrayHidden = false
-      sinkSeq++ // 作废在途沉底：Dock 被还给用户后不能再被压到底部
-      mainWindow.show()
-      recoverDock(mainWindow)
+    // 只有「子进程根本没起来」才算启动失败。err.code 是字符串时才是 spawn 级失败
+    // （ENOENT / EACCES / EPERM / UNKNOWN…）；数字则是进程正常起来了、只是退出码非零
+    // ——那种情况程序确实启动了，把 Dock 拽回来纯属帮倒忙
+    // （很多应用/启动器带参数启动后会立刻以非零码退出）。
+    const spawnFailed = typeof err.code === 'string'
+    if (!spawnFailed) {
+      console.log(`[launcher] 目标已启动但退出码非零 (${err.code}): ${targetPath}`)
+      return
     }
+    restoreDockAfterFailedLaunch()
     // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
     // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
     // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
@@ -895,24 +991,27 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   return true
 })
 
+/** 启动失败后把 Dock 还给用户：点图标时已经先隐藏到托盘，若不还回来，
+ *  用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回。 */
+function restoreDockAfterFailedLaunch(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  dockTrayHidden = false
+  sinkSeq++ // 作废在途沉底：Dock 被还给用户后不能再被压到底部
+  markDockShown()
+  mainWindow.show()
+  recoverDock(mainWindow)
+}
+
 // ─── IPC: 右键菜单扩展（编辑图标 / 管理员运行 / 打开位置 / 复制路径） ───────
 
 // 为条目更换图标：选择 exe/dll/ico → SHDefExtractIcon 提取；png/jpg 直接读文件转 dataURL
 ipcMain.handle('pick-icon', async () => {
-  dialogOpen = true
-  mainWindow?.setAlwaysOnTop(true)
-  mainWindow?.moveTop()
-  let result: Electron.OpenDialogReturnValue
-  try {
-    result = await dialog.showOpenDialog(mainWindow!, {
-      title: '选择图标（exe / dll / ico / png）',
-      defaultPath: DEFAULT_DIALOG_PATH,
-      filters: [{ name: '图标文件', extensions: ['exe', 'dll', 'ico', 'png', 'jpg'] }],
-      properties: ['openFile']
-    })
-  } finally {
-    dialogOpen = false
-  }
+  const result = await showOpenDialogSafe({
+    title: '选择图标（exe / dll / ico / png）',
+    defaultPath: DEFAULT_DIALOG_PATH,
+    filters: [{ name: '图标文件', extensions: ['exe', 'dll', 'ico', 'png', 'jpg'] }],
+    properties: ['openFile']
+  })
   const file = result.canceled ? '' : result.filePaths[0]
   if (!file) return null
   if (/\.(png|jpe?g)$/i.test(file)) {
@@ -922,7 +1021,7 @@ ipcMain.handle('pick-icon', async () => {
       return { path: file, iconDataUrl: `data:${mime};base64,${b64}` }
     } catch { return null }
   }
-  const iconDataUrl = await extractIcon(file, 0, 256)
+  const iconDataUrl = await extractIcon(file, 0, ICON_SIZE)
   return iconDataUrl ? { path: file, iconDataUrl } : null
 })
 
@@ -964,7 +1063,7 @@ foreach ($p in @(${psList})) {
   $out += @{ path = $p; name = $name; iconBase64 = $b64 }
 }
 if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
-    execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 15000 }, (err, stdout) => {
+    runPowerShell(psScript, 15000, ({ err, stdout }) => {
       if (err || !stdout.trim()) { resolve([]); return }
       try {
         const parsed = JSON.parse(stdout.trim())
@@ -1014,8 +1113,11 @@ ipcMain.handle('describe-paths', async (_e, paths: unknown) => {
 
   if (execIdx.length > 0) {
     const metas = await describeExecutables(execIdx.map((i) => list[i]))
+    // 按小写路径建索引再查：原来是每个条目 metas.find(...) 线性扫一遍（O(n²)），
+    // 一次拖入上百个文件时纯属白烧 CPU
+    const byPath = new Map(metas.map((m) => [m.path.toLowerCase(), m]))
     for (const i of execIdx) {
-      const m = metas.find((x) => x.path.toLowerCase() === list[i].toLowerCase())
+      const m = byPath.get(list[i].toLowerCase())
       if (!m) { rejected.push(list[i]); continue }
       slots[i] = {
         targetPath: list[i],
@@ -1060,7 +1162,7 @@ foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
   $out += @{ name = $d.Name.TrimEnd('\\'); label = $label; type = $type; format = $format; total = $total; free = $free; ready = $ready }
 }
 if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
-  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 8000 }, (err, stdout) => {
+  runPowerShell(psScript, 8000, ({ err, stdout }) => {
     if (err || !stdout.trim()) { resolve([]); return }
     try {
       const parsed = JSON.parse(stdout.trim())
@@ -1121,6 +1223,23 @@ const folderListCache = new Map<string, { at: number; data: FolderListing }>()
 /** 正在枚举中的目录（渲染端会「悬停预取 + 卡片打开」请求两次，靠它复用同一个 Promise） */
 const folderListPending = new Map<string, Promise<FolderListing>>()
 
+/** 目录项批量处理的并发上限：一个 400 项的目录如果无脑 Promise.all(stat)，
+ *  会同时把 400 个 fs 请求压进 libuv 线程池（默认只有 4 个线程），
+ *  排队项连同它们的闭包一起堆在内存里，主进程内存曲线会明显起尖。
+ *  按固定并发跑完再看下一个，总耗时几乎不变，峰值请求数却降一个量级。 */
+const FS_CONCURRENCY = 16
+async function forEachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = cursor++
+      if (i >= items.length) return
+      await work(items[i])
+    }
+  })
+  await Promise.all(workers)
+}
+
 // 目录统一用标准黄色文件夹图标（shell32 index 4，与 Dock 上文件夹条目同源）。
 // 不能对目录用 app.getFileIcon：实测它返回的是错图标（dist/node_modules 变成「磁盘」图标、
 // .git/.dsh-* 变成白纸），只有对文件才是正确的 shell 类型图标。
@@ -1130,12 +1249,32 @@ let folderIconLoading: Promise<void> | null = null
 function ensureFolderIcon(): Promise<void> {
   if (folderIcon !== null) return Promise.resolve()
   if (!folderIconLoading) {
-    // 64px 足够（卡片行只显示 17px），payload 比 256px 小一个量级
-    folderIconLoading = extractIcon('C:\\Windows\\System32\\shell32.dll', 4, 64)
+    // 尺寸跟 FOLDER_ICON_SIZE 一致（卡片行只显示 17px），payload 比 256px 小一个量级
+    folderIconLoading = extractIcon('C:\\Windows\\System32\\shell32.dll', 4, FOLDER_ICON_SIZE)
       .then((url) => { folderIcon = url || '' })
       .catch(() => { folderIcon = '' })
   }
   return folderIconLoading
+}
+
+/** 写入目录列表缓存。缓存里存的是**已经填过图标的对象引用**（分批补图标是就地改这些
+ *  对象），所以容量控制必须同时做两件事：① 先踢掉已过 TTL 的条目（卡片的后台补图标
+ *  每推一批都会刷新 at，所以「打开着的卡片」不会被误踢）；② 仍然超出上限时按插入序
+ *  踢掉最旧的一条。原来的实现只做 ②，一旦长期没有新目录进来，过期条目会一直挂着
+ *  ——每个 400 项目录带着上百个 base64 图标常驻内存，纯属白占。 */
+function putFolderCache(dir: string, data: FolderListing): void {
+  if (folderListCache.size >= FOLDER_CACHE_MAX) {
+    const now = Date.now()
+    for (const [key, entry] of folderListCache) {
+      if (now - entry.at >= FOLDER_LIST_TTL) folderListCache.delete(key)
+    }
+    while (folderListCache.size >= FOLDER_CACHE_MAX) {
+      const oldest = folderListCache.keys().next().value
+      if (oldest === undefined) break
+      folderListCache.delete(oldest)
+    }
+  }
+  folderListCache.set(dir, { at: Date.now(), data })
 }
 
 ipcMain.handle('list-folder', async (event, dir: unknown) => {
@@ -1197,11 +1336,12 @@ ipcMain.handle('list-folder', async (event, dir: unknown) => {
       iconDataUrl: '' // 由下面的首批提取 / 后台分批填入
     }))
 
-    // 文件大小：只 stat 文件（目录不递归），单个 stat 失败不影响整卡
-    await Promise.all(items.map(async (it) => {
+    // 文件大小：只 stat 文件（目录不递归），单个 stat 失败不影响整卡。
+    // 用受限并发跑（见 FS_CONCURRENCY），别把 400 个 stat 一次性压进线程池
+    await forEachLimited(items, FS_CONCURRENCY, async (it) => {
       if (it.isDir) return
       try { it.size = (await fsp.stat(it.path)).size } catch { it.size = -1 }
-    }))
+    })
 
     const data: FolderListing = {
       path: dir,
@@ -1215,15 +1355,11 @@ ipcMain.handle('list-folder', async (event, dir: unknown) => {
     // 首批图标（卡片首屏可见的前十几行）**在返回前就填好**——配合 renderer 的悬停预取
     // （鼠标刚碰到图标就开始列目录），卡片弹出时图标已经就位，看不到「先占位块再换」的过程。
     // 目录用缓存的标准黄色文件夹图标（不 await：预热没完成时先留空，由后台补批填上）
-    await Promise.all(items.slice(0, FOLDER_ICON_INLINE).map(async (it) => {
+    await forEachLimited(items.slice(0, FOLDER_ICON_INLINE), 8, async (it) => {
       it.iconDataUrl = it.isDir ? (folderIcon ?? '') : await fileIconDataUrl(it.path)
-    }))
+    })
 
-    if (folderListCache.size >= FOLDER_CACHE_MAX) {
-      const oldest = folderListCache.keys().next().value
-      if (oldest !== undefined) folderListCache.delete(oldest)
-    }
-    folderListCache.set(dir, { at: Date.now(), data })
+    putFolderCache(dir, data)
 
     // 其余图标后台分批补（每批推一次事件，卡片逐批换），不阻塞卡片出现
     void fillFolderIcons(items, dir, event.sender, data)
@@ -1267,14 +1403,22 @@ async function fillFolderIcons(
   }
   for (let i = 0; i < targets.length; i += FOLDER_ICON_BATCH) {
     const batch = targets.slice(i, i + FOLDER_ICON_BATCH)
-    await Promise.all(batch.map(async (it) => {
+    // 每批同样走受限并发：一批 24 个 getFileIcon 并发是安全的，但配上 stat 的
+    // 线程池占用时仍要留出余量，避免与用户其他操作抢 I/O
+    await forEachLimited(batch, 8, async (it) => {
       it.iconDataUrl = it.isDir ? (folderIcon ?? '') : await fileIconDataUrl(it.path)
-    }))
+    })
+    // sender 失效（窗口被重建/页面重载）就先删缓存再返回：缓存里的对象**已经被就地
+    // 改了图标**，留着它会让下一次 list-folder 命中「半截图标」的旧数据而不再补批。
+    // 原实现是「先 send 再检查」，对已销毁的 WebContents 调 send 本身就会抛错。
     if (sender.isDestroyed()) { dropCacheIfOurs(); return }
     const icons: Record<string, string> = {}
     for (const it of batch) if (it.iconDataUrl) icons[it.path] = it.iconDataUrl
     if (Object.keys(icons).length === 0) continue
     sender.send('folder-icons', { path: dir, icons })
+    // 卡片还开着就继续刷新保鲜期（每批一次），这样第二次悬停仍能命中缓存
+    const entry = folderListCache.get(dir)
+    if (entry?.data === data) entry.at = Date.now()
   }
 }
 
@@ -1294,6 +1438,7 @@ ipcMain.handle('open-path', async (_e, targetPath: unknown) => {
   // 与点 Dock 图标一致：打开成功后 Dock 让出桌面
   if (mainWindow && !mainWindow.isDestroyed()) {
     dockTrayHidden = true
+    sinkSeq++ // 隐藏即作废在途沉底
     mainWindow.hide()
   }
   return true
@@ -1311,12 +1456,13 @@ ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir
   if (!targetPath) return false
   if (mainWindow && !mainWindow.isDestroyed()) {
     dockTrayHidden = true
+    sinkSeq++ // 隐藏即作废在途沉底
     mainWindow.hide()
   }
   const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Start-Process -FilePath '${targetPath.replace(/'/g, "''")}' -ArgumentList '${(args || '').replace(/'/g, "''")}' -WorkingDirectory '${(workingDir || '').replace(/'/g, "''")}' -Verb RunAs`
-  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 10000 }, (err) => {
+  runPowerShell(psScript, 10000, ({ err }) => {
     if (err) console.error('[launcher] run-as-admin failed:', err.message)
   })
   return true
@@ -1410,7 +1556,7 @@ public static class WinZ {
     sinkState?.win === win && sinkSeq === startSeq &&
     !win.isDestroyed() && win.isVisible() && !win.isFocused() && !dockTrayHidden
 
-  execFile('powershell', ['-NoProfile', '-Command', psScript], { timeout: 4000 }, (err) => {
+  runPowerShell(psScript, 4000, ({ err }) => {
     if (sinkState?.win === win) sinkState = null
     if (err) {
       console.error('[dock] sendToBottom failed:', err.message)
@@ -1470,10 +1616,16 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     // 于是切位置重建出来的窗口一律不显示——Dock 会直接消失进托盘。
     if (!startHidden) {
       mainWindow?.show()
+      markDockShown() // 启动/重建后刚显示：这段时间的 blur 是焦点抖动，不触发沉底
       // 首次显示后核实一次 z-order：启动瞬间终端/资源管理器正在抢前台，
       // 只依赖 show() + focus() 有概率停在「可见但不在最前」（v1.11.0 自愈）
       if (mainWindow && !mainWindow.isDestroyed()) verifyDockOnTop(mainWindow, sinkSeq, 0)
-    } else dockTrayHidden = true
+    } else {
+      dockTrayHidden = true
+      // 收在托盘里：不能算「刚显示过」，否则之后第一次唤回+点击别的软件会落在
+      // 宽限期里被吞掉（唤醒路径自己会重新 markDockShown，见 toggleWindow）
+      dockShownAt = 0
+    }
   })
 
   // Hide to tray instead of closing
@@ -1498,18 +1650,23 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return
     // 已经收在托盘里：不需要为一次由隐藏引起的 blur 再起一个 PowerShell 进程
     if (dockTrayHidden) return
+    // 刚显示出来（启动 / 重建窗口 / Alt+Space 唤回）：焦点抖动一律不沉底。
+    // 这一条直接省掉一个 700ms 的 powershell.exe（见 SINK_GRACE_MS 注释）
+    if (!canSinkNow()) return
     const startSeq = sinkSeq
-    // blur 与「用户真的点了别的软件」之间存在噪声：首次启动、run-app 隐藏、切换停靠位置
-    // 重建窗口等都会伴随一次焦点抖动。延迟一拍再确认——期间若焦点已回到 Dock
-    // （或用户按了 Alt+Space 唤回、窗口被隐藏），就整条取消。
-    // 这一拍也是要给「真的点了别的软件」留出判定窗口：用户点击别的窗口后
-    // 焦点不会在 120ms 内回到 Dock，所以正常让位行为不受影响。
+    // blur 与「用户真的点了别的软件」之间存在噪声：首次启动、切换停靠位置重建窗口等
+    // 都会伴随一次焦点抖动。延迟一拍再确认——期间若焦点已回到 Dock（或用户按了
+    // Alt+Space 唤回、窗口被隐藏），就整条取消。这一拍也是留给「真的点了别的软件」
+    // 的判定窗口：用户点击别的窗口后焦点不会在 120ms 内回到 Dock。
     setTimeout(() => {
       if (sinkSeq !== startSeq) return
-      if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return
-      if (dockTrayHidden || mainWindow.isFocused()) return
-      mainWindow.setAlwaysOnTop(false)
-      sendToBottom(mainWindow)
+      const win = mainWindow
+      // 复核时把「窗口还在、可见、没收托盘、没拿到焦点、不在宽限期」一次判完：
+      // 任何一条不满足都说明这次让位已经过时，不能白起一个 PowerShell 进程
+      if (!win || win.isDestroyed() || !win.isVisible()) return
+      if (dockTrayHidden || win.isFocused() || !canSinkNow()) return
+      win.setAlwaysOnTop(false)
+      sendToBottom(win)
     }, 120)
   })
 
@@ -1538,7 +1695,7 @@ app.whenReady().then(() => {
   if (!gotSingleInstanceLock) return
 
   // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
-  createWindow(readDockEdge(), startedAtLogin)
+  createWindow(readDockEdge(), startHiddenAtLogin)
   // 显示器参数变化后重新归位（screen 模块必须等 ready，所以在这里注册）
   screen.on('display-metrics-changed', reapplyDockEdgeOnDisplayChange)
   screen.on('display-added', reapplyDockEdgeOnDisplayChange)
@@ -1601,8 +1758,24 @@ app.whenReady().then(() => {
   })
 })
 
+// 退出前落盘：renderer 的保存是 400ms 防抖的，退出那一刻可能还有一次改动没写盘。
+// 用 before-quit（窗口还活着、IPC 双向可用）推一条 flush-pending-save，并给 200ms
+// 让 renderer 的 save-shortcuts 回来 —— 只延迟一次，quit 重入直接放行。
+let quitFlushed = false
+app.on('before-quit', (event) => {
+  if (quitFlushed || !forceQuit) return
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  quitFlushed = true
+  event.preventDefault()
+  try { mainWindow.webContents.send('flush-pending-save') } catch {}
+  // 200ms 足够 renderer 把 invoke('save-shortcuts') 发回来（同步落盘、无异步等待）；
+  // 之后再次 quit，quitFlushed 已置位，直接放行
+  setTimeout(() => app.quit(), 200)
+})
+
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
+  stopDesktopWatch()
 })
 
 app.on('window-all-closed', () => {

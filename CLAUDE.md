@@ -44,7 +44,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
   1. `blur` 事件（点击其他窗口失去焦点）→ **延迟 120ms 复核**再 `setAlwaysOnTop(false)` + `sendToBottom()`：这一拍是为了滤掉启动/重建窗口等场景的焦点抖动，期间若焦点已回到 Dock、窗口被隐藏或 `sinkSeq` 代际变了就整条取消（点击其他窗口后焦点不会在 120ms 内回来，正常让位不受影响）；**窗口已隐藏（`isVisible()` 为 false）或已收在托盘（`dockTrayHidden`）时直接跳过**——不为一次由隐藏引起的 blur 白跑一个 PowerShell 进程
   2. `run-app` 启动目标后**自动隐藏到托盘**（`mainWindow.hide()`，不退出进程）——用户点开图标后 Dock 彻底让出桌面；托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回（`toggleWindow` 按 `isVisible()` 判断，隐藏状态下任一唤回路径均显示并恢复置顶）
-- **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），`parse-lnk` / `select-folder` 弹系统文件对话框前置 `true`（并 `setAlwaysOnTop(true)` + `moveTop()` 保持置顶），`try/finally` 归零。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
+- **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），三个弹对话框的 IPC（`parse-lnk` / `select-folder` / `pick-icon`）统一走 **`showOpenDialogSafe()`**：置 `dialogOpen`、把 Dock 顶到最前，并传 `disabled: mainWindow` 让对话框成为**真模态子窗口**（挡住 Dock 输入，避免用户在对话框开着时又点开菜单把弹层状态搞乱；Windows 也会把对话框排进父窗口的 z-order 组）。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
 - **恢复置顶（v1.11.0 起统一走 `recoverDock()`）**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）、`toggleWindow` 显示分支、启动失败恢复、`second-instance` 都调它——置顶 + `moveTop` + 120ms 后再补一次，末尾接 `verifyDockOnTop()` 自愈巡检
 - **沉底与恢复的竞态防护（v1.11.0，改这块必须先读）**：沉底是**异步**的（新起 `powershell.exe` + `Add-Type` 编译 C#，实测滞后 200ms~1s），这段时间里任何「拉回」操作都会与它打架。防护分四层：① 单调递增的 `sinkSeq`——`toggleWindow` 的**显示与隐藏两条分支**、`dock-pointer`、`focus`、启动失败恢复、`second-instance` 全部 `++`，在途沉底在启动前与回调里各比对一次，代际不符即整条放弃；② 同一窗口的沉底任务**串行化**（已有任务在跑时 180ms 后重试，不再起第二个进程）；③ 迟到的 `SetWindowPos(HWND_BOTTOM)` 补偿**不能再用 `isAlwaysOnTop()` 判断**——恢复路径会把它设回 `true`，原写法恒真、形同虚设；④ `verifyDockOnTop()` 自愈巡检：`moveTop()` 只把窗口提到「同一组内的顶部」、并不重新断言置顶位（实测恢复后 `WS_EX_TOPMOST` 有约 300ms 为 `False`），所以「窗口可见 + 未收托盘 + `sinkSeq` 未变」却没拿到焦点时补一次置顶断言，最多 4 次
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
@@ -53,6 +53,12 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **显示器参数变化**：`screen.on('display-metrics-changed' | 'display-added' | 'display-removed', reapplyDockEdgeOnDisplayChange)` 重新套用当前档位。**这三行必须写在 `app.whenReady()` 里**——`screen` 模块在 `ready` 之前使用会抛 `The 'screen' module can't be used before the app 'ready' event`，直接把启动打崩（曾发生过）
 - Dock 栏贴窗口的贴边侧：`bottom`/`middle` 布局里玻璃条在窗口下沿（`middle` 只是窗口整体悬在屏幕中间），`top` 布局里玻璃条贴窗口上沿、整套几何垂直镜像（`.app[data-edge='top']` 里改玻璃条位置、`.dock-inner` 的 70px 透明放大区从上改到下、`.dock-item` 的 `transform-origin` 改 `center top`、悬浮标签挂到图标下方、菜单/卡片/面板的浮层锚点由 JS 改到玻璃条下沿外侧）。毛玻璃背景是**独立层 `.dock-bg`**：只覆盖图标区（图标垂直居中），`blur(36px) saturate(1.7)`、圆角 24px、边框 + 阴影
 - 图标排列在 Dock 内，鼠标悬停放大效果（JS 驱动，最大放大 1.4×，上浮 8px，影响半径 140px）。放大图标从背景顶部**透明区顶出**（类似 macOS）——`.dock-inner` 顶部有 **70px** 透明 padding 作为放大+悬浮标签显示区，否则 `overflow` 会把放大溢出裁掉（`data-edge='top'` 时这 70px 挪到下方，放大向下顶出）
+- **悬停放大走几何缓存，绝不逐图标读布局（v1.12.0，改这块必须先读）**：原实现每个 `mousemove` 都对每个图标 `getBoundingClientRect()` 再写 inline `transform`，读-写交替触发强制同步布局（layout thrashing），是「鼠标划过 Dock 卡顿」的主因。现在：
+  - `measureCenters(refs, container)` 把各图标中心点量成**升序数组**（`dockCenters` / `panelCenters`），只在布局变化时重算一次
+  - `magnifyAt()` 在升序数组上**二分**定位光标，再只遍历左右各 140px 内的那一段连续区间；`applyZoom()` 用 `WeakMap` 记住上次写入的缩放值，**值没变就完全不碰 DOM**。实测 60 个图标时单帧最多触及 6 个（原来固定 60 个）；新旧算法在 145,200 个采样点上逐点比对完全一致
+  - **失效有两条通道，缺一不可**：① 显式 `useLayoutEffect`（依赖 `apps.length` / `theme` / `edge` / `openGroupId`）；② `ResizeObserver` 挂在 **ref 回调**里（`useEffect` 在 ref 回调之后才跑，挂载帧会漏掉）。**不能只靠 `ResizeObserver`**——图标增删只改变内容排布、容器盒子尺寸不一定变，观察者不会回调，缓存会留在旧中心点；另外 `ResizeObserver` 挂上去**没有初始通知**，必须在挂载时显式补测一次，否则启动后第一次悬停没有放大效果
+  - `calcDropIndex` 复用同一份缓存（落点判定本来只有「最近两个图标之间」的粒度，放大导致的几像素偏差不影响结果）
+- **主 Dock 的 `mousemove` 不做整树重渲染**：`handleDockMouseMove` / `handlePanelMouseMove` 用 `navIdRef` 判断是否真的需要 `setNavId(null)`——原来无条件每次移动都 setState，会让整个 `App`（全部图标 + 标签 + 分组拼图 + 面板成员）跟着重渲染
 - **标签悬停显示（三主题一致）**：`.dock-label` 默认隐藏，鼠标悬停图标时淡入（0.16s）；标签**绝对定位悬浮在图标上方**（macOS 式，不占图标下方布局行——玻璃条紧凑贴合图标），完整显示名称不截断；每主题一个药丸底衬（`--label-pill-bg`：黑夜=深藏青 `rgba(12,16,28,0.55)` 白字、白天=浅白玻璃 `rgba(255,255,255,0.75)` 深字、透明=中性深灰 `rgba(0,0,0,0.30)` 白字）；「+」添加按钮不显示悬浮标签
 - 图标放不下时**横向滚动**：`.dock-inner` 是滚动容器（`overflow-x: auto`，隐藏滚动条），滚轮/触控板转水平滚动（原生 `addEventListener('wheel', …, { passive: false })`——React 在 root 上以 passive 注册 wheel，`onWheel` 里 `preventDefault()` 是空操作）；两端 `dock-edge` 渐隐遮罩提示「还有更多」，仅可滚动侧显示（`scrollState`）
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）。**落点换算**：`calcDropIndex` 返回的是「顶层图标」下标（`iconRefs` 里只有顶层条目 + 分隔线），而 `apps` 是扁平数组（含分组成员），所以重排与拖入添加都必须用 `topAnchorId(list, idx)` 先换成锚点 id 再取扁平插入点——直接把顶层下标当扁平下标用会让插入位置偏「成员数」个槽位
@@ -91,8 +97,9 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `check-folders-missing` | Renderer → Main | 检查哪些文件夹路径已不存在（主进程纯 `fs.existsSync`，无 PowerShell），返回不存在的子集——用于清理被删除的桌面文件夹条目 |
 | `desktop-changed` | Main → Renderer | 主进程 `fs.watch` 桌面目录（非递归，debounce 1s）后推送的事件（`webContents.send`，非 handle/invoke）；renderer 收到后重新执行「清理缺失 + 扫描合并」，桌面文件夹增删实时同步到 Dock |
 | `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹；URL 判定正则 `/^(https?\|ftp\|steam):\/\/\|^mailto:/i`；启动后 Dock 自动隐藏到托盘（`blur` 沉底逻辑对不可见窗口跳过——`hide()` 触发的 blur 不再白跑一次 PowerShell 沉底） |
-| `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
-| `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json` |
+| `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据（顺带记住其中的真实文件夹图标，供哨兵还原） |
+| `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json`。renderer 传的文件夹条目可能带**哨兵** `ql-shared-folder-icon`，主进程 `writeShortcuts()` 会先还原成真实 data URL 再写盘——**磁盘格式与旧版完全一致** |
+| `flush-pending-save` | Main → Renderer | 退出前推送：renderer 的保存有 400ms 防抖，收到后立刻把未落盘的改动 invoke 一次 `save-shortcuts`。主进程在 `before-quit` 推它并留 200ms（`will-quit` 时窗口已销毁、IPC 不通，不能用） |
 | `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，找不到 ListView 时回退读注册表 HideIcons） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
 | `get-auto-start` | Renderer → Main | 读取开机自启动是否开启（`getLoginItemSettings`，传与 set 相同的 path/args 匹配注册表项） |
@@ -106,8 +113,8 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `nav-enter` | Main → Renderer | Alt+Space 唤出 Dock 时推送（`webContents.send`，非 handle/invoke）；renderer 据此进入键盘导航模式并恢复到上次选中位置 |
 | `get-dock-edge` / `set-dock-edge` | Renderer → Main | 读取 / 切换停靠位置（`middle`/`bottom`/`top`；横向三档窗口尺寸相同 → `applyDockEdge` 原地 `setBounds` + 推事件并写 `window-position.json`；未实现档位被拒并归一化回默认） |
 | `dock-edge-changed` | Main → Renderer | 停靠位置变更推送（含显示器参数变化后的重新归位）；renderer 收到后翻 `data-edge` 布局。**同档位提前返回时也会重发**（页面重载过的 renderer 只有启动 argv 里的旧边） |
-| `list-folder` | Renderer → Main | 文件夹预览卡片的数据源：`fs.readdir` + 目录优先自然序 + 400 项上限，文件大小只 stat 文件（目录不递归），**首批 14 个图标在返回前填好**（目录用一次提取常驻的 shell32 index 4 黄色文件夹图标、文件用 `app.getFileIcon`）；5s TTL 缓存（上限 40）+ 在途请求 Promise 去重；失败返回 `error: 'missing' \| 'denied' \| 'notdir'` |
-| `folder-icons` | Main → Renderer | 预览图标后台分批推送（每批 24 个，总上限 150）；renderer 按路径就地替换。窗口被重建后 sender 失效时，主进程会删掉自己写的那条缓存（否则卡片在 TTL 内永远停在占位块） |
+| `list-folder` | Renderer → Main | 文件夹预览卡片的数据源：`fs.readdir` + 目录优先自然序 + 400 项上限，文件大小只 stat 文件（目录不递归，**并发受限 16**，别用无脑 `Promise.all` 压垮 libuv 线程池），**首批 14 个图标在返回前填好**（目录用一次提取常驻的 shell32 index 4 黄色文件夹图标、文件用 `app.getFileIcon`）；5s TTL 缓存（上限 40，写入前先清理过期项）+ 在途请求 Promise 去重；失败返回 `error: 'missing' \| 'denied' \| 'notdir'` |
+| `folder-icons` | Main → Renderer | 预览图标后台分批推送（每批 24 个，总上限 150）；renderer 按路径就地替换（**本批没命中当前卡片目录时直接返回原状态**，不建新对象）。窗口被重建后 sender 失效时，主进程会删掉自己写的那条缓存（否则卡片在 TTL 内永远停在占位块） |
 | `open-path` | Renderer → Main | `shell.openPath`（ShellExecuteEx 语义）打开任意路径——目录开资源管理器、文档/图片交给关联程序；**返回成功后才隐藏 Dock**（目标不存在/无关联程序时保持可见，否则用户看到「点了没反应 + Dock 消失」） |
 
 ### React UI
@@ -128,8 +135,9 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**（`data-edge='top'` 时整套浮层改由 `overlayTop()` 锚在玻璃条**下沿外侧**8px，向下弹出、`maxHeight` 按窗口剩余高度算），底边固定在实测的 Dock 毛玻璃条外侧 8px（`overlayBottom()` / `overlayTop()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 用 `getBoundingClientRect` 视口坐标，Dock 滚动后仍正确。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
-- **放大效果**：`handleDockMouseMove` 计算鼠标到每个图标的距离，< 140px 时缩放 + 上浮（拖拽时暂停）
-- **持久化**：`apps` 变化时 `useEffect` 自动保存，启动时 `useEffect` 自动恢复
+- **放大效果**：`handleDockMouseMove` 在几何缓存上二分定位，只对左右各 140px 内的图标缩放 + 上浮（拖拽时暂停）。**不要改回「逐图标 getBoundingClientRect」**——那是 layout thrashing，详见上方「悬停放大走几何缓存」
+- **持久化（v1.12.0 起是 400ms 防抖 + 退出落盘）**：`apps` 变化时 `useEffect` 设置一个 400ms 防抖定时器再 `saveShortcuts()`，启动时 `useEffect` 自动恢复。**不要改回「每次变更立刻保存」**——拖拽排序每帧都会变更一次 `apps`，那等于每帧跨进程克隆整个数组（含全部 base64 图标）+ `JSON.stringify` + 写盘。退出时由主进程 `before-quit` 推 `flush-pending-save`（并留 200ms）让 renderer 立刻落盘；renderer 卸载时也会 flush 一次。**必须用 `before-quit` 而不是 `will-quit`**——后者触发时窗口已销毁、IPC 不通，兜底是无效的
+- **共享文件夹图标（`ql-shared-folder-icon` 哨兵）**：桌面扫描出的文件夹图标对所有条目都是同一张图，状态里存短哨兵、渲染时换成模块常量 `sharedFolderIcon`（JS 字符串按引用传递，全应用只留一份）；**磁盘格式不变**——主进程 `writeShortcuts()` 写盘前把哨兵还原成真实 data URL，`load-shortcuts` 读到真图标时记下它供还原。改持久化格式时别忘了这条双向往返（`compactIcon` / `realIcon`）
 - **分组（Stack）**：`isGroup` 条目点击展开面板而不启动；成员用 `groupId` 归属（**扁平模型，不嵌套**——桌面扫描/缺失清理/持久化全部沿用原逻辑）。右键图标「新建分组」创建空组并横向滚动到末尾；分组图标默认渲染**组内前 4 个非分隔线成员的缩略拼图**（0 个成员回退 2×2 网格图标、1 个放大单图、用户换过图标则用自定义图标），右下角 `.dock-badge` 显示成员数（徽标贴图标框内侧：负偏移会被滚动容器裁掉下沿）。拖到分组图标上即归组（插到该组现有成员之后），从面板拖到 Dock 条内即移出，删除分组=解散（成员回顶层、保留相对位置）；编辑表单对分组只留名称 + 图标
 - **分组面板（迷你 Dock）**：与主 Dock 同构——顶部透明放大区 + 玻璃条，条目**直接复用 `.dock-item` 系列样式**、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听；宽度 `max-content`（有几个图标就多宽，超出窗口宽度才滚动），**高度固定**，因此完全不改变窗口尺寸（这也是透明窗口 resize 白闪的根治手段）。菜单打开期间面板用 `visibility: hidden` 隐藏——两者同处 Dock 栏上方一条带，而窗口只有 300px 高，无法叠放
 - **数组不变量**：分组成员在扁平数组里**紧跟其分组条目之后**（归组时插到该组现有成员末尾）。桌面扫描合并的 `rest` 保持相对顺序，所以成员区不会被扫描打散；任何顶层插入/重排都必须经 `topAnchorId` 换算，否则会插进成员区块中间
@@ -168,7 +176,9 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - `parse-lnk` 复用 `ICON_EXTRACTOR_CS` 常量
 - `select-folder` 复用 `extractIcon()`（`add-special-item` 已随菜单入口一并移除）
 - URL 快捷方式图标解析链：`.url` 的 `IconFile` → favicon 下载 → 默认浏览器 exe → `shell32.dll` 地球图标（index 13）
-- PowerShell 超时 10 秒（`extractIcon`），每次调用启动新 `powershell.exe`
+- **尺寸按用途取（v1.12.0）**：`ICON_SIZE = 64`（Dock 图标 CSS 只有 44px、分组拼图 26px、预览卡片 17px）、`FOLDER_ICON_SIZE = 48`。原来一律 256px：PNG 大 4 倍，`SHDefExtractIcon` 还要多做一次高质量缩放；而这份 base64 要同时活在主进程状态、IPC 消息、renderer state、`shortcuts.json` 四处字符串里，是纯浪费
+- **所有 PowerShell 调用统一走 `runPowerShell(psScript, timeout, done)`**（参数已带 `-NoProfile -NonInteractive`）——漏掉 `-NonInteractive` 时脚本遇到交互式提示会挂到超时，白占一个进程。超时 10 秒（`extractIcon`），每次调用启动新 `powershell.exe`
+- **PowerShell 的代价是实打实的（实测本机 PowerShell 5.1）**：`powershell.exe -NoProfile -NonInteractive -Command <WinZ 脚本>` 单次 **690~785ms** CPU 时间——进程启动 ~450ms + .NET 运行时初始化 + `Add-Type` 编译 C# ~250ms，每次还额外占几十 MB 私有内存。**新增任何「事件里起 PowerShell」的逻辑前先想清楚触发频率**（`sendToBottom` 的 `SINK_GRACE_MS` 宽限期就是这么来的）
 - **每个 PowerShell 脚本开头都强制 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`**，适配中文 Windows GBK 编码——新增/修改 PS 脚本时务必保留，否则输出中文乱码
 - **JS 模板字符串里内嵌的 PowerShell 脚本，写 Windows 路径必须用双反斜杠 `\\`**（如 `'C:\\Windows\\System32\\shell32.dll'`）——单反斜杠的 `\W`/`\S` 等会被 JS 当转义符吞掉，编译后路径变成 `C:WindowsSystem32...`（静默失效，Test-Path/图标提取返回空，无明显报错）。新增硬编码路径时务必双反斜杠
 
@@ -244,11 +254,13 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - 关闭 → 隐藏托盘通过 `forceQuit` 标志区分：普通关闭 `preventDefault()` + `hide()`；托盘「退出」置 `forceQuit=true` 后 `app.quit()`。新增退出路径需同步设置该标志
 - 拖拽排序的 `mousemove`/`mouseup` 监听挂在 `window` 上（非 dock 元素），鼠标移出窗口仍能完成排序；`mouseup` 在窗口外也会触发
 - `run-app` 用 `execFile(targetPath, splitArgs(args))` 拆分参数——`splitArgs` 按空格切分但把双引号包裹段作为整体并剥引号（.lnk 的 Arguments 常带引号，如 `"E:\DSH\start-dsh.vbs"`；原样拆分会把字面引号传给 wscript 等宿主导致「Windows Script Host 执行失败」，顺带支持含空格的带引号参数）；含空格且无引号的参数仍不支持——已知限制
-- `run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时**回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈；ENOENT 等其它失败会**恢复显示 + 置顶**（点了图标却什么都没启动时 Dock 不能消失）
+- **`run-app` 的失败判定只看「进程有没有起来」**：`err.code` 是**字符串**才是 spawn 级失败（ENOENT/EACCES/EPERM/UNKNOWN…），**数字则是进程正常启动、只是退出码非零**——很多应用/启动器带参数启动后会立刻以非零码退出，把这种当成失败会把 Dock 错误地拽回来。恢复显示统一走 `restoreDockAfterFailedLaunch()`
+- **`run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈；其它 spawn 失败会**恢复显示 + 置顶**（点了图标却什么都没启动时 Dock 不能消失）
+- **启动节流**：`handleRun` 有 700ms 连点节流——Dock 隐藏到托盘前用户容易多点几下，每次点击都会真的 `CreateProcess` 开一个新实例
 - **文件夹预览（`list-folder`）的三个坑**：① Windows 目录联接/符号链接在 `Dirent` 上是 `isDirectory()=false` + `isSymbolicLink()=true`，必须补一次 `stat` 才认得出是目录（否则算进文件数、按文件排序、显示字节大小、图标也不对）；② 超大目录（>4000 项）用 `Intl.Collator` 排序会比较百万次、把主进程卡住好几秒，超阈值退回廉价的字符串比较；③ 后台补图标（`fillFolderIcons`）每批前检查 `sender.isDestroyed()`，失效时**删掉自己写的那条缓存**——否则窗口重建后卡片在 TTL 内永远只有占位块，且没有任何补批会再来。**目录图标不能用 `app.getFileIcon`**（实测返回错图标），统一用启动时提取一次、常驻内存的 shell32 index 4 黄色文件夹图标
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.11.0`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.11.0），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.0`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.0），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

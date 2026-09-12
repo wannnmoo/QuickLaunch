@@ -161,6 +161,13 @@ const api = {
     ipcRenderer.on('desktop-changed', listener)
     return () => { ipcRenderer.removeListener('desktop-changed', listener) }
   },
+  /** 订阅「退出前立刻落盘」事件：renderer 的保存有 400ms 防抖，退出时主进程会推这条
+   *  事件让未落盘的改动立刻写入（收到后同步 invoke save-shortcuts 即可）。 */
+  onFlushPendingSave: (callback: () => void): (() => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('flush-pending-save', listener)
+    return () => { ipcRenderer.removeListener('flush-pending-save', listener) }
+  },
   /** 订阅「进入键盘导航」事件（Alt+Space 唤出 Dock 时由主进程推送），返回取消订阅函数。 */
   onNavEnter: (callback: () => void): (() => void) => {
     const listener = (): void => callback()

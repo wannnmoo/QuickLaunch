@@ -358,7 +358,9 @@ html[data-glass-fx='off'] .dock-bg::after {
   cursor: pointer;
   /* 放大缓动：标准 ease（果冻曲线/按压反馈/入场动画实测手感不佳，已全部回退） */
   transition: transform 0.12s cubic-bezier(0.25, 0.1, 0.25, 1);
-  will-change: transform;
+  /* 注意：这里**不要**写常驻 will-change: transform —— 那会给每个图标都留一个合成层，
+     图标越多显存/内存越高（几十个图标时是实打实的一笔开销）。悬停时才提升，见下方
+     .dock-item:hover。 */
   transform-origin: center bottom; /* 放大从底部升起，贴合 macOS Dock */
   position: relative;
   /* 键盘导航用 scrollIntoView({inline:'nearest'}) 把选中项带入可视区，而「刚好可见」
@@ -416,6 +418,13 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .dock-item:hover .dock-icon-wrap::before {
   opacity: 1;
+}
+
+/* 悬停时才提示「接下来会动的是 transform」。常驻 will-change 会让每个图标都常驻一个
+   合成层 —— 图标越多，GPU 显存与内存占用越高，而这里真正需要提升的只有鼠标附近那
+   几个（放大时 JS 会给它们设 z-index: 10，本身就会触发提升）。 */
+.dock-item:hover {
+  will-change: transform;
 }
 
 .dock-icon {
@@ -1496,6 +1505,12 @@ html[data-glass-fx='off'] .dock-bg::after {
   color: var(--label-color);
   cursor: default;
   transition: background 0.12s;
+  /* 卡片最多列 400 行，每行一个 17px 的 <img>：一次全量布局/paint 会让卡片弹出那几帧
+     明显掉帧（尤其图标还在分批换入的时候）。content-visibility 让屏幕外的行跳过
+     渲染，只保留 26px 的占位高度——滚动时再按需渲染，观感完全一致。
+     contain-intrinsic-size 必须给，否则浏览器按 0 高度算，滚动条长度会跳。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 26px;
 }
 
 .folder-row:hover {
