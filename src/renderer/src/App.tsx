@@ -148,6 +148,13 @@ const isFileDragEvent = (e: React.DragEvent): boolean =>
 // getBoundingClientRect，它每帧只调一次且此时没有待处理的样式写入）。
 // 走的是「中心点排序数组 + 影响范围」的写法：鼠标只影响左右各 140px 内的图标，
 // 落到数组上就是从 lo 到 hi 的一小段，其余元素只在「上一帧被放大过」时才需要复位。
+//
+// ⚠️ **坐标系是这里唯一的坑（v1.12.1 修）**：容器是横向滚动容器，所以存下来的必须是
+// **内容坐标**（= 视口坐标 + scrollLeft），命中也必须换算到同一个坐标系。
+// v1.12.0 量的是「相对容器可见左缘」的视口坐标、命中算的却是 `clientX - container.left`
+// （内容坐标），两者只在 scrollLeft === 0 时相等 —— 于是 Dock 一旦横向滚动，光标越往后
+// （要滚动才能看到的那部分）放大效果就偏到左边 scrollLeft 像素的图标上，表现为
+// 「鼠标移到后面的图标，动画却显示在前面的图标上」。Dock 图标多到需要滚动就会踩到。
 type DockCenter = { id: number; cx: number; el: HTMLDivElement }
 
 function measureCenters(
@@ -156,11 +163,12 @@ function measureCenters(
 ): DockCenter[] {
   if (!container) return []
   const box = container.getBoundingClientRect()
+  const scroll = container.scrollLeft // 换算到内容坐标，详见上方坐标系说明
   const out: DockCenter[] = []
   refs.forEach((el, id) => {
     if (el.dataset.sep) return // 分隔线不参与放大
     const rect = el.getBoundingClientRect()
-    out.push({ id, cx: rect.left - box.left + rect.width / 2, el })
+    out.push({ id, cx: rect.left - box.left + scroll + rect.width / 2, el })
   })
   out.sort((a, b) => a.cx - b.cx)
   return out
@@ -537,13 +545,15 @@ function App(): React.ReactElement {
   // 返回的是「位置」（在渲染出来的顶层图标中排序后的下标），不是数组下标
   // 组内成员不在 Dock 里渲染，所以这里与 topAnchorId 的下标空间一致
   const calcDropIndex = useCallback((clientX: number): number => {
-    const dock = dockRef.current
     const centers = dockCenters.current
-    if (!dock) return centers.length
-    // 拖拽过程中图标会被放大 1.4×、还会被 auto/-insertion 指示线撑开，中心点与缓存
-    // 会有几像素偏差；但落点判定本来就只有「最近两个图标之间」的粒度，偏差不影响
-    // 结果，而每帧重新量一遍全部图标才是真正的开销来源
-    const mx = clientX - dock.getBoundingClientRect().left
+    const el = dockInnerRef.current
+    if (!el) return centers.length
+    // 拖拽过程中图标会被放大 1.4×、还要给插入指示线腾位置，中心点与缓存有几像素偏差；
+    // 但落点判定本来就只有「最近两个图标之间」的粒度，偏差不影响结果，
+    // 而每帧重新量一遍全部图标才是真正的开销来源。
+    // `mx` 必须换算到**内容坐标**（与缓存同一坐标系）——漏掉 scrollLeft 会让落点
+    // 偏左 scrollLeft 像素，详见文件上方「坐标系是这里唯一的坑」。
+    const mx = clientX - el.getBoundingClientRect().left + el.scrollLeft
 
     // Find where the cursor falls between/around icon centers
     for (let i = 0; i < centers.length; i++) {
@@ -861,7 +871,10 @@ function App(): React.ReactElement {
       active.clear()
       return
     }
-    const mx = clientX - container.getBoundingClientRect().left
+    // 光标同样换算到**内容坐标**：`centers` 存的是内容坐标，直接拿
+    // `clientX - container.left` 比会在容器滚动后整体偏左 scrollLeft 像素
+    // （详见文件上方「坐标系是这里唯一的坑」）
+    const mx = clientX - container.getBoundingClientRect().left + container.scrollLeft
 
     // 升序中心点里找第一个 >= mx 的位置（二分：几十个图标也别线性扫）
     let lo = 0
