@@ -116,26 +116,23 @@ const LABEL_CLAMP_PAD = 48
 // 高度上限按这个基准算，超出时内部滚动——避免透明窗口 resize 的白闪
 const BASE_WINDOW_H = 300
 
-// ─── 文件夹图标的共享哨兵 ────────────────────────────────────────────────
-// 桌面扫描出来的文件夹图标对每个条目都是同一张图（主进程只提取一次 shell32 index 4，
-// 所有条目共用同一个 base64 串）。但**每个条目各存一份**的代价是实打实的：
-// renderer state 里几十份字符串、每次 IPC（load/save/scan/check）各传几十份、
-// shortcuts.json 里几十份、每次保存还要重新 JSON 序列化几十份。
-// 这里改成存一个短哨兵：状态里只留 'ql-shared-folder-icon'，渲染前统一换成共享常量
-// （JS 字符串按引用比较与传递，等于全应用只留一份内存）。
-// 磁盘格式也保持可读：主进程 save-shortcuts 写盘前会把哨兵换回真实 data URL，
-// load-shortcuts 读入后再归一化回哨兵（旧文件、手改文件都照旧能用）。
-const FOLDER_ICON_SENTINEL = 'ql-shared-folder-icon'
-/** 第一个带真实文件夹图标的条目里那份 data URL —— 启动加载后立刻填上，作为共享引用源 */
+// ─── 文件夹图标：直接存真实 data URL（v1.12.2 撤掉了哨兵）───────────────────
+// v1.12.0 为了省内存/磁盘，把文件夹条目的图标换成了一个短哨兵串，渲染与写盘时再换回
+// 模块常量 `sharedFolderIcon`。**这个设计是错的**：`sharedFolderIcon` 只有一个赋值点
+// （加载时从磁盘上找一个「带非空图标的文件夹条目」），于是
+//   ① 全新机器上 shortcuts.json 不存在 / 没有任何带图标的文件夹条目 → 它一直是空串；
+//   ② 唯一给文件夹条目写图标的路径（桌面扫描）又存的是哨兵、把主进程刚提取好的真图标丢了；
+// 结果「哨兵 → 空串 → 落盘空串 → 下次加载还是空串」自锁，**首启即永久坏，重启不恢复**。
+//
+// 现在改成最直白的做法：文件夹条目就存主进程给的那份真实 data URL。
+// 代价只是 renderer state 里多 N 份相同字符串（48px 的 PNG 约 2.5KB，几十个文件夹也就
+// 几十 KB）——而 v1.12.0 把图标尺寸从 256px 降到 48px 省下的是它的 8 倍，
+// 用一个「会自锁成空值」的中间态去省这点内存，完全不划算。
+/** 主进程给的共享文件夹图标（一次提取、所有文件夹条目共用同一份）。
+ *  只用来**修复**两种情况：历史坏数据（iconDataUrl 为空）与主进程没给图标的扫描结果。
+ *  正常情况下根本不需要它 —— 每个条目自己就带着真图标。 */
 let sharedFolderIcon = ''
-const isSentinel = (url: string): boolean => url === FOLDER_ICON_SENTINEL
-/** 持久化/展示用的真实图标（哨兵 → 共享引用；其余原样） */
-const realIcon = (url: string): string => (isSentinel(url) ? sharedFolderIcon : url)
-/** 状态里存的紧凑形式（真实文件夹图标 → 哨兵；其余原样） */
-const compactIcon = (url: string): string =>
-  sharedFolderIcon && url === sharedFolderIcon ? FOLDER_ICON_SENTINEL : url
 
-// 外部拖入的是「文件」而非页面内元素/文本：DataTransfer.types 里含 'Files'
 const isFileDragEvent = (e: React.DragEvent): boolean =>
   Array.from(e.dataTransfer?.types ?? []).includes('Files')
 
@@ -1654,6 +1651,11 @@ function App(): React.ReactElement {
   const mergeDesktopScan = useCallback((baseline: AppEntry[]) => {
     return window.api.scanDesktopFolders().then((found) => {
       if (!found || found.length === 0) return
+      // 记住主进程给的共享文件夹图标：**它同时也是坏数据的修复源**。
+      // 只在为空时记（主进程每次扫描都会返回同一张图，没必要反复覆盖）
+      for (const f of found) {
+        if (!f.specialType && f.iconDataUrl) { sharedFolderIcon = f.iconDataUrl; break }
+      }
       const existing = new Set(baseline.map((a) => normPath(a.targetPath)))
       const fresh = found.filter((f) => !existing.has(normPath(f.path)))
       if (fresh.length === 0) return
@@ -1665,11 +1667,10 @@ function App(): React.ReactElement {
       // 联合类型，下面 add.filter((e) => e.specialType) 会在缺该字段的分支上报 TS2339
       const entries: AppEntry[] = fresh.map((f) => ({
         id: nextId++,
-        // 桌面扫描出来的文件夹图标**全都一模一样**（主进程一次提取、全量共用）。每个条目
-        // 各存一份 base64 意味着：renderer 状态里几十份、每次 IPC 传几十份、
-        // shortcuts.json 里几十份、每次保存再序列化几十份。
-        // 存成哨兵串、渲染时换回共享常量（见 FOLDER_ICON_SENTINEL），内存与文件都只留一份。
-        iconDataUrl: f.specialType ? f.iconDataUrl : FOLDER_ICON_SENTINEL,
+        // **直接用主进程扫描返回的真实图标**。v1.12.0 这里曾写成哨兵（想省内存），
+        // 结果把唯一一份真图标丢掉了、哨兵又解析成空串 → 首次安装后文件夹图标永久空白。
+        // 现在每条自帶真图标；万一主进程没给（提取失败），才回落到共享的那一枚。
+        iconDataUrl: f.iconDataUrl || sharedFolderIcon,
         targetPath: f.path,
         arguments: '',
         workingDirectory: '',
@@ -1716,6 +1717,24 @@ function App(): React.ReactElement {
     }).catch(() => {})
   }, [])
 
+  // 修复历史坏数据：v1.12.0/v1.12.1 的哨兵设计会把文件夹条目的 iconDataUrl 写盘成
+  // **空串**（见文件顶部「文件夹图标」那段说明），而且永远自愈不了。
+  // 这里在启动同步结束后统一回填——只动空值条目，有效图标一个都不碰；回填后由防抖保存
+  // 自动写回磁盘，**用户不需要删配置、也不需要重装**。
+  const repairEmptyFolderIcons = useCallback(() => {
+    if (!sharedFolderIcon) return
+    const icon = sharedFolderIcon
+    setApps((prev) => {
+      let changed = false
+      const next = prev.map((a) => {
+        if (!a.isFolder || a.iconDataUrl) return a
+        changed = true
+        return { ...a, iconDataUrl: icon }
+      })
+      return changed ? next : prev
+    })
+  }, [])
+
   // 启动：先加载已保存的快捷方式，加载完成后解锁保存，再清理缺失文件夹 + 扫描合并。
   // 顺序（load → prune → scan）链式执行避免竞态——若并行，扫描结果可能被 setApps 覆盖丢失。
   useEffect(() => {
@@ -1723,11 +1742,11 @@ function App(): React.ReactElement {
     window.api.loadShortcuts().then((saved) => {
       if (cancelled) return
       if (saved && saved.length > 0) {
-        // 先认下「共享文件夹图标」是哪一份（所有文件夹条目的图标都相同，取第一份即可），
-        // 再把列表里重复的图标归一化成哨兵——这一步直接把 N 份 base64 压成 1 份
-        const withFolderIcon = saved.find((a) => a.isFolder && a.iconDataUrl)
-        if (withFolderIcon) sharedFolderIcon = withFolderIcon.iconDataUrl
-        setApps(saved.map((a) => ({ ...a, iconDataUrl: compactIcon(a.iconDataUrl) })))
+        // 认下主进程给的那份共享文件夹图标（所有文件夹条目都是同一张图），
+        // 它是下面「修复空图标」的数据源。自己在带图标的文件夹条目上取一份也行
+        const withIcon = saved.find((a) => a.isFolder && a.iconDataUrl)
+        if (withIcon) sharedFolderIcon = withIcon.iconDataUrl
+        setApps(saved)
         nextId = Math.max(-1, ...saved.map((a) => a.id)) + 1
       }
       // 加载完成即解锁保存（不等同步结束，启动早期用户操作也能正常持久化）
@@ -1737,7 +1756,11 @@ function App(): React.ReactElement {
         try {
           await pruneMissingFolders(saved || [])
           if (cancelled) return
+          // 注意顺序：mergeDesktopScan 内部会把主进程这次扫描回来的共享图标记进
+          // sharedFolderIcon，所以「修复空图标」必须排在它后面（数据源先就位）
           await mergeDesktopScan(saved || [])
+          if (cancelled) return
+          repairEmptyFolderIcons()
         } finally {
           desktopSyncBusyRef.current = false
         }
@@ -1748,7 +1771,7 @@ function App(): React.ReactElement {
       if (!cancelled) loadedRef.current = true
     })
     return () => { cancelled = true }
-  }, [pruneMissingFolders, mergeDesktopScan])
+  }, [pruneMissingFolders, mergeDesktopScan, repairEmptyFolderIcons])
 
   // 实时同步：主进程 fs.watch 桌面目录（debounce 1s）→ 重新「清理缺失 + 扫描合并」。
   // 桌面新增文件夹即时入 Dock、删除即时移除；清理/扫描进行中跳过重复事件。
@@ -1777,9 +1800,11 @@ function App(): React.ReactElement {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingSave = useRef<AppEntry[] | null>(null)
 
-  /** 把一份列表写盘。写盘前把哨兵换成真实图标：磁盘格式保持与旧版本一致（可读、可手改）。 */
+  /** 把一份列表写盘。v1.12.2 起状态里存的就是真实 data URL，这里不需要再做任何换算。
+   *  （v1.12.0 曾在这里把哨兵换成共享常量——共享常量为空时就把空串写进了磁盘，
+   *   是那个「永久坏、重启不恢复」bug 的最后一环。） */
   const writeShortcuts = useCallback((data: AppEntry[]): void => {
-    window.api.saveShortcuts(data.map((a) => ({ ...a, iconDataUrl: realIcon(a.iconDataUrl) })))
+    window.api.saveShortcuts(data)
   }, [])
 
   /** 立刻把待保存的列表写盘（退出前由主进程的 flush-pending-save 触发）。 */
@@ -1866,24 +1891,16 @@ function App(): React.ReactElement {
     }
     return map
   }, [apps])
-  // 渲染用的列表：把文件夹图标的哨兵换成共享常量。JS 里字符串是按引用传递的，
-  // 于是「N 个文件夹图标」在内存里实际只占一份；状态里也始终只有哨兵。
-  // 只在 apps 变化时重建，不会每次渲染都 map 一遍。
-  const viewApps = useMemo(
-    () => (apps.some((a) => isSentinel(a.iconDataUrl))
-      ? apps.map((a) => (isSentinel(a.iconDataUrl) ? { ...a, iconDataUrl: sharedFolderIcon } : a))
-      : apps),
-    [apps]
-  )
-  const viewById = useMemo(() => {
-    if (viewApps === apps) return null // 没有哨兵时直接用原对象，省一次建表
-    return new Map(viewApps.map((a) => [a.id, a]))
-  }, [viewApps, apps])
-  const viewOf = (a: AppEntry): AppEntry => viewById?.get(a.id) ?? a
-  const viewTopLevel = useMemo(() => topLevel.map(viewOf), [topLevel, viewById])
-  const viewGroupMembers = useMemo(() => openGroupMembers.map(viewOf), [openGroupMembers, viewById])
-  const viewOpenGroup = openGroup ? viewOf(openGroup) : undefined
-  const viewCtxApp = ctxApp ? viewOf(ctxApp) : undefined
+  // 渲染直接用 apps：v1.12.2 起状态里存的就是真实 data URL，不再需要「哨兵 → 共享常量」
+  // 这一层转换（那一层就是把空值放大成「空白图标」的地方，且它的结果不在任何依赖数组里，
+  // 属于隐性耦合——见文件顶部「文件夹图标」那段）
+  const viewApps = apps
+  const viewById = null
+  const viewOf = (a: AppEntry): AppEntry => a
+  const viewTopLevel = useMemo(() => topLevel.map(viewOf), [topLevel])
+  const viewGroupMembers = useMemo(() => openGroupMembers.map(viewOf), [openGroupMembers])
+  const viewOpenGroup = openGroup
+  const viewCtxApp = ctxApp
 
   return (
     <div

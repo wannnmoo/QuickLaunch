@@ -101,8 +101,8 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `check-folders-missing` | Renderer → Main | 检查哪些文件夹路径已不存在（主进程纯 `fs.existsSync`，无 PowerShell），返回不存在的子集——用于清理被删除的桌面文件夹条目 |
 | `desktop-changed` | Main → Renderer | 主进程 `fs.watch` 桌面目录（非递归，debounce 1s）后推送的事件（`webContents.send`，非 handle/invoke）；renderer 收到后重新执行「清理缺失 + 扫描合并」，桌面文件夹增删实时同步到 Dock |
 | `run-app` | Renderer → Main | 启动程序/URL/`shell:` CLSID 命令，或通过 `shell.openPath()` 打开文件夹；URL 判定正则 `/^(https?\|ftp\|steam):\/\/\|^mailto:/i`；启动后 Dock 自动隐藏到托盘（`blur` 沉底逻辑对不可见窗口跳过——`hide()` 触发的 blur 不再白跑一次 PowerShell 沉底） |
-| `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据（顺带记住其中的真实文件夹图标，供哨兵还原） |
-| `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json`。renderer 传的文件夹条目可能带**哨兵** `ql-shared-folder-icon`，主进程 `writeShortcuts()` 会先还原成真实 data URL 再写盘——**磁盘格式与旧版完全一致** |
+| `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
+| `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json`。**主进程不做任何字段换算**——renderer 状态里存的就是最终要落盘的真实 data URL |
 | `flush-pending-save` | Main → Renderer | 退出前推送：renderer 的保存有 400ms 防抖，收到后立刻把未落盘的改动 invoke 一次 `save-shortcuts`。主进程在 `before-quit` 推它并留 200ms（`will-quit` 时窗口已销毁、IPC 不通，不能用） |
 | `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，找不到 ListView 时回退读注册表 HideIcons） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
@@ -141,7 +141,9 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 与悬停放大共用同一份几何缓存，**两处都必须在内容坐标里比较**（见上方坐标系说明——v1.12.0 漏了 `scrollLeft`，Dock 滚动后插入位置会偏）。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
 - **放大效果**：`handleDockMouseMove` 在几何缓存上二分定位，只对左右各 140px 内的图标缩放 + 上浮（拖拽时暂停）。**不要改回「逐图标 getBoundingClientRect」**——那是 layout thrashing，详见上方「悬停放大走几何缓存」
 - **持久化（v1.12.0 起是 400ms 防抖 + 退出落盘）**：`apps` 变化时 `useEffect` 设置一个 400ms 防抖定时器再 `saveShortcuts()`，启动时 `useEffect` 自动恢复。**不要改回「每次变更立刻保存」**——拖拽排序每帧都会变更一次 `apps`，那等于每帧跨进程克隆整个数组（含全部 base64 图标）+ `JSON.stringify` + 写盘。退出时由主进程 `before-quit` 推 `flush-pending-save`（并留 200ms）让 renderer 立刻落盘；renderer 卸载时也会 flush 一次。**必须用 `before-quit` 而不是 `will-quit`**——后者触发时窗口已销毁、IPC 不通，兜底是无效的
-- **共享文件夹图标（`ql-shared-folder-icon` 哨兵）**：桌面扫描出的文件夹图标对所有条目都是同一张图，状态里存短哨兵、渲染时换成模块常量 `sharedFolderIcon`（JS 字符串按引用传递，全应用只留一份）；**磁盘格式不变**——主进程 `writeShortcuts()` 写盘前把哨兵还原成真实 data URL，`load-shortcuts` 读到真图标时记下它供还原。改持久化格式时别忘了这条双向往返（`compactIcon` / `realIcon`）
+- **文件夹图标：直接存真实 data URL（v1.12.2 撤掉哨兵，别再引入中间态）**：v1.12.0 曾把文件夹条目的图标换成一个短哨兵串、渲染/写盘时再换回模块常量 `sharedFolderIcon`，想省内存和磁盘。**那个设计有致命缺陷**：`sharedFolderIcon` 只有一个赋值点（加载时从磁盘上找「带非空图标的文件夹条目」），而唯一给文件夹条目写图标的路径（桌面扫描）又存的是哨兵、把主进程刚提取好的真图标丢了 → **全新安装首启就把空串写进磁盘，而且永远自愈不了**（详见 CHANGELOG v1.12.2）。现在每条自帶真图标；模块级 `sharedFolderIcon` 只作为**修复源**（启动时回填历史坏数据的空图标、兜住主进程没给图标的扫描结果）。
+  - 实测这笔优化的全部收益（60 个文件夹）：结构化克隆 0.11ms、`JSON.stringify` 0.19ms、磁盘 152KB——而且 V8 会把内容相同的字符串内部化，**renderer 侧的堆增量 ≈ 一份图标**而不是 N 份。为一个「能自锁成空值」的中间态去省这点东西，完全不划算
+  - 教训：**写入路径上的「换算」必须以「换算不出来会怎样」为前提设计**。这个哨兵的失败模式是「写坏数据」而不是「少写数据」，代价差了一个量级
 - **分组（Stack）**：`isGroup` 条目点击展开面板而不启动；成员用 `groupId` 归属（**扁平模型，不嵌套**——桌面扫描/缺失清理/持久化全部沿用原逻辑）。右键图标「新建分组」创建空组并横向滚动到末尾；分组图标默认渲染**组内前 4 个非分隔线成员的缩略拼图**（0 个成员回退 2×2 网格图标、1 个放大单图、用户换过图标则用自定义图标），右下角 `.dock-badge` 显示成员数（徽标贴图标框内侧：负偏移会被滚动容器裁掉下沿）。拖到分组图标上即归组（插到该组现有成员之后），从面板拖到 Dock 条内即移出，删除分组=解散（成员回顶层、保留相对位置）；编辑表单对分组只留名称 + 图标
 - **分组面板（迷你 Dock）**：与主 Dock 同构——顶部透明放大区 + 玻璃条，条目**直接复用 `.dock-item` 系列样式**、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听；宽度 `max-content`（有几个图标就多宽，超出窗口宽度才滚动），**高度固定**，因此完全不改变窗口尺寸（这也是透明窗口 resize 白闪的根治手段）。菜单打开期间面板用 `visibility: hidden` 隐藏——两者同处 Dock 栏上方一条带，而窗口只有 300px 高，无法叠放
 - **数组不变量**：分组成员在扁平数组里**紧跟其分组条目之后**（归组时插到该组现有成员末尾）。桌面扫描合并的 `rest` 保持相对顺序，所以成员区不会被扫描打散；任何顶层插入/重排都必须经 `topAnchorId` 换算，否则会插进成员区块中间
@@ -265,6 +267,6 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.1`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.1），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.2`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.2），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

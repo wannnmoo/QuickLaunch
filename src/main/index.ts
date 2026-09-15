@@ -303,9 +303,11 @@ if (-not $iconBase64) {
   }
   # 2) 目标是文件夹：SHDefExtractIcon 对目录返回 E_FAIL 无法取图标，上面提取失败时
   #    统一回退系统黄色文件夹图标（与「添加文件夹」select-folder 一致）
+  #    尺寸必须用 FOLDER_ICON_SIZE：写死 256 会让同一张黄色文件夹图标出现 256/48 两种
+  #    base64 并存（磁盘更大、内存里也多一份无用的高清图）
   #    注意：JS 模板字符串里路径必须写双反斜杠 \\，单反斜杠会被当成转义吞掉
   if (-not $iconBase64 -and $targetPath -and (Test-Path $targetPath -PathType Container)) {
-    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, 256)
+    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, ${FOLDER_ICON_SIZE})
   }
 
   # Fallback for URL shortcuts: use default browser icon
@@ -575,10 +577,6 @@ ipcMain.handle('load-shortcuts', () => {
     return raw.map((entry) => {
       if (!entry || typeof entry !== 'object') return entry
       const e = entry as Record<string, unknown>
-      // 记住这份文件夹图标：renderer 传入哨兵时要靠它还原成真实 data URL
-      if (typeof e.iconDataUrl === 'string' && e.iconDataUrl.startsWith('data:image/') && e.isFolder) {
-        lastFolderIconDataUrl = e.iconDataUrl
-      }
       // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
       if (e.separator) {
         const { separator: _legacy, ...rest } = e
@@ -591,27 +589,11 @@ ipcMain.handle('load-shortcuts', () => {
   }
 })
 
-/** renderer 用哨兵串代替「共享的文件夹图标」以省内存（N 个文件夹只留一份 base64）。
- *  磁盘上仍写真实 data URL —— 文件格式与旧版本完全一致，可读、可手改、可回退。 */
-const FOLDER_ICON_SENTINEL = 'ql-shared-folder-icon'
-/** 最近一次写盘时的「真实文件夹图标」，用来回落哨兵（renderer 一定会先写一次带真图标的版本） */
-let lastFolderIconDataUrl = ''
-
+/** 写盘。v1.12.2 起 renderer 状态里存的就是真实 data URL，这里不再做任何换算。
+ *  （v1.12.0/v1.12.1 曾在这里把哨兵串换成「最近见过的文件夹图标」，那个值为空时
+ *   会把空串写进磁盘，是「文件夹图标永久空白」事故的最后一环。） */
 function writeShortcuts(data: unknown[]): void {
-  const out: unknown[] = []
-  for (const entry of data) {
-    if (!entry || typeof entry !== 'object') { out.push(entry); continue }
-    const e = entry as Record<string, unknown>
-    if (e.iconDataUrl === FOLDER_ICON_SENTINEL) {
-      out.push({ ...e, iconDataUrl: lastFolderIconDataUrl })
-      continue
-    }
-    if (typeof e.iconDataUrl === 'string' && e.iconDataUrl.startsWith('data:image/') && e.isFolder) {
-      lastFolderIconDataUrl = e.iconDataUrl
-    }
-    out.push(entry)
-  }
-  writeFileSync(shortcutsPath, JSON.stringify(out), 'utf-8')
+  writeFileSync(shortcutsPath, JSON.stringify(data), 'utf-8')
 }
 
 ipcMain.handle('save-shortcuts', (_event, data: unknown) => {
