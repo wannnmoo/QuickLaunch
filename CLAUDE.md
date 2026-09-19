@@ -65,6 +65,15 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **主 Dock 的 `mousemove` 不做整树重渲染**：`handleDockMouseMove` / `handlePanelMouseMove` 用 `navIdRef` 判断是否真的需要 `setNavId(null)`——原来无条件每次移动都 setState，会让整个 `App`（全部图标 + 标签 + 分组拼图 + 面板成员）跟着重渲染
 - **标签悬停显示（三主题一致）**：`.dock-label` 默认隐藏，鼠标悬停图标时淡入（0.16s）；标签**绝对定位悬浮在图标上方**（macOS 式，不占图标下方布局行——玻璃条紧凑贴合图标），完整显示名称不截断；每主题一个药丸底衬（`--label-pill-bg`：黑夜=深藏青 `rgba(12,16,28,0.55)` 白字、白天=浅白玻璃 `rgba(255,255,255,0.75)` 深字、透明=中性深灰 `rgba(0,0,0,0.30)` 白字）；「+」添加按钮不显示悬浮标签
 - 图标放不下时**横向滚动**：`.dock-inner` 是滚动容器（`overflow-x: auto`，隐藏滚动条），滚轮/触控板转水平滚动（原生 `addEventListener('wheel', …, { passive: false })`——React 在 root 上以 passive 注册 wheel，`onWheel` 里 `preventDefault()` 是空操作）；两端 `dock-edge` 渐隐遮罩提示「还有更多」，仅可滚动侧显示（`scrollState`）
+- **玻璃条宽度随图标数量伸缩（v1.13.0，改这块必须先读）**：DOM 是 `.app > .dock > .dock-bar > (.dock-bg, .dock-inner, .dock-edge ×2)`，两层分工严格：
+  - `.dock` **只做定位与拖放命中层**：`width: 100%` 占满整窗，`padding: 8px 24px`。它**不再决定玻璃条宽度**
+  - `.dock-bar` 是**玻璃条本体**：`width: max-content` + `max-width: calc(var(--dock-vw) - 48px)`。图标少时收缩到刚好看得下（两端大留白消失），一路长到上限后由 `.dock-inner` 横向滚动
+  - **窗口尺寸始终不变**（透明窗口 resize 会白闪），变的只是这一层的宽度；与分组面板 `.group-panel` 同一套做法
+  - ⚠️ **上限不能用 `100vw`**：实测本窗口里 `window.innerWidth` 是 **1202**（窗口设的是 1200），而 `100vw` 跟着它走——所以 `.dock-bar` 会多出 2px 溢出可用区。改为 renderer 把 `window.innerWidth` 写进 **`--dock-vw`**（写在 `.app` 根元素上，随 resize 更新），CSS 用 `calc(var(--dock-vw, 100vw) - 48px)`
+  - ⚠️ `.dock-bg` / `.dock-edge` 的左右偏移都改成 **0**（原先写 `24px`，那是 `.dock` 的 padding；现在定位基准已经是 `.dock-bar` 本身）
+  - ⚠️ `.dock-inner` **不要写 `max-width: 100%`**：`.dock-bar` 是 `max-content`（收缩包裹），其内部百分比 max-width 的解析基准不确定，留着既冗余又让「谁在限宽」难读。限宽只由 `.dock-bar` 负责
+  - **拖入文件的命中区按 `.dock-bar` 算，不能按 `.dock`**：`.dock` 占满整窗，图标少时条两侧大片透明区也在 `.dock` 内——不区分就会出现「在空白处松手也能添加，但那里不显示插入线和禁止光标」。`document` 级 `dragover` 用 `elementFromPoint` 判断是否在条上（不用 `e.target`：光标下方可能是被 transform 放大的图标），不在条上就 `dropEffect='none'` 并清掉插入线；`handleDockDrop` 里再用 `dockBarRef` 兜一道
+  - **回归验证脚本**：`node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/probe-main.cjs`——起一个本地 HTTP 服务（**必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽），引用真实构建产物的 CSS，在真实 Chromium 里逐个数图标量 `.dock-bar` 宽度。实测：0 个 → 32px、4 个 → 284px、16 个 → 1052px、20 个 → 封顶 1154px 且开始滚动（内容 1308）、30 个 → 仍 1154px
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）。**落点换算**：`calcDropIndex` 返回的是「顶层图标」下标（`iconRefs` 里只有顶层条目 + 分隔线），而 `apps` 是扁平数组（含分组成员），所以重排与拖入添加都必须用 `topAnchorId(list, idx)` 先换成锚点 id 再取扁平插入点——直接把顶层下标当扁平下标用会让插入位置偏「成员数」个槽位
 - **拖入文件添加**：从资源管理器拖 `.lnk`/`.url`/`.pif`/`.exe`/`.com` 到 Dock 栏即添加（**仅 Dock 栏区域**响应，其余位置显示禁止光标）。Electron 32+ 已移除 `File.path`，路径只能由 preload 的 `webUtils.getPathForFile` 提供；主进程 `describe-paths` 分派解析（快捷方式复用 `parseLnkFile`，exe 走单次 PowerShell 批量取 FileDescription + 图标，提取失败回退 shell32 通用图标），renderer 按落点插入、按路径去重（重复或格式不支持则跳过并提示）。**整窗**都要 `dragover`/`drop` preventDefault，否则 Chromium 会把窗口导航到 `file://`（白屏）
 - **分隔线**：`isSeparator` 特殊条目——1px 渐变柔线（比图标矮、两端淡出、随主题变色），只从图标右键「在此之前插入分隔线」创建；可拖拽排序、随 `shortcuts.json` 持久化；不启动、不参与桌面扫描去重/清理/键盘导航/悬停放大。命中区做成 9px（可视竖线仅 1px）+ `z-index: 20`：1px 太细时旁边放大中的图标（`magnify` 给图标设 `z-index: 10`）会压住它，右键点不中
@@ -76,8 +85,37 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - 关闭窗口 → 隐藏到系统托盘（不退出）
 - 托盘左键单击 → `toggleWindow()`（同上逻辑）
 - 托盘右键菜单 →「显示窗口」/「退出」
-- 托盘图标：[`resources/tray-icon.ico`](resources/tray-icon.ico)（16/20/24/32 多尺寸）。**必须用多尺寸 ICO，不能用单尺寸 PNG**：显示器缩放 125% 时托盘需要 20 物理像素、150% 需要 24、200% 需要 32，单尺寸 PNG 会被系统拉伸成模糊（v1.11.0 之前是 16×16 PNG，在 125% 下必然发虚）。图形为「蓝色圆角块 + 白色加号」——16px 下唯一还看得清的符号；原始 2×3 图标布局缩到 16px 时每块只剩约 4px，会糊成一片蓝斑
-- 应用图标：[`resources/icon.ico`](resources/icon.ico)
+- 托盘图标：[`resources/tray-icon.ico`](resources/tray-icon.ico)（16/20/24/32/48/64 六档）。**必须用多尺寸 ICO，不能用单尺寸 PNG**：显示器缩放 125% 时托盘需要 20 物理像素、150% 需要 24、200% 需要 32，单尺寸 PNG 会被系统拉伸成模糊（v1.11.0 之前是 16×16 PNG，在 125% 下必然发虚）。托盘只到 64 档：通知区物理最大 32px，再大的档位永远取不到
+- 应用图标：[`resources/icon.ico`](resources/icon.ico)（16/20/24/32/40/48/64/128/256 九档）
+
+### 图标体系（v1.13.0 起由 SVG 生成，改图标必读）
+
+**唯一真相源是两个 SVG**，ICO 由脚本生成、**不要手改 ICO**：
+
+| 文件 | 作用 |
+|---|---|
+| [`resources/icon.svg`](resources/icon.svg) | 主图标源（应用 / 安装包 / 桌面 / 开始菜单 / 任务栏 / 窗口） |
+| [`resources/tray-icon.svg`](resources/tray-icon.svg) | 托盘源。**必须与 `icon.svg` 逐字节相同**（用户要求两处形象完全一致） |
+| `.dsh-vision-toolkit/make-icons.mjs` | 生成器：SVG → 逐尺寸独立光栅化 → ICO。**内含哈希校验，两个 SVG 不一致就直接报错退出** |
+| `.dsh-vision-toolkit/verify-icons.mjs` | 校验两枚 ICO 在共同尺寸上**逐像素一致** |
+
+改图标的流程：改 `icon.svg` → 复制覆盖 `tray-icon.svg` → 跑 `node .dsh-vision-toolkit/make-icons.mjs` → 跑 `verify-icons.mjs` 复核。
+
+**形象**：蓝色圆角方块（`#3B7BD5`，圆角 54/256）上叠**三块白色瓷砖**（条宽 48 / 间隙 32 / 高 140 / 圆角 12）。蓝块 = Dock 的玻璃条，三块瓷砖 = 停在上面的一格格快捷方式。
+
+**几何是「从像素网格反推」出来的，不是审美数字——改尺寸前务必看这段**。图标最小要出到 16×16，那时画布只有 16 格，能承载的结构极有限。实测过的方案与结论（脚本 `final-check.mjs` / `try-icons*.mjs` 可复现）：
+
+| 方案 | 16px 实测 | 结论 |
+|---|---|---|
+| 2×2 / 2×3 网格 | 白色连成一片 | ❌ 结构全丢，读成一个白方块 |
+| 三条**横**线 | 分得开 | ❌ 满宽横线 + 0.24 长宽比 = 标准「汉堡菜单」，语义跑偏 |
+| 竖块但间隙 12 | 隙仅 0.75px，抗锯齿糊平 | ❌ 又是白方块 |
+| **竖块 条48/隙32** | `B WWWW B WWWW B WWWW B`（隙 2px 完整保留） | ✅ 现行 |
+
+- **判断小尺寸可读性的正确判据：间隙里是否真的还留有底色**，而不是数「浅色连通块个数」——抗锯齿会产生浅蓝像素，按后者会把糊掉的方案误判为通过（这个错已经犯过一次）
+- 光栅化器只认**圆角矩形**（`<rect>` / `<g fill>`）。要加 path / 描边 / 渐变 / 滤镜，必须先把渲染方案换掉（当前刻意不引依赖：没有 sharp/resvg/canvas，也没用 Electron 截图）
+- 生成器解析前会**先剥掉 XML 注释**：SVG 注释里若出现 `<g fill=...>` 这样的标签文本，不剥就会被正则先匹配到（踩过一次）
+- ⚠️ **改 `.dsh-vision-toolkit/*.mjs` 一律用编辑器工具，不要用 PowerShell 的 `Set-Content`/`Get-Content`**——本项目已因此损坏过一次脚本（中文注释全部 mojibake + 行被合并成语法错误）。这就是「注意事项」里那条 PowerShell 编码坑在脚本文件上的又一次实例
 
 ### 开机自启动
 
@@ -267,6 +305,7 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.3`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.3），功能变更后需同步更新，并与提交信息版本对齐
+  - **不只是中文丢失**：`(Get-Content -Raw) -replace ... | Set-Content -NoNewline` 这类「读-改-写」还会**悄悄合并行尾**，把脚本压成一行并抛出 `SyntaxError`（`return outside function`）。v1.13.0 做图标时用这招改 `.dsh-vision-toolkit/make-icons.mjs` 就中了一次，中文注释也全成了 mojibake。**结论：任何源文件（含自己写的生成脚本）都只用编辑器工具改，PowerShell 只用来读和跑命令**——它是本项目第二起同类事故了
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.13.0`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.13.0），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

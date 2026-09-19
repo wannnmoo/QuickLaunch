@@ -234,12 +234,31 @@ function App(): React.ReactElement {
     return off
   }, [])
 
+  // 把引擎认可的视口宽度写进 CSS 变量，供 .dock-bar 的 max-width 使用。
+  // 不用 `100vw`：实测本窗口里 100vw 比 window.innerWidth 大 2px，玻璃条会多溢出 2px。
+  // 写在根元素上（继承给 .dock-bar），这样不依赖任何子元素 ref 的挂载时序。
+  useEffect(() => {
+    const el = appRef.current
+    if (!el) return
+    const sync = (): void => {
+      el.style.setProperty('--dock-vw', `${window.innerWidth}px`)
+    }
+    sync()
+    window.addEventListener('resize', sync)
+    return () => window.removeEventListener('resize', sync)
+  }, [])
+
   const menuRef = useRef<HTMLDivElement>(null)
   const ctxRef = useRef<HTMLDivElement>(null)
   const dockRef = useRef<HTMLDivElement>(null)
+  const appRef = useRef<HTMLDivElement>(null)
   const dockBgRef = useRef<HTMLDivElement>(null)
   const dockInnerRef = useRef<HTMLDivElement>(null)
   const addBtnRef = useRef<HTMLDivElement>(null)
+  // 玻璃条本体（宽度随图标数量伸缩）。拖入文件的命中区按**它**算，不能按 .dock——
+  // .dock 占满整窗，图标少时条两侧的透明区也在 .dock 内，不区分的话会出现
+  // 「在空白处松手也会添加，但那里不显示插入线和禁止光标」的不一致。
+  const dockBarRef = useRef<HTMLDivElement>(null)
   const iconRefs = useRef<Map<number, HTMLDivElement>>(new Map())  // 菜单打开期间用户是否已手动切换过开关：防止过期的异步读取（getAutoStart /
   // getDesktopIconsHidden）覆盖乐观更新的状态（陈旧响应竞态）
   const autoStartDirtyRef = useRef(false)
@@ -468,9 +487,28 @@ function App(): React.ReactElement {
   useEffect(() => {
     const prevent = (e: DragEvent) => {
       e.preventDefault()
-      const dock = dockRef.current
-      if (e.dataTransfer && !(dock && dock.contains(e.target as Node))) {
-        e.dataTransfer.dropEffect = 'none'
+      if (!e.dataTransfer) return
+      // 只有落在**玻璃条本体**上才算有效放置目标。用 elementFromPoint 而不是 e.target：
+      // 光标正下方可能是放大中的图标（被 transform 放大并抬到 z-index 10），
+      // 而它同样是 .dock-bar 的后代，contains() 的判断与视觉一致。
+      const over = document.elementFromPoint(e.clientX, e.clientY)
+      const bar = dockBarRef.current
+      const onBar = !!bar && !!over && bar.contains(over)
+      // 光标显示「禁止」——明确「只有 Dock 栏能放」
+      e.dataTransfer.dropEffect = onBar ? 'copy' : 'none'
+      // 不在条上时顺手清掉上一帧的插入线/高亮（从条上滑到旁边的透明区时，
+      // React 的 dragleave 仍会触发，但这里再兜一次，避免边缘抖动留下残影）
+      if (!onBar && fileDragOverRef.current) {
+        const next = e.relatedTarget as Node | null
+        if (!next || !bar?.contains(next)) {
+          fileDragOverRef.current = false
+          setFileDragOver(false)
+          setDropIdx(null)
+          if (edgeRafRef.current !== null) {
+            cancelAnimationFrame(edgeRafRef.current)
+            edgeRafRef.current = null
+          }
+        }
       }
     }
     document.addEventListener('dragover', prevent)
@@ -1005,6 +1043,16 @@ function App(): React.ReactElement {
   const handleDockDrop = async (e: React.DragEvent) => {
     if (!isFileDragEvent(e)) return
     e.preventDefault()
+    // 兜底：只接受落在玻璃条本体上的拖放（见 document 级 dragover 里那段说明）。
+    // .dock 占满整窗，不加这道判断时图标少、条很窄，旁边大片透明区也能"接住"文件。
+    const bar = dockBarRef.current
+    if (bar && !bar.contains(e.target as Node)) {
+      fileDragOverRef.current = false
+      setFileDragOver(false)
+      setDropIdx(null)
+      stopEdgeScroll()
+      return
+    }
     const at = calcDropIndex(e.clientX)
     fileDragOverRef.current = false
     setFileDragOver(false)
@@ -1910,6 +1958,7 @@ function App(): React.ReactElement {
 
   return (
     <div
+      ref={appRef}
       className={(theme === 'light' ? 'app theme-light' : theme === 'transparent' ? 'app theme-transparent' : 'app')
         // 悬停卡片打开时加标记类：CSS 用它压掉图标悬浮标签（否则会透过半透明卡片叠字）
         + (folderCard || showDrivesCard ? ' card-open' : '')}
@@ -1926,16 +1975,22 @@ function App(): React.ReactElement {
         onDragLeave={handleDockDragLeave}
         onDrop={handleDockDrop}
       >
-        {/* 毛玻璃背景独立层：只覆盖图标区（图标在其中垂直居中，上下间距小）。
-            顶部放大留白区是透明的，hover 放大时图标会顶出背景之上（类似 macOS）。 */}
-        <div className="dock-bg" ref={dockBgRef} />
-        <div
-          // 两端还有图标可滚时加标记类：CSS 用遮罩让边缘的图标「溶解」而不是被硬切一刀
-          // （硬切的半个图标压在圆角边缘上，看着像探出了 Dock 轮廓）
-          className={'dock-inner' + (scrollState.left ? ' edge-left' : '') + (scrollState.right ? ' edge-right' : '')}
-          ref={setDockInnerRef}
-          onScroll={updateScrollState}
-        >
+        {/* .dock 是**占满整窗**的定位层（位置与拖放命中区都按整窗算），玻璃条本体是里面
+            这个 .dock-bar：宽度 `max-content` —— **图标少时收缩到刚好看得下，图标变多时
+            一路长到窗口宽度上限，再多的图标才开始横向滚动**（v1.13.0）。
+            窗口尺寸恒定不变（透明窗口 resize 会白闪），变的只是这层玻璃条的宽度。
+            与分组面板 .group-panel 是同一套做法。 */}
+        <div className="dock-bar" ref={dockBarRef}>
+          {/* 毛玻璃背景独立层：只覆盖图标区（图标在其中垂直居中，上下间距小）。
+              顶部放大留白区是透明的，hover 放大时图标会顶出背景之上（类似 macOS）。 */}
+          <div className="dock-bg" ref={dockBgRef} />
+          <div
+            // 两端还有图标可滚时加标记类：CSS 用遮罩让边缘的图标「溶解」而不是被硬切一刀
+            // （硬切的半个图标压在圆角边缘上，看着像探出了 Dock 轮廓）
+            className={'dock-inner' + (scrollState.left ? ' edge-left' : '') + (scrollState.right ? ' edge-right' : '')}
+            ref={setDockInnerRef}
+            onScroll={updateScrollState}
+          >
           {dropIdx === 0 && <div className="drop-indicator" />}
 
           {viewTopLevel.map((app, idx) => (
@@ -2058,9 +2113,11 @@ function App(): React.ReactElement {
           </div>
         </div>
 
-        {/* 两端渐隐提示：那一侧还有图标可滚动查看 */}
-        <div className={`dock-edge left${scrollState.left ? ' show' : ''}`} />
-        <div className={`dock-edge right${scrollState.right ? ' show' : ''}`} />
+          {/* 两端渐隐提示：那一侧还有图标可滚动查看。
+              贴在玻璃条两端 → 必须留在 .dock-bar 内（.dock-bar 是它们的定位参照） */}
+          <div className={`dock-edge left${scrollState.left ? ' show' : ''}`} />
+          <div className={`dock-edge right${scrollState.right ? ' show' : ''}`} />
+        </div>
       </div>
 
       {/* 分组面板：主 Dock 同构的迷你 Dock —— 图标尺寸/悬停放大/悬浮标签全部复用

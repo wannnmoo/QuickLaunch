@@ -178,18 +178,37 @@ html, body {
   width: 100%;
   display: flex;
   justify-content: center;
-  position: relative; /* 渐隐遮罩定位参照 */
+  /* **只做定位与拖放命中层**：占满整窗，但不决定玻璃条宽度 */
+  position: relative;
   padding: 8px 24px;
   z-index: 50;
   /* 无 app-region 拖动区：Dock 位置由「位置」预设决定（下/上贴边居中、中间居中） */
 }
 
+/* ─── 玻璃条本体：宽度随图标数量伸缩（v1.13.0）────────────────────────────
+   图标少 → 收缩到刚好看得下（不再是一整条空荡荡的通栏，两端留白消失）；
+   图标多 → 一路长到 `max-width` 上限；再多才开始横向滚动（.dock-inner 负责）。
+   窗口尺寸始终不变（透明窗口 resize 会白闪），变的只是这一层的宽度。
+   分组面板 .group-panel 用的是同一套写法（max-content + max-width + 滚动）。 */
+.dock-bar {
+  position: relative; /* .dock-bg / .dock-edge 的定位参照 */
+  width: max-content;
+  /* 上限 = 视口宽度 − .dock 的左右 padding（各 24px）。
+     用 JS 写入的 `--dock-vw`（= window.innerWidth）而不是 `100vw`：实测在本窗口里
+     `100vw` 比 `window.innerWidth` **大 2px**（1202 vs 1200），玻璃条会多出 2px 溢出
+     可用区。`--dock-vw` 由 renderer 在挂载与窗口尺寸变化时写入，取的就是引擎自己认可的
+     视口宽度，不受 vw 单位与窗口边框/缩放之间那点差异影响。
+     兜底 100vw：万一变量没写上（极端时序）也仍然可用。 */
+  max-width: calc(var(--dock-vw, 100vw) - 48px);
+}
+
 /* 毛玻璃背景：独立层，只覆盖图标区（图标在其中垂直居中，上下各 8px 小间距）。
-   顶部 70px 放大区是透明的，hover 放大时图标和悬浮标签会顶出背景之上——macOS Dock 观感。 */
+   顶部 70px 放大区是透明的，hover 放大时图标和悬浮标签会顶出背景之上——macOS Dock 观感。
+   左右用 inset 0（原先是 left/right: 24px，那 24px 是 .dock 的 padding，现在归 .dock-bar 管）。 */
 .dock-bg {
   position: absolute;
-  left: 24px;
-  right: 24px;
+  left: 0;
+  right: 0;
   top: 70px; /* 图标顶上方留 8px（与 .dock-inner 的 70px 透明区一致） */
   bottom: 0; /* 图标底下方留 8px（图标底 139，dock 底 146） */
   z-index: 0;
@@ -284,7 +303,11 @@ html[data-glass-fx='off'] .dock-bg::after {
      的图标在这里顶出背景，不被 overflow 裁剪；同时容纳悬浮在图标上方的标签
      （标签随放大一起上移，44px 区会越界被裁，故加高到 70px） */
   padding: 70px 16px 0;
-  max-width: 100%;
+  /* 宽度上限**只由 .dock-bar 的 max-width 决定**，这里不再写 max-width: 100%。
+     原因：.dock-bar 是 `width: max-content`（收缩包裹），其内部的百分比 max-width
+     解析基准是不确定的容器宽度，规范上要按「先忽略该约束再回代」处理——留着它既是
+     冗余，也让「到底谁在限宽」变得难读。实测：只留 .dock-bar 的 max-width 即可，
+     超宽时这里照常出现横向滚动。 */
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
@@ -335,12 +358,12 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 .dock-edge.left {
-  left: 24px;
+  left: 0; /* 定位基准已是 .dock-bar（= 玻璃条本身），不再需要那 24px 偏移 */
   background: linear-gradient(to right, var(--dock-edge), rgba(18, 22, 34, 0));
 }
 
 .dock-edge.right {
-  right: 24px;
+  right: 0;
   background: linear-gradient(to left, var(--dock-edge), rgba(18, 22, 34, 0));
 }
 
