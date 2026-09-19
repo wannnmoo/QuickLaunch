@@ -216,7 +216,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - appId: `com.quicklaunch.app`
 - 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.ico` → `tray-icon.ico`
 - Windows：`executableName: QuickLaunch`，图标 `resources/icon.ico`
-- 排除源码和配置文件，仅打包编译输出
+- **排除源码和配置文件，仅打包编译输出**。**额外排除 `node_modules/**`**（v1.12.3）：三个产物都不在运行时 require 第三方包——main 只依赖 `electron` + Node 内置模块，preload 只依赖 `electron`，renderer 由 Vite 把 react/react-dom 全量打进 bundle。实测 asar 里的 `node_modules`（react/react-dom/scheduler）7.2 MB 纯属白占（asar 145.7 → 138.41 MB）。⚠️ 一旦将来真要引入外部/原生模块（例如 sqlite），**必须去掉这一行**，否则那个包不会被打进产物
 - `electronDist: ./electron-v*.zip`：用项目根目录**手动下载**的 Electron 分发包打包，跳过网络下载（日志出现 `using custom electronDist zip file` 即为生效）。zip 已被 `.gitignore` 的 `electron-v*.zip` 规则忽略；需与 `package.json` 的 Electron 版本一致，换机器打包前删掉该行或用 `ELECTRON_MIRROR` 环境变量
 
 ### 持久化格式
@@ -262,11 +262,11 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - `run-app` 用 `execFile(targetPath, splitArgs(args))` 拆分参数——`splitArgs` 按空格切分但把双引号包裹段作为整体并剥引号（.lnk 的 Arguments 常带引号，如 `"E:\DSH\start-dsh.vbs"`；原样拆分会把字面引号传给 wscript 等宿主导致「Windows Script Host 执行失败」，顺带支持含空格的带引号参数）；含空格且无引号的参数仍不支持——已知限制
 - **`run-app` 的失败判定只看「进程有没有起来」**：`err.code` 是**字符串**才是 spawn 级失败（ENOENT/EACCES/EPERM/UNKNOWN…），**数字则是进程正常启动、只是退出码非零**——很多应用/启动器带参数启动后会立刻以非零码退出，把这种当成失败会把 Dock 错误地拽回来。恢复显示统一走 `restoreDockAfterFailedLaunch()`
 - **`run-app` 直接 spawn 被拒（`EACCES`/`EPERM`，多为程序需要管理员权限或杀软拦截裸 `CreateProcess`）时回退 `shell.openPath()`**——与资源管理器双击一致，自动弹 UAC 提权，代价是丢弃启动参数。该路径是已处理流程，只打单行 `console.log`，不打错误堆栈；其它 spawn 失败会**恢复显示 + 置顶**（点了图标却什么都没启动时 Dock 不能消失）
-- **启动节流**：`handleRun` 有 700ms 连点节流——Dock 隐藏到托盘前用户容易多点几下，每次点击都会真的 `CreateProcess` 开一个新实例
+- **启动防连点必须按目标分别计时（v1.12.3 踩过，别再写成全局）**：`handleRun` 用 `lastRunAtRef: Map<targetPath, timestamp>`（窗口 600ms）而不是一个全局时间戳。曾经写成全局 `if (now - lastRunAtRef.current < 700) return`：启动 A 之后的 700ms 内点 B 会被**静默丢弃**——既不启动、也无任何反馈，表现为「Dock 不消失、软件也没起来」（分组面板连点成员时最易撞上）。而且这个守卫本来就不需要那么强：主进程 `run-app` 的**第一件事**就是 `mainWindow.hide()`（在 `CreateProcess` 之前），窗口随即消失、来不及被点第二次，它只需挡「同一次点击被派发两遍」
 - **文件夹预览（`list-folder`）的三个坑**：① Windows 目录联接/符号链接在 `Dirent` 上是 `isDirectory()=false` + `isSymbolicLink()=true`，必须补一次 `stat` 才认得出是目录（否则算进文件数、按文件排序、显示字节大小、图标也不对）；② 超大目录（>4000 项）用 `Intl.Collator` 排序会比较百万次、把主进程卡住好几秒，超阈值退回廉价的字符串比较；③ 后台补图标（`fillFolderIcons`）每批前检查 `sender.isDestroyed()`，失效时**删掉自己写的那条缓存**——否则窗口重建后卡片在 TTL 内永远只有占位块，且没有任何补批会再来。**目录图标不能用 `app.getFileIcon`**（实测返回错图标），统一用启动时提取一次、常驻内存的 shell32 index 4 黄色文件夹图标
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.2`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.2），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.12.3`，每次发布需手动更新）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.12.3），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

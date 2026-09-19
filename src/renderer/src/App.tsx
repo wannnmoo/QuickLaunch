@@ -252,9 +252,10 @@ function App(): React.ReactElement {
   const dragStartedRef = useRef(false)
   // 拖拽结束后吞掉紧随其后的 click，防止误启动图标
   const suppressClickRef = useRef(false)
-  // 上一次「启动条目」的时刻：吸收启动瞬间的连点（Dock 隐藏前用户容易多点几下，
-  // 每次点击都会真的 CreateProcess 开一个新实例）
-  const lastRunAtRef = useRef(0)
+  // 每个「启动目标」各自的最近一次启动时刻：只吸收同一个目标的重复点击，
+  // **绝不能做成全局时间戳**（那会让启动 A 之后的 700ms 内点 B 被静默吞掉）。
+  // 主进程 run-app 会先 hide() 窗口，所以这里只需要一个很短的窗口挡合成双击。
+  const lastRunAtRef = useRef<Map<string, number>>(new Map())
   const [dragId, setDragId] = useState<number | null>(null)
   const [dropIdx, setDropIdx] = useState<number | null>(null)
   // 拖拽中命中的分组图标（高亮提示「松手即归入该组」）
@@ -1222,11 +1223,16 @@ function App(): React.ReactElement {
     }
     // 分隔符：不启动任何东西（点击/Enter 均无效）
     if (app.isSeparator) return
-    // 防连点：启动是「先隐藏 Dock 再 CreateProcess」，Dock 隐藏前用户很可能又点了两下，
-    // 那会真的把程序开成三份。用一个短窗口吸收这段时间内的重复点击。
+    // 防连点：**必须按目标分别计时，不能用一个全局时间戳**。
+    // 主进程 `run-app` 的第一件事就是 `mainWindow.hide()`（在 CreateProcess 之前），窗口
+    // 随即消失、根本来不及被点第二次——所以这个守卫只需要挡住「同一次点击被派发两遍」
+    // （鼠标抖动/合成双击）以及窗口隐藏前那一瞬间的重复点击。
+    // 曾经写成全局 `lastRunAtRef`：启动 A 之后的 700ms 内点 B 会被**静默丢弃**，既不启动
+    // 也没有任何反馈，表现为「点了分组里的软件，Dock 不消失、软件也没起来」——正是这个 bug。
     const now = Date.now()
-    if (now - lastRunAtRef.current < 700) return
-    lastRunAtRef.current = now
+    const lastSame = lastRunAtRef.current.get(app.targetPath) ?? 0
+    if (now - lastSame < 600) return
+    lastRunAtRef.current.set(app.targetPath, now)
     // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
     // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)

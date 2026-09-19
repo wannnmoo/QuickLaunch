@@ -9,6 +9,13 @@ files:
   - '!src/*'
   - '!electron-vite.config.*'
   - '!{.eslintignore,.eslintrc,.prettierignore,.prettierrc,tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # 不打包 node_modules：三个产物**都不在运行时 require 任何第三方包**——main 只依赖
+  # electron + node 内置模块（child_process/fs/path），preload 只依赖 electron，
+  # renderer 由 Vite 把 react/react-dom 全量打进 bundle。
+  # 实测 asar 里的 node_modules（react/react-dom/scheduler）共 7.2 MB，纯属白占体积。
+  # 注意：本项目**没有运行时依赖**，所以整目录排除是安全的；一旦将来真要用外部/原生模块
+  # （例如加个 sqlite），必须去掉这一行，否则那个包不会被打进产物。
+  - '!node_modules/**'
 extraResources:
   - from: resources/icon.ico
     to: icon.ico

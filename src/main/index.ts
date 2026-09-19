@@ -1173,10 +1173,15 @@ if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
 // 卡片弹出时图标已就位），其余后台分批补并推 `folder-icons` 事件就地替换。
 const FOLDER_LIST_LIMIT = 400
 const FOLDER_LIST_TTL = 5000
-const FOLDER_CACHE_MAX = 40
+// 缓存目录数上限。这是主进程里**最大的一块可变内存**：每个缓存项都带着它那批图标的
+// data URL（上限见 FOLDER_ICON_LIMIT）。40 个目录 × 每目录上百个图标 ≈ 十 MB 量级常驻，
+// 而用户实际只会来回看少数几个目录 → 24 足够，超出部分按「先清过期、再踢最旧」淘汰。
+const FOLDER_CACHE_MAX = 24
 const FOLDER_ICON_INLINE = 14 // 返回前就填好的首批（卡片首屏可见的那十几行）
 const FOLDER_ICON_BATCH = 24 // 后台每批数量（每批推一次事件，卡片逐批换图标）
-const FOLDER_ICON_LIMIT = 150 // 后台补图标的总上限，再多就没意义了（超出用中性占位块）
+// 后台补图标的总上限。卡片一屏约 20 行，96 个已经够用户滚四屏以上；再多只是把内存
+// 和 `folder-icons` 事件的传输量堆上去（每次推送都要把这一批 data URL 跨进程拷一遍）
+const FOLDER_ICON_LIMIT = 96
 // 资源管理器默认不显示的系统文件/目录：列出来只是噪音（每个文件夹都有 desktop.ini）
 const FOLDER_BLOCKLIST = new Set(['desktop.ini', 'thumbs.db', '$recycle.bin', 'system volume information'])
 const folderCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' })
