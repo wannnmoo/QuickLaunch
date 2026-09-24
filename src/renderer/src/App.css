@@ -1090,32 +1090,68 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 /* 分组图标预览：组内前 4 个图标的缩略拼图（macOS 堆叠观感）。
-   容器 54×54，两个一行（26 + 2 间隙）；成员 3 个时第二行单个自动居中，
-   成员 1 个时用 .single 放大单图。 */
+   ⚠️ 几何是**为右下角的数量徽标让位**算出来的（v1.13.2，改这块必看）：
+   徽标锚在图标框右下角，是 16×16（`.dock-badge`，bottom/right: 0）。
+   原来拼图是 54×54、图 26px，4 成员时第 4 张正好落在右下角 —— 实测徽标**盖住那张图的 25%**
+   （重叠 169 / 676 px²），4 个成员的分组看起来就像少了一块。
+   现在：2×2 网格 = 23 + 2 + 23 = **48**，作为**内容盒**存进 52×52（border-box + 上下左右各 2px
+   padding）→ 整块网格相对图标框**上移 2 / 左移 2**，于是右下角空出正好 16×16 给徽标：
+     图 4 右下角 = 图标框 (48, 50)  徽标左上角 = (44, 44)  →  不再相交 ✔
+   成员 3 个时第二行单个自动居中（justify-content: center），不与徽标冲突。
+   成员 1 个时用 .single 放大单图（38px，见下）。 */
 .dock-group-preview {
   display: flex;
   flex-wrap: wrap;
-  align-content: center;
-  justify-content: center;
+  /* anchor 到左上（不用 center，见下） */
+  align-content: flex-start;
+  justify-content: flex-start;
   gap: 2px;
-  width: 54px;
-  height: 54px;
+  box-sizing: border-box;
+  width: 40px;  /* 2×2：19 + 2 + 19 */
+  height: 40px;
+  /* ⚠️⚠️ 定位方式试了四轮才对，别再改错（v1.13.2）：
+     ① `margin` / 负 margin **无效** —— `.dock-icon-wrap` 是 `display:flex` +
+        `align-items/justify-content: center`，flex 的居中断言会盖掉 margin；
+     ② 只写 `position:absolute; top:0; left:0` **也无效** —— 实测 offsetLeft/offsetTop
+        仍是 9/9（被 flex 居中），因为绝对定位只把盒子移出文档流，**并不豁免父级的对齐**；
+     ③ 正解：`position:absolute` + **四个方向的 inset + `margin:auto`**，把盒子钉在
+        padding box 左上角。写成 `inset:0 auto auto 0` 亦可。
+     最终几何：网格落在图标框 (4,4)..(44,44)，而徽标占 (44,44)..(60,60) → 恰好相接不重叠。 */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  margin: 4px auto auto 4px;
+  align-self: flex-start;
+  justify-self: flex-start;
 }
 
 .dock-group-preview img {
-  width: 26px;
-  height: 26px;
+  width: 19px;
+  height: 19px;
   object-fit: contain;
   -webkit-user-drag: none;
+  border-radius: 4px;
 }
 
-.dock-group-preview.single img {
+/* 单成员：一张大图。40px 居中会与徽标相切（实测重叠 25~36px²），
+   所以同样避让到徽标左上沿 (44,44) 之内：36px 放在 (2,2) → 占 2..38，留足余量 */
+.dock-group-preview.single {
+  align-content: center;
+  justify-content: center;
   width: 40px;
   height: 40px;
 }
 
+.dock-group-preview.single img {
+  width: 36px;
+  height: 36px;
+}
+
 /* 成员数量徽标（贴在图标框内侧：bottom/right 用 0 —— 负值会被滚动容器的
-   overflow: hidden 裁掉下沿，图标框本身已足够容纳） */
+   overflow: hidden 裁掉下沿）。拼图已为它让出右下角 16×16（见 .dock-group-preview）。
+   加一圈与玻璃同色的外描边：徽标可能压在图标/壁纸的任意颜色上，纯色药丸贴上去边界会糊。 */
 .dock-badge {
   position: absolute;
   right: 0;
@@ -1130,7 +1166,7 @@ html[data-glass-fx='off'] .dock-bg::after {
   line-height: 16px;
   font-weight: 600;
   text-align: center;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 1.5px var(--label-pill-bg);
   pointer-events: none;
 }
 

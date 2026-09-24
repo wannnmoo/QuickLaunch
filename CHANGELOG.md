@@ -249,6 +249,18 @@ npm run package    # 构建并打包为可执行安装包
   - **实测效果**：`app.asar` 条目 **250 → 14**、体积 **142 MB → 0.89 MB**；安装包 **235 MB → 95 MB**（省掉 140 MB）
   - 这两者都不参与运行时（main 只读 `out/**` 与 `resources/`），排除是安全的；打包版已实机启动验证（窗口标题「快捷方式面板」、4 个 Electron 子进程正常）
 
+- **㉓ 分组图标：4 个以上成员时，右下角数量徽标盖住第 4 张缩略图**（用户反馈）
+  - **现象**：分组有 4 个成员时，右下角那张成员图标被蓝色的成员数徽标压住一角
+  - **根因**：徽标 `.dock-badge` 是 16×16 锚在图标框右下角（占 `(44,44)..(60,60)`），而缩略拼图原来是 54×54 **铺满整个图标框** —— 2×2 时第 4 张正好落在右下角，**实测被盖住 25%**（重叠 169/676 px²）。3 个成员时第二行只有一个、被 `justify-content: center` 居中，所以碰不到；**这个 bug 只在 ≥4 个成员时出现**（成员越多越明显，与直觉相反）
+  - **修法**：拼图缩为 2×2 = `19 + 2 + 19 = 40`，钉在图标框 `(4,4)..(44,44)`，与徽标恰好相接不重叠；徽标加一圈 `0 0 0 1.5px var(--label-pill-bg)` 外描边（它可能压在任意颜色的图标上）
+  - **实测**（5 种成员数：1/2/3/4/8）：重叠 **169 px² → 0 px²**，全部为 0
+  - ⚠️ **定位方式试错四轮，三条弯路值得记下**：
+    1. `margin` / 负 margin **无效** —— `.dock-icon-wrap` 是 `display:flex` + `align-items/justify-content: center`，flex 居中断言会盖掉 margin
+    2. 只写 `position:absolute; top:0; left:0` **也无效** —— 实测 `offsetLeft/offsetTop` 仍是 `9/9`（被 flex 居中）。**绝对定位只把盒子移出文档流，并不豁免父级的对齐**
+    3. 正解：`position:absolute` + 四向 inset + `margin:auto`（本项目用 `inset:0; margin:4px auto auto 4px`）
+  - 教训：**在 flex 容器里给绝对子元素定位时，`top/left` 不一定说了算**，必须实测 `offsetLeft/offsetTop`；我在这处连续推错三次，每次都被探针打回来。另外「1px 余量」在亚像素布局下会退化成 8×8 的实际重叠，**余量要给够，别卡着算**
+  - 回归断言见 `regression.cjs` 第 8 组
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
