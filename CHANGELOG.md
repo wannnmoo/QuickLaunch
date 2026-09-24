@@ -273,6 +273,34 @@ npm run package    # 构建并打包为可执行安装包
     | **4 张 22px 阶梯（前卡在右下）** | 四张都能辨认 + 有厚度感 + 右下角天然让位 ✅ |
   - 成员不足 4 个时位置**固定不重排**（2 个是「左上+右上」、3 个是「上排两个+左下」），所以看起来始终是同一叠，不会因为成员数变化而跳位置
 
+- **㉕ 「白天」模式偏白，没有毛玻璃感**（用户反馈）
+  - **根因是两层白叠加**：`.dock-bg` 的玻璃底色本身是 `rgba(252,252,254,.92) → .74`（几乎不透），
+    而它上面还压着一层 `radial-gradient(rgba(255,255,255,.14))` 的上沿高光 —— 在这么高的不透明度上再叠白，
+    「白板感」被放大一档，彩色壁纸完全透不出来
+  - **修法**：底色降到 **`.68 → .46`**，上沿高光从 `.14` 降到 **`.045`**，饱和度同时从 1.7 回调到 **1.45**
+    （白玻璃下再拉高饱和会让彩色壁纸透出时发灰发脏）。为此把原来硬编码在高光与 backdrop-filter 里的
+    两个值抽成变量 **`--dock-sheen` / `--dock-sat`**，便于按主题调
+  - **实测**（真实应用窗口）：玻璃填充 `rgba(252,252,254,0.68)` ✔、`--dock-sheen: 0.045` ✔、`--dock-sat: 1.45` ✔；
+    截图对比可见壁纸的紫/橙渐变明显透过玻璃，同时图标仍清晰
+  - ⚠️ 教训：**多层半透明叠加要一起算总不透明度**。只调最外层（或只调底色）都看不出效果 ——
+    这次是底色 + 径向高光两层白叠在一起，只看其中一个变量会误判「已经够透了」
+
+- **㉖ 「+」菜单里两种字体不匹配、字比较粗糙**（用户反馈）
+  - **根因一（粗糙）**：字体栈是
+    `-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif`
+    —— 这些在 Windows 上**都不提供中文字形**，中文落到 Arial 缺失后由 GDI 兜底字（Tahoma）渲染，
+    笔画细、边缘发虚。改为 `system-ui, 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', …`：
+    显式把**微软雅黑 UI**（雅黑的 UI 变体，小字号 hinting 更好）排进栈里
+  - **根因二（不匹配）**：`.dropdown-item` 是 `<button>`，而 **Chromium 的 UA 样式表给 button 设了自己的
+    font、不是 `inherit`** —— 于是它拿不到 body 的字体栈（实测 computed font-family 就是 `Arial`）；
+    而同在菜单里的 `.theme-seg-btn` 因为显式写了 `font: inherit`，用的是应用字体栈。
+    同一个浮层里两种中文字形并排。修法是在基础层全局收口 `button, input, select, textarea { font: inherit }`
+  - **根因三（不匹配）**：菜单项 `.84rem/400`、分段按钮 `.8rem/600` —— 字号差 + 字重差叠加，视觉上是「两种字体」
+  - **实测**（应用改动后）：菜单项与分段按钮**同为** `system-ui / 13.44px / weight 500 / letter-spacing .01em`，
+    子行 `12.48px/500`；真实应用窗口里 body 字体为 `system-ui`
+  - ⚠️ 教训：**`<button>` 不继承 `font`** 是 Chromium UA 样式表的固有行为，凡是给按钮写字体都要显式声明
+    或在基础层统一收口；别指望它跟着 body 走
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
@@ -291,6 +319,23 @@ npm run package    # 构建并打包为可执行安装包
 | `stack-variants.cjs` | **分组缩略图的 6 种候选样式**并排渲染 + 1x 截图，用于选型（层叠卡片就是这么定下来的） |
 | `badge-geometry.cjs` | 徽标与缩略图/单图的重叠面积，覆盖 1/2/3/4/8 五种成员数 |
 | `payload-loss.cjs` | **落盘往返**：模拟真实 shortcuts.json + 桌面扫描合并，核对 groupId/specialType 等字段是否存活 |
+| `themes.cjs` / `themes-1x.cjs` | 三种主题逐一渲染 + 取配色变量（**按层拆解 background-image**，别只看第一层） |
+| `menu-fonts.cjs` | 「+」菜单字体候选对比（**不要再设 `zoomFactor`**，会按源污染后续所有探针） |
+
+#### ⚠️ 探针环境里一个查了很久的坑：`devicePixelRatio` 会漂成 3
+
+写这一轮时花了不少时间在一个**假问题**上，记下来免得重蹈：
+
+- 现象：`ui-probe` 的浮层几何断言突然全挂，探针里 `innerWidth=400 / innerHeight=100 / devicePixelRatio=3`；
+  主题截图也整体偏大。连续排查了「zoom 持久化」「独立 userData 没生效」「窗口尺寸没被尊重」等若干假设，都不成立
+- **真相**：真实应用窗口里实测是 `vw=1200 / vh=300 / dpr=1.25`（显示器 2048×1152 @125%），**一切正常**；
+  是**探针进程**的 DPR 漂到了 3，导致同样的 1200×300 窗口只报告 400×100 CSS 像素
+- **代价**：期间一度怀疑是自己改的字体/玻璃 CSS 把布局搞坏了 —— 差点去回滚一个**本来正确**的改动
+- **对策（已落地）**：
+  1. `regression.cjs` 与 `ui-probe.cjs` 都加了**视口自检**：`vw < 1000 || vh < 250` 就当场停下并报
+     「断言不可信」，绝不输出误导性结论（宁可失败，也不要假通过/假失败）
+  2. 关键改动一律**再用真实应用复核一次**（临时钩子读 `innerWidth`/几何/字体再删掉），不只看探针
+  3. 探针里**不要设 `zoomFactor`**：Chromium 按**源**持久化 zoom，会污染之后所有同源探针
 | `label-check.cjs` / `visual-check.cjs` | 悬浮标签是否被容器裁剪、真壁纸下的居中肉眼复核 |
 
 **探针本身踩过的三个坑**（写在这里省得下次重踩）：

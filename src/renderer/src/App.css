@@ -15,12 +15,30 @@
 }
 
 html, body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  /* ⚠️ 字体栈必须显式带中文字体（v1.13.3 修）。原来是
+     `-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif`
+     —— 这些在 Windows 上**都不提供中文字形**，于是中文落到 Arial 缺失后由 GDI 兜底字
+     （Tahoma）渲染，笔画细、边缘发虚，就是用户说的「字体比较粗糙」。
+     现在走 system-ui（Win11 = Segoe UI Variable）并把「微软雅黑 UI」显式排在前面：
+     它是雅黑的 UI 变体，小字号下的 hinting 明显好于普通雅黑。 */
+  font-family: system-ui, 'Segoe UI Variable Text', 'Segoe UI',
+    'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background: transparent;
   overflow: hidden;
   height: 100%;
+}
+
+/* ⚠️ 表单控件必须显式继承字体（v1.13.3 修，这条是「两种字体不匹配」的根因）：
+   Chromium 的 UA 样式表给 button/input 设了自己的 font（不是 inherit），所以
+   `.dropdown-item`（<button>）**拿不到** body 的字体栈 —— 实测它的 computed font-family
+   就是 `Arial`；而同在菜单里的 `.theme-seg-btn` 因为显式写了 `font: inherit`，
+   用的是应用字体栈。于是同一个浮层里两种中文字形并排：菜单项细而虚、分段按钮粗而实。
+   统一在这里收口，别在各自的类里零散补 font: inherit。 */
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
 }
 
 /* ─── App shell + 主题变量 ──────────────────────────────────────────── */
@@ -73,6 +91,11 @@ html, body {
      浮层里有文字，饱和度太高会让彩色壁纸透过时压住可读性。
      抽成变量便于后续按主题调，也统一了原来「菜单/面板/卡片各写各的 blur」的现状 */
   --glass-sat: 1.4;
+  /* 玻璃上沿的白色径向高光（`--dock-sheen`）：给 1px 平面加体积感。
+     白天必须显著减弱 —— 在原本就高不透明的白底上再叠一层白高光，
+     会把「白板感」放大一档（v1.13.3 把它抽成变量就是为了按主题调） */
+  --dock-sheen: rgba(255, 255, 255, 0.14);
+  --dock-sat: 1.7;
   --label-color: rgba(255, 255, 255, 0.62);
   --label-color-hover: #fff;
   --label-pill-bg: rgba(12, 16, 28, 0.55); /* 黑夜：深藏青药丸衬底（悬停显示标签） */
@@ -106,11 +129,12 @@ html, body {
 }
 
 .app.theme-light {
-  /* 白天：不要在纯白上做玻璃——半透明白压在浅色壁纸上会「飘」且轮廓发虚。
-     提高不透明度（.88/.78 → 实际取 .92/.74：同时拉开上下落差，玻璃才有体积感），
-     描边相应减弱（.12 → .10），避免白玻璃出现脏边。 */
-  --dock-bg-top: rgba(252, 252, 254, 0.92);
-  --dock-bg-bottom: rgba(238, 241, 248, 0.74);
+  /* 白天玻璃（v1.13.3 调淡）：原来 .92/.74 几乎不透，彩色壁纸压过去就是一块白板，
+     完全没有「毛玻璃」的味道（用户反馈）。现在降到 .68/.46 —— 壁纸透得出来、
+     又能压住图标保持可读；配合下面 .dock-bg 里那层白色径向高光同步减弱
+     （原来是 0.14，在高不透明度上叠加把白感又放大了一档）。 */
+  --dock-bg-top: rgba(252, 252, 254, 0.68);
+  --dock-bg-bottom: rgba(238, 241, 248, 0.46);
   --dock-border: rgba(0, 0, 0, 0.1);
   /* 白天同样分段描边，但明暗强度都要弱：上棱用近白（浅底上仍是「受光」），
      下缘只给极淡的黑，否则白玻璃底部会脏 */
@@ -129,6 +153,10 @@ html, body {
   --dock-rim-glow: inset 0 0 0 rgba(0, 0, 0, 0);
   /* 白天浮层饱和度：白玻璃下再拉高饱和会让彩色壁纸透出时发灰发脏，压到 1.25 */
   --glass-sat: 1.25;
+  /* 白底上再叠白高光会放大「白板感」→ 白天只留极轻一层；
+     饱和度也回调（白玻璃下再拉高饱和会让彩色壁纸透出时发灰发脏） */
+  --dock-sheen: rgba(255, 255, 255, 0.045);
+  --dock-sat: 1.45;
   --dock-shadow:
     0 12px 32px rgba(0, 0, 0, 0.16),
     0 2px 8px rgba(0, 0, 0, 0.1),
@@ -236,10 +264,10 @@ html, body {
      且 slice 切片方向对上下边不可控）。 */
   background:
     linear-gradient(180deg, var(--dock-border-grad-a) 0%, var(--dock-border-grad-b) 100%) border-box,
-    radial-gradient(120% 180% at 50% -40%, rgba(255, 255, 255, 0.14), transparent 60%) padding-box,
+    radial-gradient(120% 180% at 50% -40%, var(--dock-sheen), transparent 60%) padding-box,
     linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%) padding-box;
-  backdrop-filter: blur(36px) saturate(1.7);
-  -webkit-backdrop-filter: blur(36px) saturate(1.7);
+  backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
+  -webkit-backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
   /* 描边颜色交给上面的渐变层渲染，透明边框只用来占位（1px 的绘制区域）。
      悬停时 .dock:hover .dock-bg 仍可整体换掉 border-color，但被渐变层盖住——
      平色留给 .dock-bg 的 border-color 兜底与将来取消渐变时复用 */
@@ -645,7 +673,13 @@ html[data-glass-fx='off'] .dock-bg::after {
   margin: 0 8px;
   border-radius: 10px;
   padding: 7px 12px;
+  /* 菜单项与分段选择器统一到同一档字号/字重（v1.13.3）：
+     原来这里是 .84rem/400、分段按钮是 .8rem/600 —— 两者在菜单里上下相邻，
+     字号差 + 字重差叠在一起就是用户说的「两种字体感觉不匹配」。
+     现在都是 .84rem/500，子行略小（.78rem）但字重一致。 */
   font-size: 0.84rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   color: var(--menu-text);
   background: none;
   border: none;
@@ -727,10 +761,13 @@ html[data-glass-fx='off'] .dock-bg::after {
   background: transparent;
   border: 0;
   border-radius: 999px;
+  /* font: inherit 在这里本来是必需的（button 不继承字体），v1.13.3 起
+     `button, input, select, textarea { font: inherit }` 已全局收口，这里保留无害。
+     字号/字重与 .dropdown-item 对齐，见那边的注释 */
   font: inherit;
-  font-size: 0.8rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-size: 0.84rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   color: var(--menu-text);
   opacity: 0.5;
   cursor: pointer;
@@ -767,7 +804,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .theme-seg-sub .theme-seg-btn {
   height: auto;
-  font-size: 0.76rem;
+  /* 子行只缩字号、不缩字重：字重不一致在并排时最显「两种字体」（v1.13.3） */
+  font-size: 0.78rem;
 }
 
 .theme-seg-sub .theme-seg-btn.active {

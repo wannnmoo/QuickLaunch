@@ -208,7 +208,29 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **开机自启动开关**：菜单打开时 `getAutoStart()` 读取注册表状态决定开关开/关（`.item-switch`），点击 `setAutoStart()` 乐观更新（先切开关，IPC 返回后校正，**不关闭菜单**）；写注册表 `HKCU\...\Run` 登录项
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
-- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。**菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步全透明**（背景/毛玻璃/边框置空，保留悬浮投影），文字固定近黑 `#1f2430` + **白色描边**（详见下方「透明风格文字可读性」），编辑输入框浅白底 + 深字
+- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。
+  - ⚠️ **多层半透明要一起算总不透明度（v1.13.3 修「白天偏白」）**：`.dock-bg` 的观感由**三层**叠加决定 ——
+    ① 渐变描边（`--dock-border-grad-*`，1px）② **上沿白色径向高光 `--dock-sheen`** ③ 玻璃填充（`--dock-bg-top/bottom`）。
+    原来白天填充是 `.92/.74`（几乎不透）**且**高光是 `.14`，两层白叠起来就是一块白板、壁纸完全透不出来。
+    现在 `.68/.46` + 高光 `.045` + `--dock-sat: 1.45`。**改主题透明度时必须同时看这三层** ——
+    只调填充或只调高光都看不出效果（这次就是因为只盯着填充值，第一版没调出感觉）
+  - ⚠️ **`--dock-sheen` / `--dock-sat` 是 v1.13.3 才抽出来的变量**（原来硬编码在 `.dock-bg` 的
+    `radial-gradient` 与 `backdrop-filter` 里），两个主题各定义一份，别再写回字面量
+  - **菜单配色与 Dock 统一**：`--menu-bg` 在黑暗/白天主题下**直接引用 `--dock-bg-top/bottom`**（`linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%)`）——菜单与软件背景同色同透明度，仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层。**透明风格**：`.theme-transparent` 在文件末尾覆盖——`.dock-bg` 背景/`backdrop-filter`/边框/阴影全部置空（图标直接悬浮桌面），`--dock-edge` 置透明（两端渐隐遮罩隐藏，滚动仍可用），图标底衬透明、悬停时给轻微底衬+外阴影，**下拉菜单/右键菜单同步全透明**（背景/毛玻璃/边框置空，保留悬浮投影），文字固定近黑 `#1f2430` + **白色描边**（详见下方「透明风格文字可读性」），编辑输入框浅白底 + 深字
+- **字体（v1.13.3 修过，改字体必读）**：`html, body` 的字体栈必须**显式带中文字体**，并且
+  **form 控件要全局收口 `font: inherit`**。两个坑都踩过：
+  1. 原字体栈 `-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif`
+     在 Windows 上**不提供任何中文字形** —— 中文落到 Arial 缺失后由 **GDI 兜底字（Tahoma）** 渲染，
+     笔画细、边缘发虚（用户原话「字体比较粗糙」）。现在改成
+     `system-ui, 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', …`，
+     显式排进**微软雅黑 UI**（雅黑的 UI 变体，小字号 hinting 明显更好）
+  2. 🚫 **`<button>` / `<input>` 不继承 `font`**（Chromium UA 样式表给它们设了自己的 font，不是 inherit）——
+     所以 `.dropdown-item`（按钮）拿不到 body 的字体栈，实测 computed font-family 就是 `Arial`；
+     而同在菜单里的 `.theme-seg-btn` 因为显式写了 `font: inherit` 用的是应用字体栈 →
+     **同一个浮层里两种中文字形并排**（用户原话「两种字体感觉不匹配」）。
+     已在基础层统一收口：`button, input, select, textarea { font: inherit }`，不要在各自的类里零散补
+  3. 菜单内字号/字重也要一致：`.dropdown-item` 与 `.theme-seg-btn` 现在同为 `.84rem/500`，
+     子行 `.78rem/500`（**只缩字号不缩字重** —— 字重不一致在并排时最像「两种字体」）
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**（`data-edge='top'` 时整套浮层改由 `overlayTop()` 锚在玻璃条**下沿外侧**8px，向下弹出、`maxHeight` 按窗口剩余高度算），底边固定在实测的 Dock 毛玻璃条外侧 8px（`overlayBottom()` / `overlayTop()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 与悬停放大共用同一份几何缓存，**两处都必须在内容坐标里比较**（见上方坐标系说明——v1.12.0 漏了 `scrollLeft`，Dock 滚动后插入位置会偏）。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
