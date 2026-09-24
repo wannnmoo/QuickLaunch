@@ -193,6 +193,17 @@ html, body {
 .dock-bar {
   position: relative; /* .dock-bg / .dock-edge 的定位参照 */
   width: max-content;
+  /* ⚠️ 这个 height 是必须的，不要删（v1.13.1 实测修正）。
+     高度 = 82px 透明放大区 + 60px 图标 + 玻璃条上下各 8px（= 158px）。
+     但这些子元素是放在它内部的 `.dock-inner` 里的，而 `.dock-bar` 作为 flex 项
+     在计算 auto 高度时，Chromium 会把父级（`.dock`，height:auto）的**内容盒**
+     当作确定高度来解析 —— 不给显式高度，bar 会收缩到"刚好包住内容"，
+     连锁后果是 `.dock-bg { top:82px; bottom:0 }` 的玻璃条比设计值薄、图标贴边。
+     ⚠️ 透明放大区的 82px 不是随手写的：它必须 = 玻璃条 76 + 玻璃上内边距 8 −
+     标签高出衬底的那 2px（标签 `bottom: calc(100% + 4px)`、高 20px → 顶边在衬底上方
+     24px），这样悬浮标签的顶边正好落在玻璃条上沿，既不会被玻璃压住也不会被容器的
+     overflow 裁掉。改这个值时把这三项一起算一遍。 */
+  height: 158px;
   /* 上限 = 视口宽度 − .dock 的左右 padding（各 24px）。
      用 JS 写入的 `--dock-vw`（= window.innerWidth）而不是 `100vw`：实测在本窗口里
      `100vw` 比 `window.innerWidth` **大 2px**（1202 vs 1200），玻璃条会多出 2px 溢出
@@ -202,15 +213,19 @@ html, body {
   max-width: calc(var(--dock-vw, 100vw) - 48px);
 }
 
-/* 毛玻璃背景：独立层，只覆盖图标区（图标在其中垂直居中，上下各 8px 小间距）。
-   顶部 70px 放大区是透明的，hover 放大时图标和悬浮标签会顶出背景之上——macOS Dock 观感。
+/* 毛玻璃背景：独立层，只覆盖图标区，**图标衬底在其中垂直居中、上下各 8px**。
+   上方 82px 放大区是透明的，hover 放大时图标和悬浮标签会顶出背景之上——macOS Dock 观感。
    左右用 inset 0（原先是 left/right: 24px，那 24px 是 .dock 的 padding，现在归 .dock-bar 管）。 */
 .dock-bg {
   position: absolute;
   left: 0;
   right: 0;
-  top: 70px; /* 图标顶上方留 8px（与 .dock-inner 的 70px 透明区一致） */
-  bottom: 0; /* 图标底下方留 8px（图标底 139，dock 底 146） */
+  /* 玻璃条上沿。⚠️ 必须与 .dock-inner 的 padding-top 同步改：
+     82（透明放大区）+ 8（衬底在玻璃内再留 8px）− 60（衬底高）= 图标衬底上方 8px。
+     v1.13.1 修过一次：原来是 top:70px 而衬底贴玻璃下沿，于是玻璃条「上留 16px、下留 0px」，
+     用户一眼就看出「图标上面间距比下面大」。 */
+  top: 82px;
+  bottom: 0; /* 玻璃条高 76 = 8 + 衬底 60 + 8（衬底上下各 8px，居中） */
   z-index: 0;
   /* 三层背景，自下而上（多重背景的第一层画在最上面）：
      ① 描边层（第 8 条渐变描边）：四边 1px 的线性渐变，clip 到 border-box；
@@ -297,12 +312,29 @@ html[data-glass-fx='off'] .dock-bg::after {
   position: relative;
   z-index: 1; /* 盖在 .dock-bg 之上 */
   display: flex;
-  align-items: flex-end;
+  /* ⚠️⚠️ **纵向居中不要用 `justify-content`**（这里踩过两次，改这块必读）：
+     本元素是**横向滚动容器**（`overflow-x: auto`），而 flex 在**主轴溢出**时
+     `justify-content: center` 会把内容**向两侧同时溢出** —— 右侧那半能滚到，
+     **左侧那半永远滚不到**（实测 31 个图标时第一个「此电脑」停在 x=−390，
+     `scrollLeft` 已是 0 也拉不回来；更隐蔽的是 `scrollWidth` 只有 1582 而实际内容
+     是 2012 —— 浏览器根本没把左侧溢出算进可滚动区，所以连"滚到底"都到不了最前面）。
+     纵向位置改由 **padding-top 82 + padding-bottom 8** 决定：`.dock-inner` 被
+     `height: 100%` 撑到 158，内容盒 = 158 − 82 − 8 = 68，衬底 60 从内容盒顶部开始
+     排布 → 落在 bar 内的 82..142；而玻璃条是 82..158（高 76），于是衬底在玻璃内上下各 8px。
+     `align-items: center` 保留：`flex-direction: row` 下它管**横轴**，让每个图标在自己
+     的 60px 轨道里横向居中（图标 44px 在衬底 60px 内居中）。 */
+  align-items: center;
   gap: 4px;
-  /* 图标放不下时横向滚动查看。顶部 70px 为透明放大区：hover 放大（1.4× + 8px 上浮）
-     的图标在这里顶出背景，不被 overflow 裁剪；同时容纳悬浮在图标上方的标签
-     （标签随放大一起上移，44px 区会越界被裁，故加高到 70px） */
-  padding: 70px 16px 0;
+  /* 图标放不下时横向滚动查看。上方 82px 为透明放大区：hover 放大（1.4× + 8px 上浮）
+     的图标在这里顶出背景，不被 overflow 裁剪；同时容纳悬浮在图标上的标签。
+     ⚠️ 82 不是随手写的：要够高到让**悬浮标签**（`bottom: calc(100% + 4px)`、高 20px
+     → 顶边在图标衬底上方 24px）完整落在玻璃条上沿之外 —— 玻璃上沿在 82−8=74px 处，
+     标签顶边在 82−24=58px，还剩 16px 余量；同时 82 = 74 + 8 让衬底在 76px 玻璃里上下各 8px。
+     ⚠️ **padding-bottom 必须是 0**：衬底的纵向位置 = 内容盒里居中，而内容盒 =
+     158 − 82 − padding-bottom。给 8px 会把内容盒压到 68，衬底 60 居中后整体上移 4px
+     （实测上 4 / 下 12）。留 0 时内容盒 76，衬底居中正好落在玻璃条 76 里、上下各 8px。
+     改这个值必须连着 .dock-bg 的 top 与 .dock-bar 的 height 一起改。 */
+  padding: 82px 16px 0;
   /* 宽度上限**只由 .dock-bar 的 max-width 决定**，这里不再写 max-width: 100%。
      原因：.dock-bar 是 `width: max-content`（收缩包裹），其内部的百分比 max-width
      解析基准是不确定的容器宽度，规范上要按「先忽略该约束再回代」处理——留着它既是
@@ -312,6 +344,10 @@ html[data-glass-fx='off'] .dock-bg::after {
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none; /* Firefox 隐藏滚动条 */
+  /* 撑满 .dock-bar（158px）：82 透明放大区 + 60 衬底 + 玻璃条上下各 8px = 158。
+     不写它 .dock-inner 只按内容撑到 142px，衬底就贴到玻璃下沿（偏心 bug）。
+     （v1.13.1 就是漏了这层联动，出现过「玻璃上留 16px、下留 0px」的偏心）。 */
+  height: 100%;
 }
 
 .dock-inner::-webkit-scrollbar {
@@ -343,7 +379,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .dock-edge {
   position: absolute;
-  top: 70px; /* 对齐 .dock-bg 背景区 */
+  top: 82px; /* 对齐 .dock-bg 背景区（改 .dock-bg 的 top 时这里要同步） */
   bottom: 0;
   width: 48px;
   pointer-events: none;
@@ -1600,7 +1636,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 .drop-hint {
   position: fixed;
   left: 50%;
-  bottom: 156px; /* Dock 高 146px，留 10px 间隙 */
+  bottom: 168px; /* Dock 高 158px，留 10px 间隙（v1.13.1：Dock 由 146 改为 158） */
   transform: translateX(-50%);
   z-index: 200;
   padding: 6px 14px;
@@ -1623,26 +1659,31 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 /* ─── 顶部 Dock（data-edge="top"）───────────────────────────────────────── */
 /* 窗口形状与底部 Dock 完全相同（宽 85% × 高 300），整套几何垂直镜像：
-   玻璃条贴窗口上沿、70px 透明放大区让到下方，图标下沉、悬浮标签挂在图标下方，
-   浮层（卡片/菜单/面板）由 JS 改成锚在玻璃条下沿外侧。 */
+   玻璃条贴窗口上沿、82px 透明放大区让到下方，图标下沉、悬浮标签挂在图标下方，
+   浮层（卡片/菜单/面板）由 JS 改成锚在玻璃条下沿外侧。
+   ⚠️ 这里的 82/0 是「底部布局」的镜像（底部是 82/0 的 padding-top、top:82px），
+   四个数字（.dock-bg 的 top/bottom、.dock-inner 的 padding、.dock-edge 的 top/bottom）
+   必须一起改，否则会出现和 v1.13.1 一样的「玻璃左右不对称」。 */
 
 .app[data-edge='top'] {
   justify-content: flex-start; /* 玻璃条贴窗口上沿（底部 Dock 是 flex-end） */
 }
 
 .app[data-edge='top'] .dock-bg {
-  top: 0; /* 玻璃条盖住图标区 + 上方 8px */
-  bottom: 70px; /* 下方让出 70px 透明区（放大图标与标签往下顶出） */
+  top: 0; /* 玻璃条贴窗口上沿 */
+  bottom: 82px; /* 下方让出 82px 透明区（放大图标与标签往下顶出）→ 玻璃条仍高 76px */
 }
 
 .app[data-edge='top'] .dock-inner {
-  padding: 0 16px 70px; /* 透明放大区从上改到下 */
-  align-items: flex-start; /* 图标贴内容区顶部（玻璃条内垂直居中） */
+  padding: 0 16px 82px; /* 透明放大区从上改到下（镜像 padding-top: 82px） */
+  /* 纵向居中由基础规则的 justify-content: center 负责，这里只需恢复横轴居中
+     （`align-items` 在 column 方向是横轴；写 flex-start 会让图标靠左） */
+  align-items: center;
 }
 
 .app[data-edge='top'] .dock-edge {
   top: 0;
-  bottom: 70px; /* 两端渐隐跟随玻璃条的位置 */
+  bottom: 82px; /* 两端渐隐跟随玻璃条的位置 */
 }
 
 /* 放大以「图标顶边」为原点：顶部时增长全部朝下（朝桌面方向顶出）。
@@ -1652,7 +1693,7 @@ html[data-glass-fx='off'] .dock-bg::after {
   transform-origin: center top;
 }
 
-/* 选中/归组高亮时图标瓷砖会 scale(1.05)。底部布局由此上方的 70px 透明区容得下这 3px
+/* 选中/归组高亮时图标瓷砖会 scale(1.05)。底部布局由此上方的 82px 透明区容得下这 3px
    增长，顶部布局的透明区在下方、上方紧贴裁剪线，所以原点也要镜像到顶边，
    否则瓷砖顶边被 overflow 削平、圆角变直角 */
 .app[data-edge='top'] .dock-item.selected .dock-icon-wrap,
@@ -1669,7 +1710,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* 拖入提示胶囊：浮到玻璃条下方 */
 .app[data-edge='top'] .drop-hint {
   bottom: auto;
-  top: 156px; /* 镜像：Dock 高 146 + 10px 间隙 */
+  top: 168px; /* 镜像：Dock 高 158 + 10px 间隙 */
 }
 
 /* 分组面板（迷你 Dock）同样镜像：玻璃在上、透明放大区在下。

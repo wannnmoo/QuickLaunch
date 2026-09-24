@@ -195,12 +195,22 @@ const ICON_SIZE = 64
 /** 文件夹图标（黄色文件夹）尺寸再小一档：卡片行只有 17px，Dock 上也是 44px 缩放显示 */
 const FOLDER_ICON_SIZE = 48
 
-/** 统一的 PowerShell 调用入口：一次把参数拼装收口，避免每处手写（漏掉
- *  `-NonInteractive` 时脚本遇到任何交互式提示都会挂到超时，白占一个进程）。 */
 const PS_ARGS = ['-NoProfile', '-NonInteractive', '-Command'] as const
 type PSResult = { err: Error | null; stdout: string; stderr: string }
+/** PowerShell stdout 上限（见 runPowerShell 注释：默认 1 MiB 会让批量图标提取静默失败） */
+const PS_MAX_BUFFER = 8 * 1024 * 1024
+
+/** 统一的 PowerShell 调用入口：一次把参数拼装收口，避免每处手写（漏掉
+ *  `-NonInteractive` 时脚本遇到任何交互式提示都会挂到超时，白占一个进程）。
+ *
+ *  ⚠️ `maxBuffer` 必须显式给：Node 默认 1 MiB，而 stdout 超限时子进程会被杀掉、
+ *  err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' —— 所有调用点都把 err 当成
+ *  「没有结果」并返回空数组，于是失败是**完全静默**的。实测 `describe-paths` 那条
+ *  批量路径每个 exe 带一枚 256px 图标（约 80 KB base64），**拖入 13 个 exe 就超 1 MiB**，
+ *  整批被丢弃且只提示「已跳过 N 个（重复或格式不支持）」。给到 8 MiB 后同样的 20 个
+ *  没问题（实测输出 1.6 MB）。 */
 function runPowerShell(psScript: string, timeout: number, done: (r: PSResult) => void): void {
-  execFile('powershell', [...PS_ARGS, psScript], { timeout }, (err, stdout, stderr) => {
+  execFile('powershell', [...PS_ARGS, psScript], { timeout, maxBuffer: PS_MAX_BUFFER }, (err, stdout, stderr) => {
     done({ err, stdout, stderr })
   })
 }
@@ -299,7 +309,7 @@ if (-not $iconBase64) {
   # 图标优先级（通用方案）：
   # 1) IconLocation 指定的图标文件，或快捷方式目标自身——是普通文件就提取（尊重自定义图标）
   if ($iconFile -and (Test-Path $iconFile -PathType Leaf)) {
-    $iconBase64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, 256)
+    $iconBase64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, ${ICON_SIZE})
   }
   # 2) 目标是文件夹：SHDefExtractIcon 对目录返回 E_FAIL 无法取图标，上面提取失败时
   #    统一回退系统黄色文件夹图标（与「添加文件夹」select-folder 一致）
@@ -316,17 +326,17 @@ if (-not $iconBase64) {
     if (-not $browserExe) { $browserExe = 'ChromeHTML' }
     $browserCmd = (Get-ItemProperty "HKLM:\\Software\\Classes\\$browserExe\\shell\\open\\command" -ErrorAction SilentlyContinue).'(Default)'
     if ($browserCmd -and $browserCmd -match '^"([^"]+)"') {
-      $iconBase64 = [IconExtractor]::GetIconBase64($Matches[1], 0, 256)
+      $iconBase64 = [IconExtractor]::GetIconBase64($Matches[1], 0, ${ICON_SIZE})
     }
     # last resort: globe icon from shell32.dll
     if (-not $iconBase64) {
-      $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 13, 256)
+      $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 13, ${ICON_SIZE})
     }
   }
 
   # 终极兜底：目标不存在/图标提取全部失败时给通用文档图标（shell32 index 1），避免 Dock 破图
   if (-not $iconBase64) {
-    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256)
+    $iconBase64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, ${ICON_SIZE})
   }
 }
 
@@ -384,9 +394,17 @@ function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electr
   mainWindow?.setAlwaysOnTop(true)
   mainWindow?.moveTop()
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
-  return dialog
-    .showOpenDialog(parent!, { ...options, ...(parent ? { disabled: true } : {}) })
-    .finally(() => { dialogOpen = false })
+  // ⚠️ 必须 try/finally 而不能只挂 .finally()：showOpenDialog 若**同步**抛错（父窗口状态
+  // 异常等），`.finally()` 根本注册不上，dialogOpen 会永久停在 true —— 之后 blur 处理里的
+  // `if (dialogOpen) return` 会让 Dock 再也不沉底（直到重启）。
+  try {
+    return dialog
+      .showOpenDialog(parent!, { ...options, ...(parent ? { disabled: true } : {}) })
+      .finally(() => { dialogOpen = false })
+  } catch (err) {
+    dialogOpen = false
+    return Promise.reject(err)
+  }
 }
 
 ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
@@ -408,8 +426,14 @@ ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
     )
     return parsed.filter(Boolean)
   }
-  // 显式传路径时同样返回数组，保持返回类型一致（LnkInfo[]）
-  return [await parseLnkFile(filePath)]
+  // 显式传路径时同样返回数组，保持返回类型一致（LnkInfo[]）。
+  // 解析失败（文件坏、PS 超时、JSON 解析失败）时返回空数组而不是让 invoke 直接 reject ——
+  // 与上面的对话框分支一致，调用方不必再包一层 try/catch
+  try {
+    return [await parseLnkFile(filePath)]
+  } catch {
+    return []
+  }
 })
 
 // ─── IPC: persist shortcuts ─────────────────────────────────────────────────
@@ -574,16 +598,18 @@ ipcMain.handle('load-shortcuts', () => {
     // 形状校验：文件被外部改坏（合法 JSON 但不是数组）时返回空数组，
     // 否则 renderer 的 baseline.filter 会抛错并中断整轮加载/桌面扫描
     if (!Array.isArray(raw)) return []
-    return raw.map((entry) => {
-      if (!entry || typeof entry !== 'object') return entry
-      const e = entry as Record<string, unknown>
-      // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
-      if (e.separator) {
-        const { separator: _legacy, ...rest } = e
-        return { ...rest, isSeparator: true }
-      }
-      return entry
-    })
+    return raw
+      // 元素级校验也不能省：`[1,"x",null]` 是合法 JSON，原样交给 renderer 会得到
+      // 一堆没有 id/targetPath 的"条目"，在 normPath / 去重 / 渲染里到处是隐性地雷
+      .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+      .map((e) => {
+        // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
+        if (e.separator) {
+          const { separator: _legacy, ...rest } = e
+          return { ...rest, isSeparator: true }
+        }
+        return e
+      })
   } catch {
     return []
   }
@@ -919,7 +945,11 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
 
   // Windows shell: / CLSID → open via explorer (This PC, Recycle Bin, etc.)
   if (targetPath.startsWith('shell:') || targetPath.startsWith('::')) {
-    execFile('explorer', [targetPath])
+    // 必须给回调：execFile 不带回调就没人消费 'error' 事件，spawn 失败（PATH 里没有
+    // explorer / EPERM）会在主进程抛未捕获异常
+    execFile('explorer', [targetPath], (err) => {
+      if (err && typeof err.code === 'string') console.error('[launcher] explorer failed:', err.message)
+    })
     return true
   }
 
@@ -941,7 +971,12 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
 
   // URL
   if (/^(https?|ftp|steam):\/\/|^mailto:/i.test(targetPath)) {
-    shell.openExternal(targetPath)
+    // openExternal 返回 Promise：没有注册的协议处理器（如未装客户端的 mailto:/steam:）会
+    // reject，不接就是未处理 rejection
+    void shell.openExternal(targetPath).catch((err) => {
+      console.error('[launcher] openExternal failed:', err instanceof Error ? err.message : String(err))
+      restoreDockAfterFailedLaunch()
+    })
     return true
   }
 
@@ -963,9 +998,9 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
     if (err.code === 'EACCES' || err.code === 'EPERM') {
       console.log(`[launcher] Direct spawn blocked (likely admin required); falling back to Shell: ${targetPath}`)
-      shell.openPath(targetPath).then((msg) => {
-        if (msg) console.error('[launcher] Shell fallback also failed:', msg)
-      })
+      shell.openPath(targetPath)
+        .then((msg) => { if (msg) console.error('[launcher] Shell fallback also failed:', msg) })
+        .catch((e) => console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e)))
       return
     }
     console.error('Failed to launch:', err)
@@ -1039,9 +1074,9 @@ foreach ($p in @(${psList})) {
   $name = ''
   try { $name = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($p).FileDescription } catch {}
   if (-not $name) { $name = [System.IO.Path]::GetFileNameWithoutExtension($p) }
-  $b64 = [IconExtractor]::GetIconBase64($p, 0, 256)
+  $b64 = [IconExtractor]::GetIconBase64($p, 0, ${ICON_SIZE})
   # 提取不到图标时回退通用文档图标（shell32 index 1），避免 <img src=""> 出现破图
-  if (-not $b64) { $b64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, 256) }
+  if (-not $b64) { $b64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, ${ICON_SIZE}) }
   $out += @{ path = $p; name = $name; iconBase64 = $b64 }
 }
 if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
@@ -1207,8 +1242,14 @@ interface FolderListing {
 }
 
 const folderListCache = new Map<string, { at: number; data: FolderListing }>()
-/** 正在枚举中的目录（渲染端会「悬停预取 + 卡片打开」请求两次，靠它复用同一个 Promise） */
-const folderListPending = new Map<string, Promise<FolderListing>>()
+/** 正在枚举中的目录。`sender` 是**可变**的：渲染端会「悬停预取 + 卡片打开」请求两次，
+ *  窗口重建后还会有新窗口来命中同一条在途 Promise，推送图标必须发给最新那个请求者
+ *  （否则新窗口的卡片永远停在占位块）。 */
+interface PendingFolderList {
+  sender: Electron.WebContents
+  job: Promise<FolderListing>
+}
+const folderListPending = new Map<string, PendingFolderList>()
 
 /** 目录项批量处理的并发上限：一个 400 项的目录如果无脑 Promise.all(stat)，
  *  会同时把 400 个 fs 请求压进 libuv 线程池（默认只有 4 个线程），
@@ -1240,6 +1281,12 @@ function ensureFolderIcon(): Promise<void> {
     folderIconLoading = extractIcon('C:\\Windows\\System32\\shell32.dll', 4, FOLDER_ICON_SIZE)
       .then((url) => { folderIcon = url || '' })
       .catch(() => { folderIcon = '' })
+      .then(() => {
+        // ⚠️ 失败时**不要**把 '' 当成有效结果常驻：`folderIcon !== null` 会让后面每一次调用
+        // 都直接返回，于是 select-folder 整个会话都发空图标（renderer 的 sharedFolderIcon 兜底
+        // 只是把它掩盖住了）。这里把状态复位成 null，下次调用会重新提取一次。
+        if (!folderIcon) { folderIcon = null; folderIconLoading = null }
+      })
   }
   return folderIconLoading
 }
@@ -1273,9 +1320,20 @@ ipcMain.handle('list-folder', async (event, dir: unknown) => {
   if (hit && Date.now() - hit.at < FOLDER_LIST_TTL) return hit.data
   // 同一目录正在枚举时复用同一个 Promise：渲染端会先「悬停预取」、300ms 后卡片打开时
   // 再请求一次，若不做去重，两次都会跑完整个枚举 + 图标提取（readdir/stat 双份、
-  // 图标提取双份、folder-icons 事件也推两遍）
+  // 图标提取双份、folder-icons 事件也推两遍）。
+  //
+  // ⚠️ 复用的是**枚举本身**，但推送图标的目标（sender）必须跟着最新的请求者走：
+  // 窗口被重建（切停靠位置 / dev HMR）后新窗口会命中这条在途 Promise，而它闭包里
+  // 捕获的却是**旧**窗口的 sender —— 后台补图标全推给了旧 WebContents，新窗口的卡片
+  // 永远停在占位块（旧的 sender.isDestroyed() 检查只在已销毁时才补救，且那一轮列表
+  // 已经拿到空图标了）。所以 pending 记录是可变的，每次有请求进来就刷新 sender。
   const inflight = folderListPending.get(dir)
-  if (inflight) return inflight
+  if (inflight) {
+    inflight.sender = event.sender
+    return inflight.job
+  }
+
+  const pending: PendingFolderList = { sender: event.sender, job: null as unknown as Promise<FolderListing> }
 
   const job = (async (): Promise<FolderListing> => {
     let entries: Dirent[]
@@ -1348,13 +1406,15 @@ ipcMain.handle('list-folder', async (event, dir: unknown) => {
 
     putFolderCache(dir, data)
 
-    // 其余图标后台分批补（每批推一次事件，卡片逐批换），不阻塞卡片出现
-    void fillFolderIcons(items, dir, event.sender, data)
+    // 其余图标后台分批补（每批推一次事件，卡片逐批换），不阻塞卡片出现。
+    // 传 pending 而不是 event.sender：推送目标要跟着「最新一次请求者」走（见上方注释）
+    void fillFolderIcons(items, dir, pending, data)
 
     return data
   })()
 
-  folderListPending.set(dir, job)
+  pending.job = job
+  folderListPending.set(dir, pending)
   try {
     return await job
   } finally {
@@ -1371,13 +1431,14 @@ async function fileIconDataUrl(targetPath: string): Promise<string> {
 }
 
 /** 后台补图标：每批完成后推一次 `folder-icons`，renderer 按路径就地替换。
- *  窗口被重建（切位置）时 sender 会失效：此时**把这个缓存项删掉**，
- *  否则列表里剩下没图标的项会在 TTL 内被当成「已完成的缓存」返回，
- *  卡片只能显示占位块，且没有任何补批会再来。 */
+ *  sender **从 pending 记录里实时取**（不是建 job 那一刻的快照）：窗口被重建后
+ *  新窗口复用同一条在途 Promise，若继续用旧 WebContents，补批全推给了已经离开的窗口。
+ *  目标确实拿不到时（已销毁）**把这个缓存项删掉**，否则列表里剩下没图标的项会在 TTL 内
+ *  被当成「已完成的缓存」返回，卡片只能显示占位块，且没有任何补批会再来。 */
 async function fillFolderIcons(
   items: FolderChild[],
   dir: string,
-  sender: Electron.WebContents,
+  pending: PendingFolderList,
   data: FolderListing
 ): Promise<void> {
   const targets = items.filter((it) => !it.iconDataUrl).slice(0, FOLDER_ICON_LIMIT)
@@ -1395,14 +1456,23 @@ async function fillFolderIcons(
     await forEachLimited(batch, 8, async (it) => {
       it.iconDataUrl = it.isDir ? (folderIcon ?? '') : await fileIconDataUrl(it.path)
     })
+    // 每批都取一次当前 sender（期间可能有新窗口接管）
+    const sender = pending.sender
     // sender 失效（窗口被重建/页面重载）就先删缓存再返回：缓存里的对象**已经被就地
     // 改了图标**，留着它会让下一次 list-folder 命中「半截图标」的旧数据而不再补批。
     // 原实现是「先 send 再检查」，对已销毁的 WebContents 调 send 本身就会抛错。
-    if (sender.isDestroyed()) { dropCacheIfOurs(); return }
+    if (!sender || sender.isDestroyed()) { dropCacheIfOurs(); return }
     const icons: Record<string, string> = {}
     for (const it of batch) if (it.iconDataUrl) icons[it.path] = it.iconDataUrl
     if (Object.keys(icons).length === 0) continue
-    sender.send('folder-icons', { path: dir, icons })
+    try {
+      sender.send('folder-icons', { path: dir, icons })
+    } catch {
+      // send 仍然可能抛（sender 在 isDestroyed 检查之后才销毁）：这个函数是 void 掉的，
+      // 不捕获就会变成主进程的未处理 rejection
+      dropCacheIfOurs()
+      return
+    }
     // 卡片还开着就继续刷新保鲜期（每批一次），这样第二次悬停仍能命中缓存
     const entry = folderListCache.get(dir)
     if (entry?.data === data) entry.at = Date.now()
@@ -1434,6 +1504,8 @@ ipcMain.handle('open-path', async (_e, targetPath: unknown) => {
 // 启动预热：① 标准黄色文件夹图标（目录行用，提取一次常驻）② 一次 getFileIcon 让 shell
 // 图像列表初始化（首次调用有 ~110ms 冷启动），用户第一次悬停文件夹时就不会撞上这个尖峰
 void app.whenReady().then(() => {
+  // 抢不到单实例锁的进程正在退出流程里，别白起一个 powershell.exe（whenReady 与 quit 是竞速的）
+  if (!gotSingleInstanceLock) return
   void ensureFolderIcon()
   void fileIconDataUrl(process.execPath)
 })
@@ -1446,11 +1518,27 @@ ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir
     sinkSeq++ // 隐藏即作废在途沉底
     mainWindow.hide()
   }
+  // ⚠️ `Start-Process` 的 -ArgumentList / -WorkingDirectory 都是 [ValidateNotNullOrEmpty]：
+  // 传空串会**先**在校验阶段抛错（实测 PS 5.1：Cannot validate argument on parameter
+  // 'ArgumentList'. The argument is null or empty），根本走不到创建进程那一步。
+  // 而「没有启动参数」正是绝大多数条目的常态 —— 原来的写法让这个菜单项对它们 100% 失败，
+  // 且因为 Dock 已经先隐藏、err 又只打日志、IPC 还返回 true，用户看到的是
+  // 「Dock 消失、没有 UAC、什么都没发生」。
+  // 修法：用参数哈希表拼装，空值一律**不传**该参数（PowerShell 侧判断，避免 JS 侧再拼一次命令）。
   const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
-Start-Process -FilePath '${targetPath.replace(/'/g, "''")}' -ArgumentList '${(args || '').replace(/'/g, "''")}' -WorkingDirectory '${(workingDir || '').replace(/'/g, "''")}' -Verb RunAs`
-  runPowerShell(psScript, 10000, ({ err }) => {
-    if (err) console.error('[launcher] run-as-admin failed:', err.message)
+$p = @{ FilePath = '${targetPath.replace(/'/g, "''")}'; Verb = 'RunAs' }
+$argStr = '${(args || '').replace(/'/g, "''")}'
+$wdStr = '${(workingDir || '').replace(/'/g, "''")}'
+if ($argStr) { $p['ArgumentList'] = $argStr }
+if ($wdStr) { $p['WorkingDirectory'] = $wdStr }
+Start-Process @p`
+  runPowerShell(psScript, 10000, ({ err, stderr }) => {
+    if (!err) return
+    // UAC 被用户取消（The operation was canceled by the user）也走这里：
+    // 此时同样要把 Dock 还给用户，否则「点了没反应 + Dock 消失」没有任何出路
+    console.error('[launcher] run-as-admin failed:', err.message, '| stderr:', (stderr || '').slice(0, 300))
+    restoreDockAfterFailedLaunch()
   })
   return true
 })
@@ -1512,10 +1600,19 @@ ipcMain.on('dock-pointer', (_e, inside: boolean) => {
 function sendToBottom(win: BrowserWindow): void {
   if (win.isDestroyed()) return
   const startSeq = sinkSeq
-  // 同一扇窗口已有沉底任务在跑：不重复起进程。延迟重试（180ms）而不是直接放弃——
-  // 谁后到谁说了算，最后一次 blur 的意图必须被满足
+  // 同一扇窗口已有沉底任务在跑：不重复起进程（每次都是一个新的 powershell.exe）。
+  // 延迟重试（180ms）而不是直接放弃——谁后到谁说了算，最后一次 blur 的意图必须被满足。
+  //
+  // ⚠️ 重试的守卫**不能**写成 `sinkState?.win === win`：上一轮任务完成时会把 sinkState
+  // 置回 null，于是这个守卫恒假、重试永远什么都不做（第二次让位意图被静默吞掉）。
+  // 正确的守卫是「意图还成立吗」——没被更晚的唤回作废、窗口还在、可见、没收托盘、没拿到焦点。
   if (sinkState && sinkState.win === win) {
-    setTimeout(() => { if (sinkState?.win === win) sendToBottom(win) }, 180)
+    setTimeout(() => {
+      if (sinkSeq !== startSeq) return // 期间有更新的意图，交给那条路径
+      if (!win.isDestroyed() && win.isVisible() && !win.isFocused() && !dockTrayHidden && canSinkNow()) {
+        sendToBottom(win)
+      }
+    }, 180)
     return
   }
 
@@ -1538,21 +1635,27 @@ public static class WinZ {
 
   sinkState = { win, seq: startSeq }
 
-  /** 这次沉底是否还应当生效：期间没有更晚的「拉回/隐藏」意图，窗口也还在原位 */
-  const stillWanted = (): boolean =>
-    sinkState?.win === win && sinkSeq === startSeq &&
-    !win.isDestroyed() && win.isVisible() && !win.isFocused() && !dockTrayHidden
-
   runPowerShell(psScript, 4000, ({ err }) => {
+    // ⚠️ 必须先捕获「这次沉底是不是我们自己的、还是否仍然成立」，**再**清 sinkState。
+    // 原实现先清 sinkState 再调 stillWanted()，而 stillWanted() 的第一个条件正是
+    // `sinkState?.win === win` —— 于是它恒为 false，紧跟的 `if (!visible) recoverDock()`
+    // 在**每一次成功的沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶
+    // （并顺带 markDockShown() 重置 2.5s 宽限期，让下一次 blur 也被吞掉）。
+    // 表现：「点击别的软件后 Dock 让位」100% 被撤销。
+    const ours = sinkState?.win === win && sinkState.seq === startSeq
     if (sinkState?.win === win) sinkState = null
     if (err) {
       console.error('[dock] sendToBottom failed:', err.message)
       return
     }
+    // 这次沉底仍然有效（期间没有任何更晚的「拉回/隐藏」意图，窗口也还在原位）→ 什么都不做
+    if (ours && sinkSeq === startSeq && !win.isDestroyed() && win.isVisible() &&
+        !win.isFocused() && !dockTrayHidden) {
+      return
+    }
     // 迟到的 HWND_BOTTOM 补偿：PS 执行期间用户可能已经把 Dock 拉回来了
     // （Alt+Space 唤回 / 托盘 / 鼠标移回 / 启动失败恢复）。这里不能再用
     // isAlwaysOnTop() 判断——恢复路径会把它设回 true，原写法恒真、形同虚设。
-    if (stillWanted()) return
     if (!win.isDestroyed() && win.isVisible()) recoverDock(win)
   })
 }
@@ -1620,6 +1723,7 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     if (!forceQuit) {
       event.preventDefault()
       dockTrayHidden = true
+      sinkSeq++ // 隐藏同样作废在途沉底（与其它四条隐藏路径一致）：不能让它去操作一扇已隐藏的窗口
       mainWindow?.hide()
     }
   })
@@ -1666,7 +1770,9 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    void shell.openExternal(details.url).catch((err) => {
+      console.error('[window] openExternal failed:', err instanceof Error ? err.message : String(err))
+    })
     return { action: 'deny' }
   })
 
@@ -1703,11 +1809,17 @@ app.whenReady().then(() => {
     {
       label: '显示窗口',
       click: () => {
-        if (mainWindow) {
-          dockTrayHidden = false
-          mainWindow.show()
-          mainWindow.focus()
-        }
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        // 与 toggleWindow 的显示分支保持一致（三个动作缺一不可）：
+        // ① sinkSeq++ 作废在途沉底——否则迟到的 SetWindowPos(HWND_BOTTOM) 会把刚显示的
+        //    窗口钉到底部；② recoverDock 统一置顶入口；③ focus 由 recoverDock 的巡检兜住。
+        // 原来只做 show()+focus()：一旦 Windows 前台锁拒绝这次激活（CLAUDE.md 里记过这个
+        // 场景），窗口就停在「可见但不置顶」，而且没有任何宽限期保护
+        dockTrayHidden = false
+        sinkSeq++
+        mainWindow.show()
+        recoverDock(mainWindow)
+        mainWindow.focus()
       }
     },
     { type: 'separator' },

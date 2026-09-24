@@ -22,10 +22,21 @@ let nextId = 0
 // 桌面扫描去重：路径规范化（去尾部反斜杠 + 小写），Windows 路径大小写不敏感
 const normPath = (p: string): string => (p || '').trim().replace(/\\+$/, '').toLowerCase()
 
-// 顶层下标 → 扁平数组里的锚点 id（null = 追加到末尾）
-// 拖拽排序的 dropIdx 是「顶层图标」下标空间，而 apps 是扁平数组（含组内成员），两者需要换算
+// ⚠️ **落点下标空间（改这里必须先读）**
+// `calcDropIndex` 是在 `dockCenters` 上二分的，而 `measureCenters` **跳过了分隔线**
+// （`if (el.dataset.sep) return`）——所以它返回的是**不含分隔线的顶层条目**下标空间
+// （「可显示顶层条目」= 非分组成员且非分隔线）。
+// 但 `topAnchorId` 原来用的是 `list.filter(a => !a.groupId)`（**含**分隔线），渲染插入线
+// 时比的 `viewTopLevel` 也含分隔线 —— 三个下标空间混用，每有一条分隔线落在落点左侧，
+// 插入位置与指示线就整体偏左一个槽位。实测：图标为 `A ▏ B C` 时把 C 拖到 B 右侧，
+// 结果数组变成 `[A, C, ▏, B]`（C 越过分隔线和 B），指示线画在 B 左边两格处。
+// 现在统一到「可显示顶层条目」这一个空间：锚点换算与指示线都跳过分隔线。
+const droppableTop = (list: AppEntry[]): AppEntry[] =>
+  list.filter((a) => !a.groupId && !a.isSeparator)
+
+// 落点下标（可显示顶层条目空间）→ 扁平数组里的锚点 id（null = 追加到末尾）
 const topAnchorId = (list: AppEntry[], idx: number | null): number | null => {
-  const top = list.filter((a) => !a.groupId)
+  const top = droppableTop(list)
   if (idx === null || idx >= top.length) return null
   return top[idx].id
 }
@@ -716,7 +727,15 @@ function App(): React.ReactElement {
           // 插到该组现有成员之后，维持「成员紧跟在分组条目后面」的数组形态
           let at = gi + 1
           while (at < without.length && without[at].groupId === overGroup) at++
-          return [...without.slice(0, at), { ...item, groupId: overGroup }, ...without.slice(at)]
+          // ⚠️ 必须是 `{ ...item, groupId }` 再**抹掉顶层专属标记**，不能只覆盖 groupId：
+          // 把「此电脑」拖进分组时 `specialType: 'this-pc'` 会跟着进组，于是这个成员在面板里
+          // 仍然被当成系统位置渲染（标签被改写成「此电脑 · 可用 …」、图标上还挂一条用量细条），
+          // 而它的 targetPath 是 `shell:` 命令、语义上根本不是普通成员。
+          // isFolder 同理：桌面缺失清理与右键菜单会按「文件夹」对待这个其实是系统的条目。
+          const member: AppEntry = { ...item, groupId: overGroup }
+          delete member.isFolder
+          delete member.specialType
+          return [...without.slice(0, at), member, ...without.slice(at)]
         }
 
         // 2) 组内成员拖到 Dock 上 → 移出分组并落到落点（面板内松手则取消）
@@ -1176,8 +1195,9 @@ function App(): React.ReactElement {
   // 切换停靠位置：交给主进程「原地」应用（横向三档窗口尺寸相同 → setBounds + 事件翻布局，
   // 不重建窗口、不重载页面，约 60ms 生效；将来左/右竖排换了窗口形状才会走重建）。
   // 位置只由预设决定，所以这里不做短路，具体怎么切由主进程判断。
+  // **菜单保持打开**（与主题分段选择器一致，CLAUDE.md 也是这么写的）：点「下」→ 看一眼
+  // 效果 → 不满意直接点「上」，不需要重新点开菜单。这里只关右键菜单（两者本就互斥）。
   const handleEdgePick = (next: DockEdge) => {
-    setMenuPos(null)
     setContextMenu(null)
     window.api.setDockEdge(next).catch(() => {})
   }
@@ -1331,7 +1351,10 @@ function App(): React.ReactElement {
       a.id === id
         ? {
             ...a,
-            description: editFields.description.trim() || a.description,
+            // ⚠️ 不要写 `editFields.description.trim() || a.description`：用户把名称清空后
+            // 保存，输入框空了但名字没变（静默保留原名），看起来像「保存没生效」。
+            // 允许清空，交由渲染兜底显示「未命名」。
+            description: editFields.description.trim(),
             arguments: editFields.arguments,
             workingDirectory: editFields.workingDirectory,
             iconDataUrl: editIconUrl || a.iconDataUrl
@@ -1530,10 +1553,17 @@ function App(): React.ReactElement {
       // 编辑表单的输入框里正常打字，不参与导航
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
 
-      // 导航列表排除分隔符（方向键直接跳过它们）
-      const list = openGroupId === null
-        ? appsRef.current.filter((a) => !a.groupId && !a.isSeparator)
-        : appsRef.current.filter((a) => a.groupId === openGroupId && !a.isSeparator)
+      // 导航列表排除分隔符（方向键直接跳过它们）。
+      // ⚠️ 用哪个列表要按**当前选中项在哪一层**决定，不能只看 openGroupId：
+      // 面板是用鼠标点开的（openGroupId 非 null）而选中项可能仍在主 Dock 上，此时若按
+      // openGroupId 取面板成员列表，`list.findIndex(navId)` 恒为 -1，→ 会跳到 list[0]
+      // （选中框凭空飞进面板），← 则会收起面板并选中那个分组的兄弟项。实测表现为
+      // 「面板开着时按右键，选中框跳到面板第一个成员」。
+      const navInPanel = openGroupId !== null &&
+        appsRef.current.some((a) => a.id === navId && a.groupId === openGroupId)
+      const list = navInPanel
+        ? appsRef.current.filter((a) => a.groupId === openGroupId && !a.isSeparator)
+        : appsRef.current.filter((a) => !a.groupId && !a.isSeparator)
 
       // 未处于导航模式：按 ←/→ 直接「唤醒」选中框（Esc / 鼠标点击退出后仍可随时唤起）
       // 恢复到上次选中的条目；菜单打开时不抢占方向键
@@ -1581,14 +1611,16 @@ function App(): React.ReactElement {
           }
           const next = list[idx + 1]
           if (next) { setNavId(next.id); return }
-          // 已经在最右：再往右落到 Dock 末尾的「+」新增按钮（面板里没有 + 按钮）
-          if (openGroupId === null) setNavId(ADD_BTN_ID)
+          // 已经在最右：再往右落到 Dock 末尾的「+」新增按钮（面板里没有 + 按钮）。
+          // 条件用 navInPanel 而不是 openGroupId —— 面板开着但选中项在主 Dock 时，
+          // → 到最右应当照常落到「+」，否则「+」在面板打开期间完全无法用方向键到达
+          if (!navInPanel) setNavId(ADD_BTN_ID)
           return
         }
         case 'ArrowLeft': {
           e.preventDefault()
-          // 面板里：← 返回主 Dock 并选中该分组
-          if (openGroupId !== null) {
+          // 面板里（选中项确实在面板内）：← 返回主 Dock 并选中该分组
+          if (navInPanel) {
             setOpenGroupId(null)
             setNavId(openGroupId)
             return
@@ -1616,12 +1648,15 @@ function App(): React.ReactElement {
         case 'Escape': {
           e.preventDefault()
           if (contextMenu || menuPos) { setContextMenu(null); setMenuPos(null); return }
-          if (openGroupId !== null) {
-            // 面板里：Esc 返回主 Dock（仍处于导航模式）
+          if (navInPanel) {
+            // 面板里（选中项在面板内）：Esc 返回主 Dock（仍处于导航模式）
             setOpenGroupId(null)
             setNavId(openGroupId)
             return
           }
+          // 选中项在主 Dock：只退出导航；顺手收起可能开着的面板（鼠标点开过、
+          // 但选中框还在主 Dock 上时，Esc 应当把浮层一并收掉）
+          if (openGroupId !== null) setOpenGroupId(null)
           setNavId(null)
           return
         }
@@ -1993,110 +2028,125 @@ function App(): React.ReactElement {
           >
           {dropIdx === 0 && <div className="drop-indicator" />}
 
-          {viewTopLevel.map((app, idx) => (
-            <div key={app.id} style={{ display: 'contents' }}>
-              {app.isSeparator ? (
-                // 分隔线：不参与悬停放大（data-sep），可拖拽、可右键
-                <div
-                  className={'dock-sep' + (dragId === app.id ? ' dragging' : '')}
-                  data-sep="1"
-                  ref={(el) => {
-                    if (el) iconRefs.current.set(app.id, el)
-                    else iconRefs.current.delete(app.id)
-                  }}
-                  onMouseDown={(e) => handleIconMouseDown(e, app.id)}
-                  onContextMenu={(e) => handleContextMenu(e, app.id)}
-                />
-              ) : (
-              <div
-                className={
-                  getItemClass(app.id) +
-                  (dragOverGroupId === app.id ? ' drop-target' : '') +
-                  (navId === app.id ? ' selected' : '')
-                }
-                ref={(el) => {
-                  if (el) iconRefs.current.set(app.id, el)
-                  else iconRefs.current.delete(app.id)
-                }}
-                onMouseDown={(e) => handleIconMouseDown(e, app.id)}
-                onClick={() => handleRun(app)}
-                onContextMenu={(e) => handleContextMenu(e, app.id)}
-                // 「此电脑」：悬停 300ms 弹出盘符卡片（移开 150ms 后关，方便移到卡片上继续看）
-                // 文件夹条目：同一套时序弹出子项预览卡片（锚在该图标中心）
-                // 两者都先做一次标签钳制，保证贴边图标的悬浮标签不被容器裁掉
-                onMouseEnter={(e) => {
-                  clampDockLabel(e.currentTarget as HTMLElement)
-                  if (app.specialType === 'this-pc') {
-                    openDrivesCard()
-                  } else if (app.isFolder && app.targetPath) {
-                    const r = e.currentTarget.getBoundingClientRect()
-                    openFolderCard(app, r.left + r.width / 2)
-                  }
-                }}
-                onMouseLeave={app.specialType === 'this-pc'
-                  ? scheduleCloseDrivesCard
-                  : app.isFolder && app.targetPath ? scheduleCloseFolderCard : undefined}
-                // 不设 title：App 自己有胶囊悬浮标签，再叠加系统的原生 tooltip 会变成
-                // 光标下方多出一个灰色提示框（与标签重复，观感也差）
-              >
-                <div className="dock-icon-wrap">
-                  {app.isGroup && !app.iconDataUrl ? (
-                    // 分组图标：默认用组内前 4 个图标的缩略拼图（macOS 堆叠观感），
-                    // 空组回退 2×2 网格图标；用户手动换过图标则走下面的 <img>
-                    (() => {
-                      // 用「可显示成员」（排除分隔线）做拼图，避免空破图格子
-                      const members = groupIconMembersById.get(app.id) ?? []
-                      if (members.length === 0) {
-                        return (
-                          <div className="dock-icon group-glyph">
-                            <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
-                              <rect x="3" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
-                              <rect x="13.4" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
-                              <rect x="3" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
-                              <rect x="13.4" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
-                            </svg>
-                          </div>
-                        )
+          {(() => {
+            // 插入线的位置必须按**可显示顶层条目**计数（与 calcDropIndex 同一空间）：
+            // 分隔线原来也参与了 idx+1 的比较，于是每有一条分隔线落在落点左侧，
+            // 指示线就整体左移一个槽位（详见文件上方「落点下标空间」）
+            let slot = 0
+            return viewTopLevel.map((app) => {
+              if (app.isSeparator) {
+                return (
+                  <div key={app.id} style={{ display: 'contents' }}>
+                    <div
+                      className={'dock-sep' + (dragId === app.id ? ' dragging' : '')}
+                      data-sep="1"
+                      ref={(el) => {
+                        if (el) iconRefs.current.set(app.id, el)
+                        else iconRefs.current.delete(app.id)
+                      }}
+                      onMouseDown={(e) => handleIconMouseDown(e, app.id)}
+                      onContextMenu={(e) => handleContextMenu(e, app.id)}
+                    />
+                    {/* 分隔线不占落点槽位，但「插到这条分隔线之前」也是一个合法落点 */}
+                    {dropIdx === slot && <div className="drop-indicator" />}
+                  </div>
+                )
+              }
+              const mySlot = slot
+              slot += 1
+              return (
+                <div key={app.id} style={{ display: 'contents' }}>
+                  <div
+                    className={
+                      getItemClass(app.id) +
+                      (dragOverGroupId === app.id ? ' drop-target' : '') +
+                      (navId === app.id ? ' selected' : '')
+                    }
+                    ref={(el) => {
+                      if (el) iconRefs.current.set(app.id, el)
+                      else iconRefs.current.delete(app.id)
+                    }}
+                    onMouseDown={(e) => handleIconMouseDown(e, app.id)}
+                    onClick={() => handleRun(app)}
+                    onContextMenu={(e) => handleContextMenu(e, app.id)}
+                    // 「此电脑」：悬停 300ms 弹出盘符卡片（移开 150ms 后关，方便移到卡片上继续看）
+                    // 文件夹条目：同一套时序弹出子项预览卡片（锚在该图标中心）
+                    // 两者都先做一次标签钳制，保证贴边图标的悬浮标签不被容器裁掉
+                    onMouseEnter={(e) => {
+                      clampDockLabel(e.currentTarget as HTMLElement)
+                      if (app.specialType === 'this-pc') {
+                        openDrivesCard()
+                      } else if (app.isFolder && app.targetPath) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openFolderCard(app, r.left + r.width / 2)
                       }
-                      return (
-                        <div className={'dock-group-preview' + (members.length === 1 ? ' single' : '')}>
-                          {members.slice(0, 4).map((m) => (
-                            <img key={m.id} src={m.iconDataUrl} alt="" draggable={false} />
-                          ))}
-                        </div>
-                      )
-                    })()
-                  ) : (
-                    <img className="dock-icon" src={app.iconDataUrl} alt="" draggable={false} />
-                  )}
-                  {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 0 && (
-                    <span className="dock-badge">{groupIconMembersById.get(app.id)!.length}</span>
-                  )}
-                  {/* 「此电脑」：所有盘符的汇总用量细条（贴在图标框底部内侧） */}
-                  {app.specialType === 'this-pc' && driveSummary && (
-                    <span className="dock-usage" aria-hidden="true">
-                      <span
-                        className="dock-usage-fill"
-                        style={{
-                          width: `${Math.round(driveSummary.ratio * 100)}%`,
-                          background: usageColor(driveSummary.ratio)
-                        }}
-                      />
+                    }}
+                    onMouseLeave={app.specialType === 'this-pc'
+                      ? scheduleCloseDrivesCard
+                      : app.isFolder && app.targetPath ? scheduleCloseFolderCard : undefined}
+                    // 不设 title：App 自己有胶囊悬浮标签，再叠加系统的原生 tooltip 会变成
+                    // 光标下方多出一个灰色提示框（与标签重复，观感也差）
+                  >
+                    <div className="dock-icon-wrap">
+                      {app.isGroup && !app.iconDataUrl ? (
+                        // 分组图标：默认用组内前 4 个图标的缩略拼图（macOS 堆叠观感），
+                        // 空组回退 2×2 网格图标；用户手动换过图标则走下面的 <img>
+                        (() => {
+                          // 用「可显示成员」（排除分隔线）做拼图，避免空破图格子
+                          const members = groupIconMembersById.get(app.id) ?? []
+                          if (members.length === 0) {
+                            return (
+                              <div className="dock-icon group-glyph">
+                                <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+                                  <rect x="3" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
+                                  <rect x="13.4" y="3" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
+                                  <rect x="3" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.55" />
+                                  <rect x="13.4" y="13.4" width="7.6" height="7.6" rx="2.2" fill="currentColor" opacity="0.9" />
+                                </svg>
+                              </div>
+                            )
+                          }
+                          return (
+                            <div className={'dock-group-preview' + (members.length === 1 ? ' single' : '')}>
+                              {members.slice(0, 4).map((m) => (
+                                <img key={m.id} src={m.iconDataUrl} alt="" draggable={false} />
+                              ))}
+                            </div>
+                          )
+                        })()
+                      ) : (
+                        <img className="dock-icon" src={app.iconDataUrl} alt="" draggable={false} />
+                      )}
+                      {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 0 && (
+                        <span className="dock-badge">{groupIconMembersById.get(app.id)!.length}</span>
+                      )}
+                      {/* 「此电脑」：所有盘符的汇总用量细条（贴在图标框底部内侧） */}
+                      {app.specialType === 'this-pc' && driveSummary && (
+                        <span className="dock-usage" aria-hidden="true">
+                          <span
+                            className="dock-usage-fill"
+                            style={{
+                              width: `${Math.round(driveSummary.ratio * 100)}%`,
+                              background: usageColor(driveSummary.ratio)
+                            }}
+                          />
+                        </span>
+                      )}
+                    </div>
+                    <span className="dock-label">
+                      {app.specialType === 'this-pc' && driveSummary
+                        ? `此电脑 · 可用 ${fmtSize(driveSummary.free)} / ${fmtSize(driveSummary.total)}`
+                        : (app.description || '未命名')}
                     </span>
+                  </div>
+                  {/* 落点在这条之后（slot 已自增，所以比的是 mySlot + 1） */}
+                  {dropIdx === mySlot + 1 && dragId !== app.id && (
+                    <div className="drop-indicator" />
                   )}
                 </div>
-                <span className="dock-label">
-                  {app.specialType === 'this-pc' && driveSummary
-                    ? `此电脑 · 可用 ${fmtSize(driveSummary.free)} / ${fmtSize(driveSummary.total)}`
-                    : (app.description || '未命名')}
-                </span>
-              </div>
-              )}
-              {dropIdx === idx + 1 && dragId !== app.id && (
-                <div className="drop-indicator" />
-              )}
-            </div>
-          ))}
+              )
+            })
+          })()}
 
           {/* Add button（键盘导航可落到这里：Enter 打开菜单） */}
           <div className={'dock-item dock-add' + (navId === ADD_BTN_ID ? ' selected' : '')} ref={addBtnRef}>

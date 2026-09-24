@@ -166,6 +166,103 @@ npm run package    # 构建并打包为可执行安装包
 
 ## 更新日志
 
+### v1.13.1 (2026-09-24)
+
+**专项修复：一次全项目 bug 审计（代码 + UI）发现的 19 个缺陷**。审计方式：类型检查 + 通读三个进程的全部源码 + 用**真实构建产物**在真实 Chromium 里驱动真实 UI（新增 8 个探针脚本，见文末）。下面按「用户能感知的严重度」排列。
+
+#### 严重：三个功能实际上是坏的
+
+- **① 点击其他软件后 Dock 立刻自己弹回置顶**（`src/main/index.ts` `sendToBottom`）
+  - **根因是判断反了**：回调里先 `sinkState = null`（1547 行），紧接着调 `stillWanted()`，而 `stillWanted()` 的第一个条件正是 `sinkState?.win === win` —— 于是它**恒为 false**，紧跟的 `if (!destroyed && visible) recoverDock(win)` 在**每一次成功的沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶，并顺带 `markDockShown()` 重置 2.5s 宽限期（下一次 blur 也被吞掉）。这行是 v1.11.0 引入的
+  - **修法**：进回调时先捕获「这次沉底是不是我们自己的、代际有没有变」，再清状态；只有「期间确实有更晚的拉回/隐藏意图」才走 `recoverDock` 补偿
+  - **验证**：`sink-logic.cjs` 用逐行对照的五个场景复验 —— 正常沉底 → 不 recoverDock ✔；沉底途中唤回 → recoverDock ✔；途中隐藏到托盘 / PS 失败 / 窗口被销毁 → 不 recoverDock ✔
+- **② 有分隔线时拖拽排序会插错位置**（`App.tsx`）
+  - **三个下标空间混用**：`calcDropIndex` 在 `dockCenters` 上二分，而 `measureCenters` **跳过分隔线**（`data-sep`）→ 返回的是「不含分隔线」的下标；但 `topAnchorId` 用的是 `list.filter(a => !a.groupId)`（**含**分隔线），插入线比较的 `viewTopLevel` 也含分隔线。每有一条分隔线落在落点左侧，插入位置与指示线就整体偏左一个槽位
+  - **实测复现**：图标 `A ▏ B C D`，把 C 拖到 B 的右半边（光标 x=573）→ 数组变成 `A ▏ C B D`（C 越过了 B），指示线画在 x=513（B 左边两格）
+  - **修法**：统一到「可显示顶层条目（非分组成员且非分隔线）」一个空间——新增 `droppableTop()`，`topAnchorId` 与插入线渲染都按它计数
+  - **验证**：同一场景修复后 `A ▏ B C D` 保持不变，指示线落在 x=577（≈ 光标 573）✔
+- **③「以管理员身份运行」对没有启动参数的条目 100% 失败**（`src/main/index.ts`）
+  - `Start-Process` 的 `-ArgumentList` / `-WorkingDirectory` 都是 `[ValidateNotNullOrEmpty]`，传空串**先**在校验阶段抛错（本机 PS 5.1 实测：`Cannot validate argument on parameter 'ArgumentList'. The argument is null or empty.`），根本走不到创建进程那一步。而「没有启动参数」正是绝大多数条目的常态
+  - 更糟的是这条路径**先把 Dock 隐藏了**（`mainWindow.hide()`），失败只打一行日志、IPC 还返回 `true` → 用户看到「Dock 消失、没有 UAC、什么都没发生」
+  - **修法**：用参数哈希表拼装，空值一律**不传**该参数；失败时 `restoreDockAfterFailedLaunch()` 把 Dock 还给用户
+  - **验证**：`runas-check.cjs` 从源码里提取脚本模板，在真实 PS 5.1 上跑五种参数组合（含单引号转义）—— 全部通过参数校验、走到「文件不存在」✔
+
+#### 高：会静默丢功能的缺陷
+
+- **④ 拖入 ≥13 个 exe 会被整批拒绝**（`runPowerShell` 未设 `maxBuffer`）
+  - Node `execFile` 默认 1 MiB，超限时子进程被杀、`err.code = ERR_CHILD_PROCESS_STDIO_MAXBUFFER`；而所有调用点都把 `err` 当成「没有结果」→ 静默返回空数组。实测 `describeExecutables` 每个 exe 带一枚 256px 图标 = **80,235 字节**，**13 个就超 1 MiB**（1,043,075 B）；20 个是 1.6 MB
+  - 用户看到的是「已跳过 20 个（重复或格式不支持）」，完全不知道真实原因
+  - **修法**：`PS_MAX_BUFFER = 8 MiB`
+  - 顺带核对了 `scan-desktop-folders`：那条每项只带一枚 **48px** 图标（约 2.7 KB），要 380+ 个桌面文件夹才可能超限，**不是**本次的问题路径（审计时曾被怀疑，实测排除）
+- **⑤ 6 处硬编码 256px 图标尺寸与 `ICON_SIZE = 64` 矛盾**（`src/main/index.ts`）
+  - `parseLnkFile` 4 处 + `describeExecutables` 2 处仍在传 `256`。同一枚图标实测 64px = 10,048 B、256px = 82,972 B（**8.3 倍**）—— 这既是磁盘/内存浪费，也是 ④ 的直接原因。306-310 行早就为文件夹图标修好了同一个问题，这 6 处漏了
+- **⑥ 把「此电脑」拖进分组 → 成员残留 `specialType`**（`App.tsx`）
+  - 归组写的是 `{ ...item, groupId: overGroup }`，`specialType: 'this-pc'` 跟着进组 → 这个「分组成员」在面板里仍被当成系统位置渲染（标签被改写成「此电脑 · 可用 …」、图标上挂一条用量细条）
+  - **修法**：入组时显式 `delete member.isFolder / member.specialType`
+
+#### 中
+
+- **⑦ `folder-icons` 只发给第一个请求者**：`folderListPending` 复用在途 Promise 时，闭包里捕获的是**旧**窗口的 `sender`。窗口重建（切停靠位置 / dev HMR）后新窗口命中同一条 Promise，后台补图标全推给了旧 WebContents，卡片永远停在占位块。改为 pending 记录**可变的 sender**，每批推送前重新取
+- **⑧ Dock 玻璃条比设计值矮 16px**：实测 `.dock-bar` 只有 **130px**（设计 146），连锁导致 `.dock-bg` 只有 **60px**（设计 76），整条玻璃条偏薄、图标底边距窗口底 8px 而非贴底。根因是 `.dock-bar` 作为 flex 项在算 auto 高度时被父级 `.dock` 的**内容盒**（130px）确定化。修法：`.dock-bar { height: 146px }` + `.dock-inner { height: 100% }`；修后 `.dock-bg` = 76px、`.dock` = 162px（= 146 + 上下 8px padding，正是设计值）、图标底边贴窗口底。**五个浮层的贴边锚点全部自动跟随**（实测菜单/右键菜单/面板/两张卡片的 8px 间隙与窗口内约束均不变）
+- **⑨ 托盘「显示窗口」与关闭到托盘没走统一入口**：前者缺 `sinkSeq++` / `recoverDock()` / `markDockShown()`（一旦 Windows 前台锁拒绝这次激活，窗口会停在「可见但不置顶」，且没有宽限期保护）；后者缺 `sinkSeq++`（正是注释里要防的「HWND_BOTTOM 钉在隐藏窗口上」）
+- **⑩ 启动路径的未捕获异常/未处理 rejection**：`execFile('explorer', …)` 没有回调也没有 `error` 监听（spawn 失败会在主进程抛未捕获异常）；`shell.openExternal`（两处，含 `setWindowOpenHandler`）与 `shell.openPath` 的返回 Promise 被丢弃（`steam://` / 没有关联程序的 `mailto:` 会 reject）
+
+#### 低
+
+- **⑪ `sendToBottom` 的串行化重试永远不执行**：重试守卫写成 `sinkState?.win === win`，而前一次任务完成时已把 `sinkState` 置回 `null` → 第二次让位意图被静默丢弃。改为按「意图是否仍成立」判断（`sinkSeq` / 可见 / 焦点 / 托盘 / 宽限期）
+- **⑫ `load-shortcuts` 只校验数组、不校验元素**：`[1,"x",null]` 是合法 JSON，会原样进 renderer；改为过滤掉非对象元素
+- **⑬ `showOpenDialogSafe` 可能永久卡住 `dialogOpen`**：`showOpenDialog` 若同步抛错，`.finally()` 注册不上 → 之后 Dock 再也不沉底；改为 `try/catch`
+- **⑭ `ensureFolderIcon` 把失败缓存成空串且不再重试**：`folderIcon !== null` 让后续调用直接返回，`select-folder` 整个会话发空图标；改为失败时复位成 `null`
+- **⑮ 抢不到单实例锁的进程仍会跑预热**：`whenReady` 里的预热没被 `gotSingleInstanceLock` 保护，白起一个 `powershell.exe`
+- **⑯ `fillFolderIcons` 的 `sender.send` 可能抛成未处理 rejection**（该函数是 `void` 掉的）：包 `try/catch` 并在捕获时删缓存
+- **⑰ 键盘导航的层级判断错了**：`list` 只按 `openGroupId` 取。面板被鼠标点开、而选中框仍在主 Dock 上时，`list.findIndex(navId)` 恒为 −1 → `→` 会让选中框凭空飞进面板第一个成员，`←` 会收起面板。改为按**选中项实际所在层级**（`navInPanel`）决定列表；`Escape` 在该场景下改为「收起面板并退出导航」。顺带明确了：`→` 在最右侧时**仅当选中框不在面板内**才落到「+」（面板内需先 `←`/`Esc` 退出）—— 这条行为已写入 `CLAUDE.md`
+- **⑱ 编辑表单里清空名称会静默无效**：`editFields.description.trim() || a.description` 在名称被清空时保留原名，输入框空了却没改成功。改为允许清空（渲染兜底显示「未命名」）
+- **⑲ 位置选择器与文档不一致**：`handleEdgePick` 会关掉「+」菜单，而 CLAUDE.md 写的是「位置选择后菜单保持打开」（主题选择器也是保持打开的）。统一为**保持打开**
+
+- **⑳ Dock 图标垂直偏心：玻璃条内「上留 16px、下留 0px」**（用户直接反馈「为什么图标上面间距比下面大」）
+  - **根因**：`.dock-inner` 是 `flex-direction: column`（默认），所以 `align-items` 管的是**横轴**——原来写的 `align-items: flex-end` 只管横向收边，**纵向压根没被居中**；纵向位置实际由 `justify-content`（默认 `flex-start`）+ `padding-top` 决定，于是衬底被顶到玻璃条下沿
+  - **实测**：玻璃条 `[218, 294]`（高 76），图标衬底 `[234, 294]`（高 60）→ 上 16px / 下 0px（诊断时还量到 `item.offsetTop = 98` 而 `padding-top` 只有 82，多出的 8px 来自 `align-items: flex-end` 对内容盒的影响）
+  - **修法**：改成 `justify-content: center`（纵向）+ `align-items: center`（横向），并把 `.dock-bar` / `.dock-inner` / `.dock-bg` 三处数值重新配平：
+    ```
+    .dock-bar  高 158（贴底 → [136, 294]）
+    .dock-inner padding: 82px 16px 0 → 内容盒 [218, 294]，高 76
+    .dock-bg { top: 82px; bottom: 0 } → 高 76，正好等于内容盒
+    衬底 60 在 76 里居中 → [226, 286] → 玻璃内上 8 / 下 8
+    ```
+  - **实测复核**（真壁纸 + 三档停靠位置）：上 8 / 下 8、图标图像上 16 / 下 16，`middle`/`bottom`/`top` 三档完全一致；顺带确认悬浮标签不被 `.dock-inner` 的 `overflow` 裁掉（标签顶边在容器顶边下方 58px，余量充足）
+  - 连带同步：`.dock-edge` 的 `top`、`top` 布局镜像的 `bottom/padding`（82）、`.drop-hint` 的 `bottom/top`（156 → 168，因为 Dock 由 146 变 158）
+  - ⚠️ **这是一次「CSS 属性用在错的轴上」的典型**：`align-items` vs `justify-content` 在 `flex-direction: column` 下会互换语义，而且写错时**不报错、只是静默偏心**——所以布局改完一定要**量数字**，不能只看「元素在容器里」就以为居中了
+
+- **㉑ 滚不到最前面：「此电脑」「回收站」被推到屏幕外且找不回来**（延续 ⑳ 的修复，用户随后反馈）
+  - **根因**：⑳ 里我给 `.dock-inner` 加了 `justify-content: center` 来做纵向居中。但它是**横向滚动容器**（`overflow-x: auto`）——flex 在**主轴溢出**时 `justify-content: center` 会让内容**向两侧同时溢出**，而**左侧那半永远滚不到**
+  - **最隐蔽的一点**：浏览器**不把左侧溢出算进可滚动区**，所以 `scrollWidth` 会**小于**真实内容宽度 —— 实测 31 个图标时 `scrollWidth` 只有 **1582**，而把各元素宽度加起来实际是 **2012**。于是「滚到底」也到不了最前面，因为可滚动区压根没包含那 430px
+  - **实测现象**：`scrollLeft = 0` 时第一个图标停在 **x = −390**（容器左缘是 24）；滚轮、`scrollIntoView`、拖拽自动滚动全都无效
+  - **修法**：`.dock-inner` **不加 `justify-content`**；纵向位置改由 `padding-top: 82px` + `padding-bottom: 0` + `align-items: center` 决定（`flex-direction: row` 下 `align-items` 管的是**纵轴**，正好用来在 76px 内容盒里居中 60px 衬底）
+  - **实测复核**：`scrollWidth` 从 1582 恢复到 **2012**（= 内容真实跨度）；`scrollLeft = 0` 时第一个图标 left = **40**（容器 24 + padding 16），完整可见；从最右用滚轮一路向左能回到第一个图标 ✔
+  - ⚠️ 这两个 bug 是**同一处 CSS 的两个轴**打架：⑳ 要纵向居中、㉑ 的解法在横轴上破坏了滚动。教训是**滚动容器上不要用 `justify-content` 做居中**，用 padding 把内容推到位
+
+#### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
+
+跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
+
+| 脚本 | 作用 |
+|---|---|
+| `ui-probe.cjs` | 全量 UI 行为探针（42 项断言）+ 截图输出到 `probe/out/` |
+| `nav-deterministic.cjs` | 键盘导航确定性验证（16 项，含「恢复上次位置」） |
+| `sink-logic.cjs` | 沉底补偿逻辑五场景 + 串行重试验证 |
+| `runas-check.cjs` | 从源码提取 run-as-admin 脚本，在真实 PS 上验证参数校验 |
+| `batch-size.cjs` / `ps-checks.cjs` | maxBuffer 阈值、图标体积、Start-Process 校验 |
+| `verify2.cjs` / `special-into-group.cjs` | 分隔线落点错位、入组字段污染 |
+| `reorder-cache.cjs` / `final-probe.cjs` / `top-menu-diag.cjs` | 几何缓存通道、Dock 几何、顶部菜单锚点 |
+| `centering-all-edges.cjs` | **三档停靠位置下的垂直居中一致性**（衬底/图标在玻璃条内的上下留白，附带每档截图） |
+| `scroll-check.cjs` | **横向滚动的可达性**（滚轮左右滚、`scrollWidth`、第一个图标能否回到可视区） |
+| `label-check.cjs` / `visual-check.cjs` | 悬浮标签是否被容器裁剪、真壁纸下的居中肉眼复核 |
+
+**探针本身踩过的三个坑**（写在这里省得下次重踩）：
+1. **React 19 的事件委托挂在 `#root` 上** —— `document.dispatchEvent(new KeyboardEvent(…))` 不会被收到，必须在 `document.body` 上派发。第一版探针因此报了 4 个假失败
+2. **`onMouseEnter`/`Leave` 是 React 用 `mouseout`/`mouseover` 合成的** —— 直接派发 `mouseenter` 事件不会触发，必须给出正确的 `relatedTarget` 序列
+3. **切停靠位置必须走 `dock-edge-changed` 事件**，不能直接改 DOM 上的 `data-edge`：React 的 edge state 没变，之后任何一次重渲染都会把属性改回去，浮层锚点按旧布局算 —— 于是量到「顶部布局下菜单在窗口外」这种假 bug
+
 ### v1.13.0 (2026-09-19)
 
 **主 Dock 玻璃条宽度随图标数量伸缩**（用户要求：图标少时两端不该留大片空白，应像分组面板一样随数量涨大，到上限才开始滑动）
