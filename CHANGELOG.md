@@ -301,6 +301,52 @@ npm run package    # 构建并打包为可执行安装包
   - ⚠️ 教训：**`<button>` 不继承 `font`** 是 Chromium UA 样式表的固有行为，凡是给按钮写字体都要显式声明
     或在基础层统一收口；别指望它跟着 body 走
 
+- **㉗ `run-app` 立刻 `return true`，启动失败的回执永远传不到 renderer**（弹窗时机审计发现）
+  - **审计方法**：把「弹出/消失」的所有路径列出来逐一核对——显示 4 条（启动、Alt+Space/托盘、second-instance、失败回滚）、
+    隐藏 5 条（启动目标、关窗到托盘、Alt+Space 隐藏、失败回滚的反向、重建窗口）。重点核对**异步窗口期**里的顺序
+  - **发现的缺陷**：`run-app` 的「Executable」分支是
+    ```ts
+    execFile(targetPath, args, (err) => { …restoreDock… })   // 回调是异步的
+    return true                                              // ← 却立刻返回成功
+    ```
+    spawn 失败是**异步**通知回调的。实测（探针 `runapp-timing.cjs`，与源码逐行同构）：
+    目标不存在时 handler 在 **~1ms** 就返回了 `true`，而 `ENOENT` 要到 **~400ms** 后才在回调里到达。
+    **后果**：renderer 里那句
+    `window.api.runApp(...).then(ok => { if (ok === false) showDropHint('启动失败：目标不存在或无法运行') })`
+    **永远不可能触发** —— Dock 约 0.4s 后自己弹回来、却一句解释都没有。
+    那句提示正是 v1.13.1 为了消除「点了没反应」而加的，结果因为返回值恒真而形同虚设（典型「修了但没生效」）
+  - **修法**：监听子进程的 `spawn` / `error` 两个事件再决定返回值 ——
+    `spawn` 表示进程真的起来了（立刻 resolve），`error` 表示没起来（resolve false）。
+    ⚠️ **不能用 `execFile` 的完成回调判成功**：对 GUI 程序那个回调要等**程序关闭**才触发，
+    挂上去会让这个 IPC 一直挂到用户关掉应用为止（这是必须避开的设计陷阱）
+  - **实测**（探针 `runapp-fixed.cjs`）：不存在的 exe → 返回值 **false** + Dock 还回；
+    存在的 GUI 程序（notepad）→ 返回值 **true** + Dock 保持隐藏（**不等进程退出**，21ms 返回）
+
+- **㉘ 启动失败的回滚会「抢用户的操作」**（同上审计，修 ㉗ 时连带发现）
+  - `restoreDockAfterFailedLaunch()` 原实现是**无条件** `show()`。但失败回调是异步的（~400ms），
+    这段时间里用户完全可能已经自己 Alt+Space 唤回、**或又点了另一个图标并成功启动** ——
+    那时这个迟到的回调会把 Dock 又弹回来
+  - 第一版修法只加了 `if (!dockTrayHidden) return`，**不够**：用户点第二个图标时 `run-app` 会再次
+    把 `dockTrayHidden` 置真，值凑巧又相等，守卫失效 —— 这个漏洞是我自己的状态机测试
+    （探针 `visibility-state.cjs` 场景 3）抓出来的
+  - **正解：比代际，不比布尔值**。`run-app` / `run-as-admin` 隐藏时记下当时是第几代
+    （`sinkSeq++` 之后的值）并往下传，回滚时 `if (sinkSeq !== hideSeq) return` ——
+    期间只要发生过任何一次唤回或再次隐藏，代际就变了，这次回滚自动作废
+  - **实测**（`visibility-state.cjs` 5 个场景全过）：正常失败还回 ✔ / 用户已唤回时不重复 show ✔ /
+    第二个应用已启动时不弹回 ✔ / URL 失败还回 ✔ / UAC 取消还回 ✔
+
+- **㉙ 弹窗时序审计的其余结论（这些是**对的**，记录以免以后改坏）**
+  - 显示 4 条路径**都**做了 `sinkSeq++` + `markDockShown()` + `recoverDock()` 三件套（`second-instance`、
+    托盘「显示窗口」、`toggleWindow` 显示分支、`ready-to-show`）；隐藏 5 条路径都做了 `sinkSeq++`，
+    没有漏网的（这是 v1.13.1 修回归时补的，本次逐条复核确认）
+  - `blur` 的 120ms 延迟复核是对的：回调里先比 `sinkSeq`（任何招回都会 ++ 使其作废），
+    再查可见/焦点/托盘/宽限期，四条全过才起 PowerShell
+  - **`focus` 每次都会 `sinkSeq++`**，因此「点回 Dock 再点别的软件」不会留下过期的沉底定时器 ——
+    旧定时器代际不符自动作废，永远只有一个待执行（这条设计很关键，别再改成"只在状态变化时才 ++"）
+  - ⚠️ **已知取舍（未改）**：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时用户会看到
+    Dock 消失约 0.4s 再回来 + 提示。要消除这个闪烁得在隐藏前做存在性预检，
+    但那对 `shell:`/URL/裸命令名（PATH 里解析）会误判，风险大于收益，故保留现状
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
@@ -321,6 +367,9 @@ npm run package    # 构建并打包为可执行安装包
 | `payload-loss.cjs` | **落盘往返**：模拟真实 shortcuts.json + 桌面扫描合并，核对 groupId/specialType 等字段是否存活 |
 | `themes.cjs` / `themes-1x.cjs` | 三种主题逐一渲染 + 取配色变量（**按层拆解 background-image**，别只看第一层） |
 | `menu-fonts.cjs` | 「+」菜单字体候选对比（**不要再设 `zoomFactor`**，会按源污染后续所有探针） |
+| `runapp-timing.cjs` | **`run-app` 返回值时序**：证明原实现 ~1ms 就返回 true、而 ENOENT 要 ~400ms 后才到 |
+| `runapp-fixed.cjs` | 同上，验证修好后 handler 能等到 spawn 结果（false / true 各一例） |
+| `visibility-state.cjs` | **弹出/消失状态机**的 5 个场景（正常回滚 / 用户已唤回 / 第二个应用已启动 / URL 失败 / UAC 取消） |
 
 #### ⚠️ 探针环境里一个查了很久的坑：`devicePixelRatio` 会漂成 3
 

@@ -156,7 +156,33 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 - **实现**：Electron 原生 `app.setLoginItemSettings` / `getLoginItemSettings`，写注册表 `HKCU\...\Run` 登录项，无第三方依赖
 - **参数**：打包版注册 `QuickLaunch.exe --autostart`；开发模式 `process.execPath` 是 `electron.exe`，必须附带应用路径参数（`--autostart <appPath>`，第一个非开关参数被 Electron 当作 app 路径）——`autoStartArgs()` 按 `app.isPackaged` 区分，`get/set` 必须传相同的 `path`/`args` 才能正确匹配注册表项
-- **`--autostart` 隐藏启动**：带该参数启动（开机自启）时窗口默认隐藏到托盘（`ready-to-show` 不 `show()`），不打扰登录后的桌面；Alt+Space / 托盘图标唤出
+- **`run-app` 必须等 spawn 结果再返回（v1.13.4 修，改这块必看）**：handler 是
+  `await new Promise(...)` 监听子进程的 `spawn` / `error` 事件，只有 `spawn` 才算成功。
+  - 🚫 原实现 `execFile(target, args, cb)` 之后**立刻 `return true`** —— spawn 失败是**异步**通知 cb 的
+    （实测目标不存在时 handler **~1ms** 返回 true，`ENOENT` 要 **~400ms** 后才到），
+    于是 renderer 的 `if (ok === false) showDropHint('启动失败：…')` **永远不触发**：
+    Dock 自己弹回来却没有任何解释。**改这里必须保证「返回值真实反映 spawn 结果」**
+  - 🚫 **不要用 `execFile` 的完成回调判成功**：对 GUI 程序那个回调要等**程序关闭**才触发，
+    挂上去会让这个 IPC 一直挂到用户关掉应用为止。完成回调现在只用于「起来了但退出码非零」的日志
+  - 成功后 `child.unref()` 与子进程解绑（GUI 程序可能跑几小时，父进程不该持有它）
+- **启动失败的回滚要**比代际**，不要比布尔值（v1.13.4 修）**：`restoreDockAfterFailedLaunch(hideSeq)`
+  收的是「**这次隐藏时**的 `sinkSeq`」，进入时先 `if (sinkSeq !== hideSeq) return`。
+  - 原因：失败回调是异步的（~400ms），这期间用户可能 ① 自己 Alt+Space 唤回、② 又点了另一个图标并成功启动。
+    只判 `!dockTrayHidden` **不够**：点第二个图标时 `run-app` 会再把 `dockTrayHidden` 置真，值凑巧相等 → 守卫失效，
+    迟到的回调会把第二个应用刚启动的 Dock 又弹出来（这个漏洞是 `visibility-state.cjs` 场景 3 抓出来的）
+  - `run-app` 与 `run-as-admin` 都在隐藏时 `let hideSeq = sinkSeq` → `sinkSeq++` → `hideSeq = sinkSeq` 并往下传；
+    **新增任何「先隐藏、失败再回滚」的路径都必须照做**
+  - 回归验证：`node .dsh-vision-toolkit/probe/visibility-state.cjs`（5 个场景）+
+    `runapp-timing.cjs` / `runapp-fixed.cjs`（返回值时序）
+- **弹窗/消失的路径清单（2026-09 逐条复核过，改动时对照）**：
+  - **显示 4 条**：`ready-to-show`（启动/重建）、`toggleWindow` 显示分支（Alt+Space/托盘左键）、
+    托盘「显示窗口」、`second-instance`。**都必须做三件套**：`sinkSeq++`（作废在途沉底）+ `markDockShown()`（宽限期）
+    + `recoverDock()`（置顶 + 120ms 补一次 + `verifyDockOnTop` 巡检）
+  - **隐藏 5 条**：`run-app`、`run-as-admin`、`open-path`、`close` 到托盘、`toggleWindow` 隐藏分支。**都必须 `sinkSeq++`**
+  - ⚠️ **`focus` 每次都会 `sinkSeq++`** —— 所以「点回 Dock 再点别的软件」不会留下过期的沉底定时器
+    （旧定时器代际不符自动作废，永远只有一个待执行）。**别改成「只在状态变化时才 ++」**
+  - ⚠️ 已知取舍：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时会有 ~0.4s 消失再回来 + 提示。
+    要消除闪烁得在隐藏前做存在性预检，但对 `shell:` / URL / 裸命令名会误判，风险大于收益，故保留
 - **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色与主题分段选择器统一——`--switch-on-bg`/`--switch-on-knob` 按主题定义：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）
 - **单实例锁**：模块顶层 `app.requestSingleInstanceLock()`——未获得锁直接 `app.quit()`，`whenReady` 开头 `return` 跳过初始化；`second-instance` 事件唤起已有窗口（防止开机自启 + 手动启动出现两个 Dock）
 

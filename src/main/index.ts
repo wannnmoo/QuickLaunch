@@ -937,9 +937,11 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
   // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 dockTrayHidden
   // 意图状态判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
+  let hideSeq = sinkSeq
   if (mainWindow && !mainWindow.isDestroyed()) {
     dockTrayHidden = true
     sinkSeq++ // 隐藏即作废在途沉底（hide() 引发的 blur 不该再起 PowerShell）
+    hideSeq = sinkSeq // 记下这次隐藏的代际：失败回滚只认这一代（见 restoreDockAfterFailedLaunch）
     mainWindow.hide()
   }
 
@@ -960,7 +962,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       const msg = await shell.openPath(targetPath)
       if (msg) {
         console.error('[launcher] openPath (folder) failed:', msg)
-        restoreDockAfterFailedLaunch()
+        restoreDockAfterFailedLaunch(hideSeq)
         return false
       }
       return true
@@ -975,43 +977,87 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     // reject，不接就是未处理 rejection
     void shell.openExternal(targetPath).catch((err) => {
       console.error('[launcher] openExternal failed:', err instanceof Error ? err.message : String(err))
-      restoreDockAfterFailedLaunch()
+      restoreDockAfterFailedLaunch(hideSeq)
     })
     return true
   }
 
   // Executable
-  execFile(targetPath, args ? splitArgs(args) : [], { cwd: workingDir || undefined }, (err) => {
-    if (!err) return
-    // 只有「子进程根本没起来」才算启动失败。err.code 是字符串时才是 spawn 级失败
-    // （ENOENT / EACCES / EPERM / UNKNOWN…）；数字则是进程正常起来了、只是退出码非零
-    // ——那种情况程序确实启动了，把 Dock 拽回来纯属帮倒忙
-    // （很多应用/启动器带参数启动后会立刻以非零码退出）。
-    const spawnFailed = typeof err.code === 'string'
-    if (!spawnFailed) {
-      console.log(`[launcher] 目标已启动但退出码非零 (${err.code}): ${targetPath}`)
-      return
-    }
-    restoreDockAfterFailedLaunch()
-    // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
-    // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
-    // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
-    if (err.code === 'EACCES' || err.code === 'EPERM') {
-      console.log(`[launcher] Direct spawn blocked (likely admin required); falling back to Shell: ${targetPath}`)
-      shell.openPath(targetPath)
-        .then((msg) => { if (msg) console.error('[launcher] Shell fallback also failed:', msg) })
-        .catch((e) => console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e)))
-      return
-    }
-    console.error('Failed to launch:', err)
+  //
+  // ⚠️ 这里**必须等 spawn 结果再返回**（v1.13.4 修）。原实现是
+  //   execFile(target, args, cb)  然后**立刻** `return true` —— 而 spawn 失败是
+  //   **异步**通知 cb 的。实测：目标不存在时 handler 在 ~1ms 就返回了 true，
+  //   而 ENOENT 要到 ~400ms 后才在 cb 里到达。
+  //   后果：renderer 那句 `if (ok === false) showDropHint('启动失败：…')` **永远不可能触发** ——
+  //   Dock 约 0.4s 后自己弹回来、却一句解释都没有，正是那句提示想避免的体验。
+  //   现在改为监听 'spawn' / 'error' 两个事件：'spawn' 表示进程真的起来了（立刻 resolve），
+  //   'error' 表示没能起来（resolve false）——都不必等进程退出。
+  //   ⚠️ 不能用 execFile 的完成回调来判成功：对 GUI 程序那个回调要等**程序关闭**才触发，
+  //      挂在它上面会让这个 IPC 挂到用户关掉应用为止。
+  const spawnOutcome = await new Promise<'ok' | 'spawn-failed'>((resolve) => {
+    let settled = false
+    const child = execFile(
+      targetPath,
+      args ? splitArgs(args) : [],
+      { cwd: workingDir || undefined },
+      // 完成回调只用于「起来了但退出码非零」的日志；成功/失败已由下面的事件定夺
+      (err) => {
+        if (!err) return
+        if (typeof err.code === 'string') return // spawn 级失败已由 'error' 处理
+        console.log(`[launcher] 目标已启动但退出码非零 (${err.code}): ${targetPath}`)
+      }
+    )
+    child.once('spawn', () => {
+      if (settled) return
+      settled = true
+      // 与子进程解绑：主进程不再关心它的生死（GUI 程序可能跑几小时），
+      // 否则父进程会一直持有句柄、退出时还要等它
+      child.unref?.()
+      resolve('ok')
+    })
+    child.once('error', (err: NodeJS.ErrnoException) => {
+      if (settled) return
+      settled = true
+      const code = err.code
+      // spawn 被拒（EACCES/EPERM）：通常是程序需要管理员权限，或安全软件拦了裸的
+      // CreateProcess。回退到系统 Shell 启动（ShellExecuteEx）——与资源管理器双击
+      // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
+      if (code === 'EACCES' || code === 'EPERM') {
+        console.log(`[launcher] Direct spawn blocked (likely admin required); falling back to Shell: ${targetPath}`)
+        shell.openPath(targetPath)
+          .then((msg) => { if (msg) console.error('[launcher] Shell fallback also failed:', msg) })
+          .catch((e) => console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e)))
+        // 回退成功与否由 shell 侧日志兜底；对 renderer 报成功（Dock 保持隐藏，
+        // 因为确实已经交给系统去启动了）
+        resolve('ok')
+        return
+      }
+      console.error('[launcher] Failed to launch:', err.message)
+      resolve('spawn-failed')
+    })
   })
+
+  if (spawnOutcome === 'spawn-failed') {
+    restoreDockAfterFailedLaunch(hideSeq)
+    return false // renderer 据此提示「启动失败：目标不存在或无法运行」
+  }
   return true
 })
 
 /** 启动失败后把 Dock 还给用户：点图标时已经先隐藏到托盘，若不还回来，
- *  用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回。 */
-function restoreDockAfterFailedLaunch(): void {
+ *  用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回。
+ *
+ *  ⚠️ `hideSeq` 必须传「**这次隐藏时**的 sinkSeq」，不能只看 `dockTrayHidden`
+ *  （v1.13.4 修，这条是实测出来的）：
+ *  spawn 失败是**异步**通知的（实测 ~400ms 后）。这段时间里用户完全可能
+ *  ① 自己 Alt+Space 唤回，或 ② 又点了另一个图标并成功启动。
+ *  那时 `dockTrayHidden` 的**值**可能凑巧又是 true（比如被第二次 run-app 重新置真），
+ *  只比值就会把第二个应用刚启动的 Dock 又弹出来。比对**代际**才准确：
+ *  代际不同 ⇒ 这次隐藏早已不是当前意图，什么也别做。 */
+function restoreDockAfterFailedLaunch(hideSeq: number): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
+  if (sinkSeq !== hideSeq) return // 期间有更新的意图（唤回 / 又启动了一个）—— 不抢用户的操作
+  if (!dockTrayHidden) return // 已经不是「我们藏起来」的状态了
   dockTrayHidden = false
   sinkSeq++ // 作废在途沉底：Dock 被还给用户后不能再被压到底部
   markDockShown()
@@ -1513,9 +1559,11 @@ void app.whenReady().then(() => {
 // 以管理员身份运行（Start-Process -Verb RunAs → UAC 提权，与资源管理器「以管理员身份运行」一致）
 ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
+  let hideSeq = sinkSeq
   if (mainWindow && !mainWindow.isDestroyed()) {
     dockTrayHidden = true
     sinkSeq++ // 隐藏即作废在途沉底
+    hideSeq = sinkSeq // 记下代际：UAC 取消/失败的回滚只认这一代
     mainWindow.hide()
   }
   // ⚠️ `Start-Process` 的 -ArgumentList / -WorkingDirectory 都是 [ValidateNotNullOrEmpty]：
@@ -1538,7 +1586,7 @@ Start-Process @p`
     // UAC 被用户取消（The operation was canceled by the user）也走这里：
     // 此时同样要把 Dock 还给用户，否则「点了没反应 + Dock 消失」没有任何出路
     console.error('[launcher] run-as-admin failed:', err.message, '| stderr:', (stderr || '').slice(0, 300))
-    restoreDockAfterFailedLaunch()
+    restoreDockAfterFailedLaunch(hideSeq)
   })
   return true
 })
