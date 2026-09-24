@@ -241,6 +241,14 @@ npm run package    # 构建并打包为可执行安装包
   - **实测复核**：`scrollWidth` 从 1582 恢复到 **2012**（= 内容真实跨度）；`scrollLeft = 0` 时第一个图标 left = **40**（容器 24 + padding 16），完整可见；从最右用滚轮一路向左能回到第一个图标 ✔
   - ⚠️ 这两个 bug 是**同一处 CSS 的两个轴**打架：⑳ 要纵向居中、㉑ 的解法在横轴上破坏了滚动。教训是**滚动容器上不要用 `justify-content` 做居中**，用 padding 把内容推到位
 
+- **㉒ `electron-builder.yml` 的 `files` 是排除式，把开发脚手架整包打进了 asar**（打包发布时发现）
+  - electron-builder 的 `files` 语义是「**没列出来的都会进去**」，原配置只排除了 `src/`、`node_modules/` 和几个配置文件，漏掉两类，实测：
+    - `electron-v43.1.0-win32-x64.zip`（**144 MB**，仅用于 `electronDist` 跳过下载）——它就躺在项目根目录，被整包塞进 asar，`app.asar` 因此虚报到 **142 MB**
+    - `.dsh-vision-toolkit/**`（3.7 MB / 224 个文件：图标候选图、探针脚本、截图、提交信息草稿）——asar 的 **250 个条目里有 235 个是它**
+  - **修法**：显式加 `!electron-v*.zip` 与 `!.dsh-vision-toolkit/**`
+  - **实测效果**：`app.asar` 条目 **250 → 14**、体积 **142 MB → 0.89 MB**；安装包 **235 MB → 95 MB**（省掉 140 MB）
+  - 这两者都不参与运行时（main 只读 `out/**` 与 `resources/`），排除是安全的；打包版已实机启动验证（窗口标题「快捷方式面板」、4 个 Electron 子进程正常）
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：

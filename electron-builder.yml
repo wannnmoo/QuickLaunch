@@ -16,6 +16,15 @@ files:
   # 注意：本项目**没有运行时依赖**，所以整目录排除是安全的；一旦将来真要用外部/原生模块
   # （例如加个 sqlite），必须去掉这一行，否则那个包不会被打进产物。
   - '!node_modules/**'
+  # 不打包开发脚手架与本地 Electron 分发包（v1.13.1 补）：
+  # electron-builder 的 files 是**排除式**——没列出来的东西都会进 asar。实测漏掉了两类：
+  #   ① `electron-v*.zip`（144 MB，仅用于 electronDist 跳过下载）——它本身就躺在项目根目录，
+  #      于是被整包塞进 asar，把 app.asar 撑到 142 MB；
+  #   ② `.dsh-vision-toolkit/**`（3.7 MB / 224 个文件：图标候选图、探针脚本、截图、提交信息草稿）
+  #      ——asar 250 个条目里有 235 个是它。
+  # 两者都不参与运行时（main 只读 `out/**` 与 `resources/`），必须显式排除。
+  - '!electron-v*.zip'
+  - '!.dsh-vision-toolkit/**'
 extraResources:
   - from: resources/icon.ico
     to: icon.ico
