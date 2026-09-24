@@ -1089,51 +1089,52 @@ html[data-glass-fx='off'] .dock-bg::after {
   background: transparent;
 }
 
-/* 分组图标预览：组内前 4 个图标的缩略拼图（macOS 堆叠观感）。
-   ⚠️ 几何是**为右下角的数量徽标让位**算出来的（v1.13.2，改这块必看）：
-   徽标锚在图标框右下角，是 16×16（`.dock-badge`，bottom/right: 0）。
-   原来拼图是 54×54、图 26px，4 成员时第 4 张正好落在右下角 —— 实测徽标**盖住那张图的 25%**
-   （重叠 169 / 676 px²），4 个成员的分组看起来就像少了一块。
-   现在：2×2 网格 = 23 + 2 + 23 = **48**，作为**内容盒**存进 52×52（border-box + 上下左右各 2px
-   padding）→ 整块网格相对图标框**上移 2 / 左移 2**，于是右下角空出正好 16×16 给徽标：
-     图 4 右下角 = 图标框 (48, 50)  徽标左上角 = (44, 44)  →  不再相交 ✔
-   成员 3 个时第二行单个自动居中（justify-content: center），不与徽标冲突。
-   成员 1 个时用 .single 放大单图（38px，见下）。 */
+/* 分组图标预览：组内前 4 个成员的缩略图，做成**层叠卡片**（v1.13.2 重做）。
+   设计意图与几何约束（改这块必看）：
+   ① 徽标 `.dock-badge` 是 16×16 锚在图标框右下角（占 `(44,44)..(60,60)`）——
+      所以**第 4 张卡不能占满右下角**。旧版是 54×54 铺满图标框的 2×2 网格，
+      4 成员时第 4 张正好落在那个角上，实测被盖住 **25%**（169/676 px²），
+      看起来就像组里少了一块（用户反馈的就是这个）。
+   ② 卡片走**向右下阶梯**：每张依次 +20/+22 px，既保留「一叠东西」的厚叠观感，
+      又让 4 张都能辨认（试过纯旋转堆叠，44px 下糊成一坨、认不出成员）。
+   ③ 第 4 张落在 (20,20)..(42,42)，右下角距徽标左/上沿 (44,44) 留 2px —— 实测重叠 0 px²。
+   ④ 成员不足 4 个时只渲染有的那几张，位置固定（不重排），所以 2 个成员时是
+      「左上 + 右上」，3 个成员时是「上排两个 + 左下」，看起来仍然是同一叠。
+   ⚠️ 卡片用**绝对定位**，不能用 flex 排（`.dock-icon-wrap` 是 flex + center，
+      会把它们居中；而且阶梯 offsets 本身也不适合流式布局）。 */
 .dock-group-preview {
-  display: flex;
-  flex-wrap: wrap;
-  /* anchor 到左上（不用 center，见下） */
-  align-content: flex-start;
-  justify-content: flex-start;
-  gap: 2px;
-  box-sizing: border-box;
-  width: 40px;  /* 2×2：19 + 2 + 19 */
-  height: 40px;
-  /* ⚠️⚠️ 定位方式试了四轮才对，别再改错（v1.13.2）：
-     ① `margin` / 负 margin **无效** —— `.dock-icon-wrap` 是 `display:flex` +
-        `align-items/justify-content: center`，flex 的居中断言会盖掉 margin；
-     ② 只写 `position:absolute; top:0; left:0` **也无效** —— 实测 offsetLeft/offsetTop
-        仍是 9/9（被 flex 居中），因为绝对定位只把盒子移出文档流，**并不豁免父级的对齐**；
-     ③ 正解：`position:absolute` + **四个方向的 inset + `margin:auto`**，把盒子钉在
-        padding box 左上角。写成 `inset:0 auto auto 0` 亦可。
-     最终几何：网格落在图标框 (4,4)..(44,44)，而徽标占 (44,44)..(60,60) → 恰好相接不重叠。 */
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
   left: 0;
+  /* ⚠️ 只写 position:absolute + top/left **不够**：绝对定位只把盒子移出文档流，
+     并不豁免父级 flex 的对齐 —— 实测 offsetLeft/Top 仍被居中成 9/9。
+     必须配四向 inset + `margin:auto` 才能钉死到指定角落（这里 = 左上，偏移 4px）。 */
   margin: 4px auto auto 4px;
+  width: 42px;
+  height: 42px;
   align-self: flex-start;
   justify-self: flex-start;
 }
 
 .dock-group-preview img {
-  width: 19px;
-  height: 19px;
+  position: absolute;
+  width: 22px;
+  height: 22px;
   object-fit: contain;
   -webkit-user-drag: none;
-  border-radius: 4px;
+  border-radius: 5px;
+  /* 卡片之间靠投影分开，否则同色系图标会糊成一片 */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
+
+/* 阶梯：1 左上 → 2 右上(略微上提) → 3 左下 → 4 右下(最前，最后渲染故在最上层)。
+   第 4 张收在 (19,19)..(41,41)，右下角距徽标 (44,44) 留 3px —— 实测残留重叠 0 px² */
+.dock-group-preview img:nth-child(1) { left: 2px; top: 2px; }
+.dock-group-preview img:nth-child(2) { left: 22px; top: 0; }
+.dock-group-preview img:nth-child(3) { left: 0; top: 22px; }
+.dock-group-preview img:nth-child(4) { left: 18px; top: 18px; }
 
 /* 单成员：一张大图。40px 居中会与徽标相切（实测重叠 25~36px²），
    所以同样避让到徽标左上沿 (44,44) 之内：36px 放在 (2,2) → 占 2..38，留足余量 */
