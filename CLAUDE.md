@@ -183,23 +183,39 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     （旧定时器代际不符自动作废，永远只有一个待执行）。**别改成「只在状态变化时才 ++」**
   - ⚠️ 已知取舍：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时会有 ~0.4s 消失再回来 + 提示。
     要消除闪烁得在隐藏前做存在性预检，但对 `shell:` / URL / 裸命令名会误判，风险大于收益，故保留
-- **点图标时「已在运行就激活、否则才启动」（v1.13.5）**：`run-app` 在隐藏 Dock **之前**
-  先调 `tryActivateRunningInstance(targetPath)`，成功就直接返回（不启动新进程）。
+- **点图标时「已在运行就绝不重复启动」（v1.13.5 引入，v1.13.6 修正为四态）**：
+  `run-app` 在**隐藏 Dock 之前**先调 `probeTargetState(targetPath)`，按四态分派：
+  | 状态 | 含义 | 动作 |
+  |---|---|---|
+  | `running` | 有可见/最小化窗口 | 已置前 → 藏起 Dock，返回 `true` |
+  | `tray` | 进程在、窗口隐藏（收托盘） | **不启动、不强行显示** → 返回 `'in-tray'`，renderer 提示点托盘图标 |
+  | `absent` | 确认没在运行 | 继续走启动流程 |
+  | `failed` | 探询没成功（超时/编译失败/枚举未就绪） | **也不启动** → 返回 `'probe-failed'`，提示重试 |
   - **为什么需要它**：`execFile`（CreateProcess）与 `Start-Process`（ShellExecuteEx）对
     单实例/托盘型应用（微信、QQ 等）**都会新开一个进程**（实测两者各新增 1 个进程）——
-    这**不是**启动方式的问题，换 ShellExecuteEx 修不了，只能主动激活已有窗口
-  - **窗口在哪**：微信收托盘时主窗口是 `title=[微信] class=Qt51514QWindowIcon visible=False`，
-    窗口**还在**、只是隐藏。`ShowWindow(SW_SHOW)` 即可真正显示；但 `SetForegroundWindow`
-    会被 Windows 前台锁拒绝（实测 False），**必须配 `AttachThreadInput`** 挂到当前前台线程才成功
+    这**不是**启动方式的问题，换 ShellExecuteEx 修不了
+  - 🚫🚫 **`failed` 态绝不能掉到「启动新进程」** —— 这是整个特性的安全底线。
+    多开出来的实例是**登录窗口**，用户看到的就是「点了微信又弹一个要我登录」。
+    实测：应用刚启动时 `Activate` 可能返回 `0`（进程/窗口枚举尚未就绪），
+    所以 `probeTargetState` 会**重试 3 次**（每次间隔 260ms），3 次都不成 → `failed`（不启动）
+  - 🚫🚫 **不要对隐藏窗口调 `ShowWindow` 强行显示（v1.13.5 的错误做法，已废弃）**：
+    把一个本该隐藏的窗口强行显示出来，有概率让它**可见但失去响应**（看起来像卡死）。
+    实测复现过一次用户报的「微信界面卡住」。现在只对**已经可见/最小化**的窗口做
+    `SetForegroundWindow`（最小化的用 `SW_RESTORE`）；隐藏的返回 `-1` 交给上层提示用户点托盘
+  - `SetForegroundWindow` 会被 Windows 前台锁拒绝（实测 `False`），
+    **必须配 `AttachThreadInput`** 挂到当前前台线程才成功（这条实测有效）
   - 匹配用**可执行文件路径**（大小写不敏感）而非进程名；跳过无标题窗口与 IME 辅助窗口；
     **只对「无启动参数的本地 exe」生效**（带参数时用户要的多半是明确的新行为，别替他改语义）
-  - 回归验证：`node .dsh-vision-toolkit/probe/activate-real.cjs`
-    （从**构建产物**里抠出真实 C# 再跑，确认 `ACTIVATED` 且进程数不变）
+  - 返回值是**联合类型** `true | false | 'in-tray' | 'probe-failed'`（`src/preload` 的
+    `RunAppResult`，`env.d.ts` 同步）。**别简化回 boolean** —— 两种非成功态都必须能与
+    「失败」区分，否则用户看到的就是「点了没反应」
+  - 回归验证：`node .dsh-vision-toolkit/probe/activate-3state.cjs`（四态 + 进程数不变）、
+    `retry-logic.cjs`（超时不该被误判成 absent）、`activate-real.cjs`（从构建产物抠真实 C# 再跑）
   - 🚫🚫 **内嵌的 C# 必须纯 ASCII，一个中文注释都不能有（踩过一次，静默失效）**：
     `powershell.exe -Command <文本>` 按**系统 ANSI 代码页**（中文 Windows = GBK/936）解码命令行，
     而我们的脚本文本是 UTF-8。C# 里出现中文注释时，GBK 解码会解错多字节序列、
     **把注释结尾的 `*/` 吃掉** → 整段源码语法错误 → `Add-Type` 编译失败 →
-    `FindPid` 永远返回 0 → **功能静默失效**（只表现为"没生效"，不报错，极难定位）。
+    找不到窗口 → **功能静默失效**（只表现为"没生效"，不报错，极难定位）。
     ⚠️ 本项目**所有** C# 常量（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `WinZ` / `ACTIVATE_CS`）
     实测都是 **0 个非 ASCII 字符** —— 这不是巧合，是这条约定在撑着。中文说明写在 TS 那一侧
 - **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色与主题分段选择器统一——`--switch-on-bg`/`--switch-on-knob` 按主题定义：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）

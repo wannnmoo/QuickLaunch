@@ -1,6 +1,6 @@
 {
   "name": "quicklaunch",
-  "version": "1.13.5",
+  "version": "1.13.6",
   "description": "QuickLaunch - Windows shortcut & folder launcher panel",
   "main": "./out/main/index.js",
   "scripts": {

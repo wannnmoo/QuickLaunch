@@ -934,21 +934,40 @@ function splitArgs(input: string): string[] {
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
-  // ⚠️ 先判断「目标是不是已经在运行」——是的话激活它的窗口，**不要再开一个进程**。
-  // 必须在隐藏 Dock 之前做：这一路是同步的（PowerShell 约 0.3~0.6s），若先隐藏、
+  // ⚠️ 先判断「目标是不是已经在运行」——是的话激活它的窗口，**绝不再开一个进程**。
+  // 必须在隐藏 Dock 之前做：这一路是同步的（PowerShell 约 0.8s），若先隐藏、
   // 再发现只是激活了已有窗口，用户会看到 Dock 无谓地闪一下。
   //
   // 只对「无启动参数的本地 exe」这么做：带参数时用户要的多半是明确的新行为
   // （例如某些工具用参数开新窗口），不能替他改语义。
-  if (!args && tryActivateRunningInstance(targetPath)) {
-    // 已经是用户想要的那个窗口在前台了。仍然把 Dock 收起来——
-    // 与「启动成功」一致：用户是点图标切过去的，Dock 让出桌面。
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      dockTrayHidden = true
-      sinkSeq++
-      mainWindow.hide()
+  if (!args) {
+    const state = probeTargetState(targetPath)
+    if (state === 'running') {
+      // 已经是用户想要的那个窗口在前台了。仍然把 Dock 收起来——
+      // 与「启动成功」一致：用户是点图标切过去的，Dock 让出桌面。
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        dockTrayHidden = true
+        sinkSeq++
+        mainWindow.hide()
+      }
+      return true
     }
-    return true
+    if (state === 'tray') {
+      // 程序在运行、但窗口收在托盘里（微信/QQ 关到托盘就是这种状态）。
+      // ⚠️ 这里**故意不启动新进程**：那会多开一个实例，微信会弹登录窗口 ——
+      //    用户报的正是这个。也**故意不强行 ShowWindow**：实测把一个本该隐藏的
+      //    窗口强行显示出来有概率让它可见但失去响应（看起来像卡死，已踩过）。
+      // 正确做法是让应用自己走「从托盘恢复」的流程，那只能由用户点托盘图标触发。
+      console.log('[launcher] 目标已在运行但窗口在托盘，提示用户点托盘图标:', targetPath)
+      return 'in-tray' // renderer 据此提示「点右下角托盘图标」
+    }
+    if (state === 'failed') {
+      // 探询本身没成功（超时 / C# 编译失败 / 首次枚举未就绪）。
+      // **绝不能在这里启动** —— 那正是「又多开一个」的来源。宁可什么都不做。
+      console.log('[launcher] 无法判定目标是否在运行，为避免多开实例而放弃本次启动:', targetPath)
+      return 'probe-failed' // renderer 提示「请再试一次」
+    }
+    // 'absent' = 确认没在运行 → 继续走下面的启动流程
   }
 
   // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
@@ -1664,10 +1683,9 @@ ipcMain.on('dock-pointer', (_e, inside: boolean) => {
 // 也就是说这**不是**启动方式的问题（换 ShellExecuteEx 也一样），
 // 必须由我们主动把已有窗口提到前台。
 //
-// 实测可行路径（探针 ActivateProbe.cs 验证）：
-//   ShowWindow(SW_SHOW) 就能让微信那个 `visible=False` 的隐藏主窗口真的显示出来
-//   （持续可见、不被它自己再藏回去）；但 SetForegroundWindow 会被 Windows 前台锁拒绝，
-//   必须配 AttachThreadInput 把我们的线程挂到当前前台线程上才成功。
+// ⚠️ 实测过两次「第一次调用返回 NONE」：应用刚启动时进程/窗口枚举还没就绪，
+//    此时若直接掉到「启动新进程」就会**多开一个登录窗口**（用户报的正是这个）。
+//    对策：FindWindow 阶段做**短轮询重试**（见 findTargetWindow），不要一次失败就放弃。
 //
 // ⚠️⚠️ 下面这段 C# **必须是纯 ASCII，一个中文注释都不能有**（踩过一次，很隐蔽）：
 //   powershell.exe -Command <脚本文本> 是按**系统 ANSI 代码页**解码命令行的（中文 Windows
@@ -1689,6 +1707,7 @@ public static class QLActivate
     delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
@@ -1701,9 +1720,10 @@ public static class QLActivate
     const int SW_SHOW = 5;
     const int SW_RESTORE = 9;
 
-    // Collect pids whose executable path equals exePath (case-insensitive).
-    // Skip processes whose path cannot be read (access denied / bitness mismatch).
-    public static int FindPid(string exePath)
+    /// Find the app's main window. Returns 0 if none. Does NOT change any state.
+    /// Only titled windows are considered: Qt/Electron apps create many untitled
+    /// helper windows (message-only, IME) which must never be foregrounded.
+    public static IntPtr FindWindow(string exePath)
     {
         string want = exePath.ToLowerInvariant();
         var pids = new HashSet<int>();
@@ -1714,9 +1734,9 @@ public static class QLActivate
             } catch { continue; }
             pids.Add(p.Id);
         }
-        if (pids.Count == 0) return 0;
+        if (pids.Count == 0) return IntPtr.Zero;
 
-        int found = 0;
+        IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) =>
         {
             uint pid; GetWindowThreadProcessId(h, out pid);
@@ -1724,36 +1744,24 @@ public static class QLActivate
             var t = new StringBuilder(256); GetWindowText(h, t, 256);
             var c = new StringBuilder(256); GetClassName(h, c, 256);
             if (t.Length == 0) return true;
-            // Skip IME / input-method helper windows: they are never the main window
             if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            found = (int)pid;
+            found = h;
             return false;
         }, IntPtr.Zero);
         return found;
     }
 
-    // Show the app's window and bring it to the foreground. Returns false if no window.
-    public static bool Activate(string exePath)
+    /// Bring the app's window to the foreground.
+    /// Returns: 1 = activated, 0 = no window found, -1 = window found but hidden (tray).
+    /// A hidden window is NOT force-shown: doing so can leave the app's window visible
+    /// while its session is not ready, which looks like a freeze. The caller decides.
+    public static int Activate(string exePath)
     {
-        int pid = FindPid(exePath);
-        if (pid == 0) return false;
-        IntPtr target = IntPtr.Zero;
-        EnumWindows((h, l) =>
-        {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if ((int)p != pid) return true;
-            var t = new StringBuilder(256); GetWindowText(h, t, 256);
-            var c = new StringBuilder(256); GetClassName(h, c, 256);
-            if (t.Length == 0) return true;
-            if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            target = h;
-            return false;
-        }, IntPtr.Zero);
-        if (target == IntPtr.Zero) return false;
+        IntPtr target = FindWindow(exePath);
+        if (target == IntPtr.Zero) return 0;
+        if (!IsWindowVisible(target) && !IsIconic(target)) return -1;
 
-        // Minimized -> restore; hidden (tray) -> SW_SHOW actually reveals it
-        ShowWindow(target, IsIconic(target) ? SW_RESTORE : SW_SHOW);
-        // Foreground lock: without AttachThreadInput, SetForegroundWindow is refused
+        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
         IntPtr fg = GetForegroundWindow();
         uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, IntPtr.Zero);
         uint me = GetCurrentThreadId();
@@ -1761,16 +1769,44 @@ public static class QLActivate
         bool ok;
         try { ok = SetForegroundWindow(target); }
         finally { if (attached) AttachThreadInput(me, fgThread, false); }
-        return ok;
+        return ok ? 1 : 0;
     }
 }
 `
 
-/** 若目标程序的窗口已存在，就把它激活并返回 true（调用方据此跳过启动）。
- *  只对「看起来是本地可执行文件」的路径尝试：shell: / URL 没有进程可匹配。 */
-function tryActivateRunningInstance(targetPath: string): boolean {
-  if (!/\.(exe|com)$/i.test(targetPath)) return false
-  if (!existsSync(targetPath)) return false
+/** 判断目标程序当前处于哪种状态，决定「激活 / 提示 / 启动」。
+ *
+ *  ⚠️ 核心约束（这一条是整个特性的安全底线）：**探询失败时绝不允许启动新进程**。
+ *  宁可什么都不做、让用户再点一次，也不能多开一个实例 —— 多开出来的是登录窗口，
+ *  用户看到的正是「点了微信又弹一个要我登录」。
+ *
+ *  三态：
+ *    running  有可见（或最小化）窗口 → 已置前，调用方直接返回
+ *    tray     进程在、窗口隐藏（收托盘）→ **不启动、不强行显示**，提示用户点托盘图标
+ *    absent   确认没在运行 → 调用方才去启动
+ *    failed   探询本身没成功（超时/编译失败/枚举未就绪）→ **不启动**，交给用户重试
+ *
+ *  为什么要重试：实测应用刚启动时**第一次调用会返回 0**（进程/窗口枚举尚未就绪），
+ *  一次失败就掉到「启动新进程」就会多开 —— 用户的报障正是这个。 */
+function probeTargetState(targetPath: string): 'running' | 'tray' | 'absent' | 'failed' {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = activateRunningInstance(targetPath, 3000)
+    if (r !== 'retry') return r
+    if (attempt < 2) {
+      // 同步小睡：这里在 IPC handler 里、用户正等结果，几百毫秒无感，
+      // 换来的是「不误判成未运行」—— 比多开一个进程划算得多
+      const until = Date.now() + 260
+      while (Date.now() < until) { /* busy-wait，避免为此引入 async 复杂度 */ }
+    }
+  }
+  return 'failed'
+}
+
+/** 单次探测/激活。'retry' 表示这次没能得到结论、值得重试。 */
+function activateRunningInstance(targetPath: string, timeoutMs: number): 'running' | 'tray' | 'absent' | 'retry' {
+  // 非本地可执行文件（shell: / URL / 无扩展名）没有进程可匹配，直接走启动流程
+  if (!/\.(exe|com)$/i.test(targetPath)) return 'absent'
+  if (!existsSync(targetPath)) return 'absent'
   try {
     const escaped = targetPath.replace(/'/g, "''")
     const out = execFileSync(
@@ -1780,16 +1816,18 @@ function tryActivateRunningInstance(targetPath: string): boolean {
 Add-Type -TypeDefinition @'
 ${ACTIVATE_CS}
 '@
-if ([QLActivate]::Activate('${escaped}')) { 'ACTIVATED' } else { 'NONE' }`],
-      { encoding: 'utf8', timeout: 4000, windowsHide: true }
+[QLActivate]::Activate('${escaped}')`],
+      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }
     )
-    const activated = String(out).includes('ACTIVATED')
-    if (activated) console.log('[launcher] 已激活运行中的实例:', targetPath)
-    return activated
+    const n = Number(String(out).trim())
+    if (n === 1) { console.log('[launcher] 已激活运行中的实例:', targetPath); return 'running' }
+    if (n === -1) { console.log('[launcher] 目标在运行但窗口收在托盘里:', targetPath); return 'tray' }
+    // 0 = 没找到窗口：可能「进程刚起来还没建窗」也可能「真的没在运行」，
+    // 一次分不清 → 交给上层重试（**不要**在这里就断言 absent）
+    return 'retry'
   } catch (err) {
-    // 超时/编译失败都不该影响正常启动：静默回退到「启动新进程」
-    console.log('[launcher] activate probe failed, will launch instead:', err instanceof Error ? err.message : String(err))
-    return false
+    console.log('[launcher] activate probe failed:', err instanceof Error ? err.message : String(err))
+    return 'retry'
   }
 }
 

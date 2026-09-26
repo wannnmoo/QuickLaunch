@@ -46,7 +46,12 @@ interface Window {
       description: string
       iconDataUrl: string
     }[]>
-    runApp: (targetPath: string, args: string, workingDir: string) => Promise<boolean>
+    // true / false / 'in-tray' / 'probe-failed' —— 语义见 preload 的 RunAppResult
+    runApp: (
+      targetPath: string,
+      args: string,
+      workingDir: string
+    ) => Promise<true | false | 'in-tray' | 'probe-failed'>
     getPathForFile: (file: File) => string
     describePaths: (paths: string[]) => Promise<{
       accepted: { targetPath: string; arguments: string; workingDirectory: string; description: string; iconDataUrl: string }[]

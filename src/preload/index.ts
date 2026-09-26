@@ -1,6 +1,18 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+/** `run-app` 的返回值。
+ *  - `true`          已启动，或「已在运行且窗口已激活/置前」
+ *  - `false`         启动失败（目标不存在 / 无法运行 / UAC 被取消）
+ *  - `'in-tray'`     目标**已在运行**，但窗口收在系统托盘里。主进程**不会**新开进程
+ *                    （那会多开一个实例），也不强行显示它的窗口（有概率让它失去响应），
+ *                    所以由 renderer 提示用户去点托盘图标。
+ *  - `'probe-failed'` 没能判定目标是否在运行。主进程**故意不启动**（否则可能多开实例），
+ *                    由 renderer 提示用户重试。
+ *  ⚠️ 不要简化回 boolean：这两种状态必须能和「成功/失败」区分开，
+ *     否则用户看到的就是「点了没反应」。 */
+export type RunAppResult = true | false | 'in-tray' | 'probe-failed'
+
 export interface LnkInfo {
   targetPath: string
   arguments: string
@@ -91,8 +103,9 @@ const api = {
   /** Parse one or more .lnk shortcut files. Pass a path, or omit to open a multi-select file dialog. */
   parseLnk: (filePath?: string): Promise<LnkInfo[]> =>
     ipcRenderer.invoke('parse-lnk', filePath),
-  /** Launch an executable with optional args and working directory. */
-  runApp: (targetPath: string, args: string, workingDir: string): Promise<boolean> =>
+  /** Launch an executable with optional args and working directory.
+   *  返回 true / false / 'in-tray'，语义见 RunAppResult。 */
+  runApp: (targetPath: string, args: string, workingDir: string): Promise<RunAppResult> =>
     ipcRenderer.invoke('run-app', targetPath, args, workingDir),
   /** 为条目更换图标：选择 exe/dll/ico/png 并提取图标，返回 { path, iconDataUrl } 或 null（取消）。 */
   pickIcon: (): Promise<{ path: string; iconDataUrl: string } | null> =>

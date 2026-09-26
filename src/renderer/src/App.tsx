@@ -1302,9 +1302,17 @@ function App(): React.ReactElement {
     if (now - lastSame < 600) return
     lastRunAtRef.current.set(app.targetPath, now)
     // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
-    // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」
+    // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」。
+    // 'in-tray'：目标已在运行但窗口收在托盘里（微信/QQ 关到托盘就是这种）。
+    //   主进程**故意不新开进程**、也不强行显示它的窗口（强行显示有概率让它失去响应），
+    //   所以这里必须明确告诉用户「去点托盘图标」——否则就是「点了没反应」。
+    // 'probe-failed'：没能判定是否在运行，主进程为避免多开实例故意不启动，提示重试。
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
-      .then((ok) => { if (ok === false) showDropHint('启动失败：目标不存在或无法运行') })
+      .then((ok) => {
+        if (ok === false) showDropHint('启动失败：目标不存在或无法运行')
+        else if (ok === 'in-tray') showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
+        else if (ok === 'probe-failed') showDropHint('没能确认是否已在运行，为避免多开已取消：请再点一次')
+      })
       .catch(() => showDropHint('启动失败：目标不存在或无法运行'))
   }, [dragId, openGroupId, closeGroupPanel, showDropHint])
 
