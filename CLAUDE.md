@@ -66,7 +66,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **悬停放大走几何缓存，绝不逐图标读布局（v1.12.0，改这块必须先读）**：原实现每个 `mousemove` 都对每个图标 `getBoundingClientRect()` 再写 inline `transform`，读-写交替触发强制同步布局（layout thrashing），是「鼠标划过 Dock 卡顿」的主因。现在：
   - `measureCenters(refs, container)` 把各图标中心点量成**升序数组**（`dockCenters` / `panelCenters`），只在布局变化时重算一次
   - `magnifyAt()` 在升序数组上**二分**定位光标，再只遍历左右各 140px 内的那一段连续区间；`applyZoom()` 用 `WeakMap` 记住上次写入的缩放值，**值没变就完全不碰 DOM**。实测 60 个图标时单帧最多触及 6 个（原来固定 60 个）；新旧算法在 145,200 个采样点上逐点比对完全一致
-  - **失效有两条通道，缺一不可**：① 显式 `useLayoutEffect`（依赖 `apps.length` / `theme` / `edge` / `openGroupId`）；② `ResizeObserver` 挂在 **ref 回调**里（`useEffect` 在 ref 回调之后才跑，挂载帧会漏掉）。**不能只靠 `ResizeObserver`**——图标增删只改变内容排布、容器盒子尺寸不一定变，观察者不会回调，缓存会留在旧中心点；另外 `ResizeObserver` 挂上去**没有初始通知**，必须在挂载时显式补测一次，否则启动后第一次悬停没有放大效果
+  - **失效有两条通道，缺一不可**：① 显式 `useLayoutEffect`，依赖是**条目签名 `apps.map(a => a.id).join(',')`** / `theme` / `edge` / `openGroupId`（⚠️ v1.14.0 修正：原来写的是 `apps.length`，而**拖拽重排是纯置换** —— 长度不变、图标宽都是 60px、中心点数组一模一样，只是 DOM 节点换位，`apps.length` 判不出变化；而② 的 `ResizeObserver` 在玻璃条封顶时也不会回调（插入线只改 `scrollWidth` 不改 `clientWidth`）→ 缓存里 `el↔cx` 失配，表现为「鼠标划过后面的图标、放大的却是前面的图标」）；② `ResizeObserver` 挂在 **ref 回调**里（`useEffect` 在 ref 回调之后才跑，挂载帧会漏掉）。**不能只靠 `ResizeObserver`**——图标增删只改变内容排布、容器盒子尺寸不一定变，观察者不会回调，缓存会留在旧中心点；另外 `ResizeObserver` 挂上去**没有初始通知**，必须在挂载时显式补测一次，否则启动后第一次悬停没有放大效果
   - `calcDropIndex` 复用同一份缓存（落点判定本来只有「最近两个图标之间」的粒度，放大导致的几像素偏差不影响结果）
   - **⚠️ 坐标系：缓存与命中必须都在「内容坐标」里（v1.12.1 翻修过一次，改这里必看）**。容器是**横向滚动容器**，而 `clientX - container.getBoundingClientRect().left` 算出来的是**内容坐标**（不随滚动变化）。所以两边都必须换算对齐：
     - `measureCenters()`：`rect.left - box.left + container.scrollLeft + rect.width / 2`
@@ -183,34 +183,76 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     （旧定时器代际不符自动作废，永远只有一个待执行）。**别改成「只在状态变化时才 ++」**
   - ⚠️ 已知取舍：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时会有 ~0.4s 消失再回来 + 提示。
     要消除闪烁得在隐藏前做存在性预检，但对 `shell:` / URL / 裸命令名会误判，风险大于收益，故保留
-- **点图标时「已在运行就绝不重复启动」（v1.13.5 引入，v1.13.6 修正为四态）**：
-  `run-app` 在**隐藏 Dock 之前**先调 `probeTargetState(targetPath)`，按四态分派：
+- **点图标时「已在运行就绝不重复启动」（v1.13.5 引入，v1.13.6 改成四态，v1.13.8 修好「absent 不可达」，随后按用户要求整段关闭）**：
+  🚫🚫 **默认是关的（改这里先读这一段）**：`src/main/index.ts` 里那行
+  `const PROBE_BEFORE_LAUNCH = false` 就是总开关。**用户明确要求「点图标一律直接启动」**
+  （= v1.13.4 的行为），所以整套探询被这个常量短路，打包器会把它**整段静态消除**
+  （实测 `out/main/index.js` 里 `ACTIVATE_CS` / `probeTargetState` / `clickTrayIconFor` 命中数都是 **0**）。
+  | 开关 | 点图标的行为 | 代价 |
+  |---|---|---|
+  | `false`（**现行默认**） | 直接 spawn（约 4~10ms） | 微信/QQ 收托盘时再点会**多开一个实例（弹登录窗）** |
+  | `true` | 先探询约 0.9s：running→激活、tray→点托盘图标唤出、其余→启动 | 「进程在但没窗口」的目标要靠 fail-open 兜；点击有 ~0.9s 等待 |
+  ⚠️ 开关只对**源码**有效（`false` 时相关代码已不在产物里，改 `out/main/index.js` 没用）——
+  想切回去：改那一行 + `npm run build`。
+  下面的四态说明在开关为 `true` 时才生效：
+
+  按四态分派（`run-app` 在**隐藏 Dock 之前**先调 `probeTargetState(targetPath)`）：
   | 状态 | 含义 | 动作 |
   |---|---|---|
   | `running` | 有可见/最小化窗口 | 已置前 → 藏起 Dock，返回 `true` |
   | `tray` | 进程在、窗口隐藏（收托盘） | **不启动、不强行显示** → 返回 `'in-tray'`，renderer 提示点托盘图标 |
-  | `absent` | 确认没在运行 | 继续走启动流程 |
-  | `failed` | 探询没成功（超时/编译失败/枚举未就绪） | **也不启动** → 返回 `'probe-failed'`，提示重试 |
+  | `absent` | **确认没这个进程**（唯一允许启动的一态） | 继续走启动流程 |
+  | `failed` | 进程在、但 3 次都没探到带标题的窗口 | **照旧启动**（fail-open，v1.13.8）→ 不再有 `'probe-failed'` |
+  - ⚠️⚠️ **四个码必须来自 C# 的 `QLActivate.Probe`，不许再把两种结果挤进一个返回值（v1.13.8 修）**：
+    `1` 在运行（已置前 / 已抬升）、`-1` 托盘、`0` 进程在但没窗口（可重试）、`2` 没这个进程（可启动）。
+    v1.13.6 的 `Activate` 把「没进程」和「进程在但没窗口」**都返回 `0`** → `absent` 对
+    「exe 存在但没在运行」**不可达** → 重试 3 次后判 `failed` → **没在运行的程序永远点不开**，
+    只弹「没能确认是否已在运行」（用户报障原话）。**「没有窗口」与「没有进程」是相反的结论**，
+    挤在同一个返回值里就注定有一条路走错
+  - ⚠️ `SetForegroundWindow` 被前台锁拒绝**不等于「没有窗口」**：v1.13.8 起改为
+    `SetWindowPos(HWND_TOP) + BringWindowToTop` 把窗口抬起来并**仍返回 1**。
+    旧写法 `return ok ? 1 : 0` 会让一个**窗口就在眼前**的程序被判成「无法判定」→ 点了什么都不做
+  - ⚠️ 进程匹配**按全路径、同名兜底**：读 `MainModule.FileName` 对提权 / 受保护进程会抛异常
+    （实测 273 个进程里 **148 个**读不到），只按路径匹配会把**正在运行**的程序误判成「没在运行」→ 多开。
+    同名进程一律算「在运行」（安全侧），只有全路径命中时才优先用它们的窗口
+  - 回归验证：`node .dsh-vision-toolkit/probe/runapp-four-states.cjs`
+    （真实应用 + CDP 调 `window.api.runApp`，四个用例都核对**进程数**：没在运行必须真的启动、
+    已在运行必须不多开）。⚠️ 老的 `activate-3state.cjs` 只测了「路径不存在」的 exe ——
+    那条路在 TS 层就被 `existsSync` 短路了、**从没进过探询**，所以这个 bug 从它眼皮底下溜了过去
   - **为什么需要它**：`execFile`（CreateProcess）与 `Start-Process`（ShellExecuteEx）对
     单实例/托盘型应用（微信、QQ 等）**都会新开一个进程**（实测两者各新增 1 个进程）——
     这**不是**启动方式的问题，换 ShellExecuteEx 修不了
-  - 🚫🚫 **`failed` 态绝不能掉到「启动新进程」** —— 这是整个特性的安全底线。
-    多开出来的实例是**登录窗口**，用户看到的就是「点了微信又弹一个要我登录」。
-    实测：应用刚启动时 `Activate` 可能返回 `0`（进程/窗口枚举尚未就绪），
-    所以 `probeTargetState` 会**重试 3 次**（每次间隔 260ms），3 次都不成 → `failed`（不启动）
+  - ⚠️⚠️ **`failed` 必须放行（fail-open），不许拦（v1.13.8 反向修正，改这里先读）**：
+    被拦住的代价是**用户 100% 点不开**，而「探不出结论」几乎总发生在**目标连窗口都还没有**的时候 ——
+    此时启动恰恰是唯一能拿到窗口的办法。实测用户报障的 Clash Verge（**Tauri 托盘型应用**，空闲时没有主窗口）：
+    ```
+    pid=99776  cls=tao_system_tray_app      title=[]  visible=False   ← 只有托盘窗口
+    pid=99776  cls=Tao Thread Event Target  title=[]  visible=True    ← 可见但无标题
+    pid=99776  cls=MSCTFIME UI / IME                                  ← 输入法辅助窗口（本就跳过）
+    ```
+    `FindWindow` 只认**有标题**的顶层窗口 → 永远 0 → `failed` → 旧代码拦住 → **永远点不开**。
+    ⚠️ 报障时**先对比新旧两版在同一输入上的行为**再决定改什么：这次实测该状态下
+    今天的 `Probe = 0`、`FindWindow = 0`，而昨天的 `Activate` 用的是**同一套「只认有标题窗口」的判定**
+    （路径匹配那层也正常，`pids=1`）→ 同样 `0` → 同样 failed。**两版行为一致** ⇒ 不是当天那次改动引入的，
+    而是这条「拦」的约束本身不对
+  - ✅ 真正要守的底线挪到了这两态上：`running`（有窗口 → 置前，**绝不新开**）与
+    `tray`（窗口隐藏 → 点托盘图标唤出，**绝不强行 `ShowWindow`**）。
+    微信/QQ 收托盘时窗口**是存在的**（只是隐藏）→ 命中 `-1`，所以「多点一下开了个登录窗」不会回来
+  - 回归验证：`node .dsh-vision-toolkit/probe/runapp-open-always.cjs`
+    （重点用例就是 Clash Verge 这种「进程在、窗口为空」的目标：必须返回 `true` 且**窗口真的出现**、进程数不爆炸）
   - 🚫🚫 **不要对隐藏窗口调 `ShowWindow` 强行显示（v1.13.5 的错误做法，已废弃）**：
     把一个本该隐藏的窗口强行显示出来，有概率让它**可见但失去响应**（看起来像卡死）。
     实测复现过一次用户报的「微信界面卡住」。现在只对**已经可见/最小化**的窗口做
     `SetForegroundWindow`（最小化的用 `SW_RESTORE`）；隐藏的返回 `-1` 交给上层提示用户点托盘
   - `SetForegroundWindow` 会被 Windows 前台锁拒绝（实测 `False`），
     **必须配 `AttachThreadInput`** 挂到当前前台线程才成功（这条实测有效）
-  - 匹配用**可执行文件路径**（大小写不敏感）而非进程名；跳过无标题窗口与 IME 辅助窗口；
+  - 匹配**优先用可执行文件路径**（大小写不敏感），读不到路径时按**进程名**兜底（v1.13.8，见上）；跳过无标题窗口与 IME 辅助窗口；
     **只对「无启动参数的本地 exe」生效**（带参数时用户要的多半是明确的新行为，别替他改语义）
-  - 返回值是**联合类型** `true | false | 'in-tray' | 'probe-failed'`（`src/preload` 的
-    `RunAppResult`，`env.d.ts` 同步）。**别简化回 boolean** —— 两种非成功态都必须能与
-    「失败」区分，否则用户看到的就是「点了没反应」
-  - 回归验证：`node .dsh-vision-toolkit/probe/activate-3state.cjs`（四态 + 进程数不变）、
-    `retry-logic.cjs`（超时不该被误判成 absent）、`activate-real.cjs`（从构建产物抠真实 C# 再跑）
+  - 返回值是**联合类型** `true | false | 'in-tray'`（`src/preload` 的 `RunAppResult`，`env.d.ts` 同步）。
+    **别简化回 boolean** —— `'in-tray'` 必须能与「失败」区分，否则用户看到的就是「点了没反应」。
+    （`'probe-failed'` 已在 v1.13.8 删除，见上）
+  - 老的 `activate-3state.cjs` / `retry-logic.cjs` / `activate-real.cjs` 仍可跑，
+    但它们只覆盖「路径不存在 → 0」与「超时 → retry」，**别再把它们当成四态的完整验证**
   - 🚫🚫 **内嵌的 C# 必须纯 ASCII，一个中文注释都不能有（踩过一次，静默失效）**：
     `powershell.exe -Command <文本>` 按**系统 ANSI 代码页**（中文 Windows = GBK/936）解码命令行，
     而我们的脚本文本是 UTF-8。C# 里出现中文注释时，GBK 解码会解错多字节序列、
@@ -218,7 +260,51 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     找不到窗口 → **功能静默失效**（只表现为"没生效"，不报错，极难定位）。
     ⚠️ 本项目**所有** C# 常量（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `WinZ` / `ACTIVATE_CS`）
     实测都是 **0 个非 ASCII 字符** —— 这不是巧合，是这条约定在撑着。中文说明写在 TS 那一侧
+- **桌面图标开关的文案不许翻转（v1.13.7 修，改这里必看）**：菜单项「隐藏/显示桌面图标」的
+  文案由 `desktopIconsHidden` 决定，而它**必须从首帧就是真值**。两道防线：
+  1. **初始值走同步读取**：主进程维护缓存 `desktopIconsHiddenCache` +
+     `ipcMain.on('get-desktop-icons-hidden-sync')`（`sendSync`），preload 暴露
+     `desktopIconsHiddenInitial()`，renderer 拿它当 `useState` 初始值。
+     应用启动时预热缓存、切换成功后写回缓存。
+     🚫 **`sendSync` 的处理器必须同步设置 `event.returnValue`** —— 读操作要起 PowerShell、
+     是异步的，在 `.then` 里赋值已经晚了（这条弯路走了一半才发现），所以才需要缓存。
+     🚫 也**不要**在 render 里读 `dockBgRef.getBoundingClientRect()` 之类算布局：首帧 ref 还没挂上。
+  2. **读失败返回 `null`（状态未知），不要返回 `false`**：`false` 的语义是「图标可见」，
+     把「读失败」当「可见」会让文案先渲染错值、再翻成对值 —— 这正是用户报的现象。
+     renderer 收到 `null` 时保持现状、不翻转；`toggle-desktop-icons` 失败时也返回缓存值而非编一个 `false`。
+   - 回归验证（v1.13.8 起用这个）：`node .dsh-vision-toolkit/probe/flip-e2e.cjs` ——
+     真实 main + 真实 preload + 真实 renderer，从外部读注册表当真值，核对菜单文案是否跟着翻；退出码 0/1
+     ⚠️ 老的 `flip-test.cjs` 用的是**模拟 IPC**，只能证明「首帧文案正确」，
+     **测不出 PowerShell 输出解析类 bug** —— v1.13.8 那个 bug 就从它眼皮底下溜过去了
+- **🚫🚫 解析 PowerShell 输出：不要对整段 stdout 做等值判断（v1.13.8 修，极隐蔽）**：
+  「菜单文案**永远卡在『隐藏桌面图标』**、但图标隐藏/显示都正常」的真凶就在这里。
+  `toggle-desktop-icons` 里 `[DesktopIcons]::SendMessage(...)` **漏了 `[void]`**，
+  而 PowerShell 会把**未赋值方法调用的返回值**（IntPtr 0）也写进 stdout ——
+  实测 stdout = `"0\n1"`（第一行是 SendMessage 的返回值，第二行才是注册表真值），
+  旧的整段等值判断 `raw !== '0' && raw !== '1'` 判成「读失败」→ toggle 返回 null →
+  主进程缓存永不更新 → 下次开菜单又读回旧值 → 文案退回「隐藏桌面图标」。
+  **功能全程正常，只有文案不动**（用户报的正是这个）。两道防线，改这块时都别拆：
+  1. **调用有返回值的 PowerShell 方法一律加 `[void]` 或 `| Out-Null`**
+     （现成的正确写法：`[WinZ]::SetWindowPos(...) | Out-Null`；
+     托盘点击路径则用 `String(stdout).trim().split(/\r?\n/).pop()` 只取最后一行）
+  2. **输出带标记、解析只认标记**：脚本 `Write-Output 'HIDEICONS=0|1'`（两路都拿不到时输出 `HIDEICONS=?`），
+     主进程 `parseDesktopIconsHidden()` 扫标记、忽略其它行。
+     顺带别犯「拿不到就编一个 0」—— `0` 的语义是「图标可见」，拿不到要明确输出「未知」
+- **「+」菜单是「可滚动内容 + 固定页脚」两段式（v1.13.7）**：`.dropdown-menu` 是 flex 纵向布局，
+  `.dropdown-scroll` 负责滚动（**`min-height: 0` 不能省**，否则 flex 项不收缩、菜单被撑爆），
+  版本号 `.dropdown-version` 在滚动区之外、始终可见。
+  - 原因：整窗只有 300px，菜单可用高度约 200px，内容（4 项 + 停靠位置 + 主题两行 + 分隔线）
+    已接近这个量。版本行若放在滚动容器里会被挤到可视区外 —— 实测 `rect.top=292` 而菜单底 `209`，
+    **永远看不到**。以后再加菜单项也只滚内容区
+  - 高度上限 `overlayAvail` 用 `window.innerHeight - anchorOffset` 算，**不要用常量 `BASE_WINDOW_H`**：
+    锚点偏移是从真实 `innerHeight` 推出的，用常量会差几像素，而内容本就贴着上限，
+    差这几像素就把主题选择器推进滚动区
 - **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色与主题分段选择器统一——`--switch-on-bg`/`--switch-on-knob` 按主题定义：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）
+- **「点图标后 Dock 隐藏到托盘」是既定行为，不是 bug（v1.13.7 与用户确认）**：
+  用户报「点开微信后软件就退出到后台」，实测**进程没有退出**——`runApp` 返回 `true`、
+  主窗口 `visible=false destroyed=false`、5 秒后仍存活、微信窗口 0→1 成功唤出。
+  这就是「启动目标后隐藏到托盘、把桌面让出来」的设计（托盘图标 / Alt+Space 都能唤回）。
+  ⚠️ 以后再遇到「应用退出」类报障，**先量进程存活**（`Get-Process` + `isDestroyed()`）再动代码
 - **单实例锁**：模块顶层 `app.requestSingleInstanceLock()`——未获得锁直接 `app.quit()`，`whenReady` 开头 `return` 跳过初始化；`second-instance` 事件唤起已有窗口（防止开机自启 + 手动启动出现两个 Dock）
 
 ### IPC 通道
@@ -238,7 +324,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `load-shortcuts` | Renderer → Main | 从 `{userData}/shortcuts.json` 加载持久化数据 |
 | `save-shortcuts` | Renderer → Main | 保存持久化数据到 `{userData}/shortcuts.json`。**主进程不做任何字段换算**——renderer 状态里存的就是最终要落盘的真实 data URL |
 | `flush-pending-save` | Main → Renderer | 退出前推送：renderer 的保存有 400ms 防抖，收到后立刻把未落盘的改动 invoke 一次 `save-shortcuts`。主进程在 `before-quit` 推它并留 200ms（`will-quit` 时窗口已销毁、IPC 不通，不能用） |
-| `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，找不到 ListView 时回退读注册表 HideIcons） |
+| `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（**主进程缓存**：启动时用注册表 `HideIcons` 预热、拿不到才回退 ListView 可见性；读不到返回 `null` = 未知，不编 `false`） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
 | `get-auto-start` | Renderer → Main | 读取开机自启动是否开启（`getLoginItemSettings`，传与 set 相同的 path/args 匹配注册表项） |
 | `set-auto-start` | Renderer → Main | 开启/关闭开机自启动（`setLoginItemSettings` 写 `HKCU\...\Run`），返回切换后实际状态 |
@@ -435,6 +521,6 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
   - **不只是中文丢失**：`(Get-Content -Raw) -replace ... | Set-Content -NoNewline` 这类「读-改-写」还会**悄悄合并行尾**，把脚本压成一行并抛出 `SyntaxError`（`return outside function`）。v1.13.0 做图标时用这招改 `.dsh-vision-toolkit/make-icons.mjs` 就中了一次，中文注释也全成了 mojibake。**结论：任何源文件（含自己写的生成脚本）都只用编辑器工具改，PowerShell 只用来读和跑命令**——它是本项目第二起同类事故了
-- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前已同步为 `1.13.1`，每次发布需手动更新）
-- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（当前记录到 v1.13.1），功能变更后需同步更新，并与提交信息版本对齐
+- **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前为 `1.14.0`，每次发布需手动更新；`package-lock.json` 顶部与 `packages[""]` 两处也要一起改）
+- 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（**当前记录到 v1.14.0**），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

@@ -121,6 +121,8 @@ button, input, select, textarea {
   --menu-hover-text: #fff;
   --context-hover-bg: rgba(255, 255, 255, 0.08);
   --divider-bg: rgba(255, 255, 255, 0.1);
+  /* 「+」菜单底部的版本号等元信息文字：比 --menu-text 更弱，不跟操作项抢注意力 */
+  --menu-meta: rgba(255, 255, 255, 0.42);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
   --switch-off-bg: rgba(255, 255, 255, 0.22);
   /* 开机自启动开关配色（与分段选择器强调色统一） */
@@ -193,6 +195,8 @@ button, input, select, textarea {
   --menu-hover-text: #1659b0;
   --context-hover-bg: rgba(0, 0, 0, 0.06);
   --divider-bg: rgba(0, 0, 0, 0.1);
+  /* 白天：白玻璃上用中性灰，太浅会读不清 */
+  --menu-meta: rgba(31, 36, 48, 0.5);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
   --switch-off-bg: rgba(0, 0, 0, 0.2);
   /* 开机自启动开关配色（与分段选择器强调色统一） */
@@ -659,8 +663,24 @@ html[data-glass-fx='off'] .dock-bg::after {
   z-index: 100;
   box-shadow: var(--menu-shadow);
   overflow: hidden;
-  overflow-y: auto; /* 菜单超高（如 300px 窗口装不下 5+ 项）时内部滚动，不再被窗口裁掉 */
   animation: dropdown-in 0.16s ease-out;
+  /* ⚠️ 菜单是「菜单容器 + 可滚动内容」两层（v1.13.7 改）：
+     整窗只有 300px，菜单可用高度（overlayAvail）约 200px，而内容约 270px
+     （4 个菜单项 + 停靠位置 + 主题两行 + 分隔线 + 版本行），所以必须有内部滚动。
+     滚动交给 .dropdown-scroll 一层，菜单容器本身 overflow: hidden 保证圆角不被滚动条切掉。
+     ⚠️ 版本号是滚动内容里的最后一项（按用户要求「放到菜单项最后面」），
+        所以它**要滚到底才看得到** —— 这是刻意的，不要再改回固定页脚。 */
+  display: flex;
+  flex-direction: column;
+}
+
+/* 可滚动区：min-height 必须显式给 0，否则 flex 项不会收缩、菜单整体被撑爆。
+   （原来的 overflow-y: auto 就在 .dropdown-menu 上，这里等价接管，行为不变） */
+.dropdown-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .dropdown-item {
@@ -735,6 +755,20 @@ html[data-glass-fx='off'] .dock-bg::after {
   height: 1px;
   margin: 6px 12px;
   background: var(--divider-bg);
+}
+
+/* 版本号：菜单最底部一行小字，纯展示、不可点击。
+   字号刻意小于菜单项（.84rem）——它是元信息，不该跟操作项抢注意力；
+   但字体栈继承 body、字重保持 500，避免出现「同一浮层里两种中文字形」（v1.13.3 修过的问题）。
+   颜色用菜单里已有的弱色变量，三个主题下都读得清。 */
+.dropdown-version {
+  padding: 2px 12px 4px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-align: center;
+  user-select: none;
+  color: var(--menu-meta, rgba(255, 255, 255, 0.42));
 }
 
 /* ─── 主题分段选择器（纯 flex，无绝对定位，不可能错位）─────────────────
@@ -818,13 +852,13 @@ html[data-glass-fx='off'] .dock-bg::after {
    就成了直角；且原生滚动条与毛玻璃界面格格不入。直接隐藏（与 .dock-inner 横向
    滚动一致）——菜单超出时用滚轮/触控板滚动，四个角始终保持 16px 圆角。 */
 
-.dropdown-menu::-webkit-scrollbar,
+.dropdown-scroll::-webkit-scrollbar,
 .context-menu::-webkit-scrollbar {
   display: none;
 }
 
 /* Firefox（Electron 用 Chromium，此处仅防御性兼容） */
-.dropdown-menu,
+.dropdown-scroll,
 .context-menu {
   scrollbar-width: none;
 }
@@ -976,6 +1010,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   --menu-hover-bg: rgba(58, 123, 213, 0.22);
   --context-hover-bg: rgba(58, 123, 213, 0.18);
   --divider-bg: rgba(0, 0, 0, 0.15);
+  /* 透明：与近黑菜单文字同色系，靠 --menu-meta 稍微弱一点 */
+  --menu-meta: rgba(31, 36, 48, 0.55);
   --label-pill-bg: rgba(0, 0, 0, 0.30); /* 透明：中性深灰药丸衬底（悬停显示标签） */
   --switch-on-bg: rgba(0, 0, 0, 0.75); /* 透明：深色轨道（与近黑菜单文字统一） */
   --switch-on-knob: #fff;
@@ -1067,6 +1103,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 .app.theme-transparent .dock-label,
 .app.theme-transparent .drop-hint,
 .app.theme-transparent .dropdown-item,
+.app.theme-transparent .dropdown-version,
 .app.theme-transparent .context-menu-item,
 .app.theme-transparent .edit-label,
 .app.theme-transparent .drives-card,

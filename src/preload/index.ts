@@ -4,14 +4,16 @@ import { electronAPI } from '@electron-toolkit/preload'
 /** `run-app` 的返回值。
  *  - `true`          已启动，或「已在运行且窗口已激活/置前」
  *  - `false`         启动失败（目标不存在 / 无法运行 / UAC 被取消）
- *  - `'in-tray'`     目标**已在运行**，但窗口收在系统托盘里。主进程**不会**新开进程
- *                    （那会多开一个实例），也不强行显示它的窗口（有概率让它失去响应），
+ *  - `'in-tray'`     目标**已在运行**、窗口收在系统托盘里，并且**没能**用 UI Automation
+ *                    点开它的托盘图标。主进程既不再开进程（那会多开一个实例），
+ *                    也不强行显示它的窗口（有概率让它失去响应），
  *                    所以由 renderer 提示用户去点托盘图标。
- *  - `'probe-failed'` 没能判定目标是否在运行。主进程**故意不启动**（否则可能多开实例），
- *                    由 renderer 提示用户重试。
- *  ⚠️ 不要简化回 boolean：这两种状态必须能和「成功/失败」区分开，
- *     否则用户看到的就是「点了没反应」。 */
-export type RunAppResult = true | false | 'in-tray' | 'probe-failed'
+ *  ⚠️ 不要简化回 boolean：这个状态必须能和「成功/失败」区分开，
+ *     否则用户看到的就是「点了没反应」。
+ *  ⚠️ 原来的 `'probe-failed'`（探询给不出结论时故意不启动）已在 v1.13.8 删掉 ——
+ *     它会把「进程在、但连窗口都没有」的目标（Clash Verge 这类 Tauri 托盘应用）
+ *     永久挡在门外。现在这种情况一律 fail-open：直接启动。 */
+export type RunAppResult = true | false | 'in-tray'
 
 export interface LnkInfo {
   targetPath: string
@@ -187,12 +189,22 @@ const api = {
     ipcRenderer.on('nav-enter', listener)
     return () => { ipcRenderer.removeListener('nav-enter', listener) }
   },
-  /** Get whether desktop icons are currently hidden (registry HideIcons). */
-  getDesktopIconsHidden: (): Promise<boolean> =>
+  /** 桌面图标当前是否隐藏。**读失败时是 null（状态未知）**，不是 false ——
+   *  见主进程 readDesktopIconsHidden 的注释：把「读失败」当成「图标可见」
+   *  会让菜单文案先显示一个错的值、再翻成对的，用户看到闪烁。 */
+  getDesktopIconsHidden: (): Promise<boolean | null> =>
     ipcRenderer.invoke('get-desktop-icons-hidden'),
+  /** 桌面图标隐藏状态的**同步**读取（sendSync）：renderer 用它做 useState 的初始值，
+   *  这样首帧就是对的，不会「先渲染错的、再翻成对的」。
+   *  主进程侧读的是启动时预热好的缓存，不会阻塞；返回 null = 尚不知/读失败。 */
+  desktopIconsHiddenInitial: (): boolean | null =>
+    ipcRenderer.sendSync('get-desktop-icons-hidden-sync') as boolean | null,
   /** Toggle desktop icon visibility (registry + shell refresh); returns new state. */
-  toggleDesktopIcons: (): Promise<boolean> =>
+  toggleDesktopIcons: (): Promise<boolean | null> =>
     ipcRenderer.invoke('toggle-desktop-icons'),
+  /** 应用版本号（显示在「+」菜单底部）。 */
+  getAppVersion: (): Promise<string> =>
+    ipcRenderer.invoke('get-app-version'),
   /** 开机自启动当前是否开启（注册表 Run 登录项）。 */
   getAutoStart: (): Promise<boolean> =>
     ipcRenderer.invoke('get-auto-start'),

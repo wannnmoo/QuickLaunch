@@ -33,7 +33,8 @@
 ### 桌面图标显隐
 - 「+」菜单内置**隐藏/显示桌面图标**开关
 - 通过向桌面 `SHELLDLL_DefView` 发送 `WM_COMMAND 0x7402` 切换——与 Windows「右键桌面 → 查看 → 显示桌面图标」底层一致，不依赖 `SHChangeNotify`（后者在部分 Win11 上不刷新桌面）
-- 切换后 Explorer 自动同步注册表 `HideIcons`，状态持久化；状态读取用 `IsWindowVisible(ListView)`，比读注册表更贴近真实视觉状态
+- 切换后 Explorer 自动同步注册表 `HideIcons`，状态持久化；状态读取**优先读注册表 `HideIcons`**（Explorer 每次切换都会同步，实测最可靠），拿不到才回退 `IsWindowVisible(ListView)`，两路都拿不到就报「未知」而不是编一个「可见」（见更新日志 ㉟）
+- 菜单文案由主进程缓存驱动（`sendSync` 取首帧真值），切换后同步写回缓存 —— 文案与系统真值始终一致
 
 ### 添加快捷方式
 - 支持 `.lnk`（Windows 快捷方式）、`.url`（网页快捷方式）、`.pif` 文件
@@ -90,7 +91,7 @@
 | `run-app` | Renderer → Main | 启动目标程序（exe/URL/`shell:` 位置），或通过 `shell.openPath` 打开文件夹 |
 | `load-shortcuts` | Renderer → Main | 从 `userData/shortcuts.json` 加载已保存的快捷方式（含形状归一化与旧字段迁移） |
 | `save-shortcuts` | Renderer → Main | 保存快捷方式数据到 `userData/shortcuts.json` |
-| `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（ListView 可见性，回退注册表） |
+| `get-desktop-icons-hidden` | Renderer → Main | 读取桌面图标当前是否隐藏（**主进程缓存**，启动时用注册表 `HideIcons` 预热、拿不到才回退 ListView 可见性；读不到返回 `null` = 未知） |
 | `toggle-desktop-icons` | Renderer → Main | 切换桌面图标显隐，返回切换后状态 |
 | `get-auto-start` / `set-auto-start` | Renderer → Main | 读取 / 切换开机自启动（注册表 Run 登录项） |
 | `pick-icon` | Renderer → Main | 更换条目图标：选 exe/dll/ico（`SHDefExtractIcon`）或 png/jpg（直读转 dataURL） |
@@ -166,7 +167,55 @@ npm run package    # 构建并打包为可执行安装包
 
 ## 更新日志
 
-### v1.13.1 (2026-09-24)
+### v1.14.0 (2026-09-26) —— 全量代码审查 + 启动逻辑回退到 v1.13.4
+
+**1) 点图标回归「直接启动」（用户要求）**
+`PROBE_BEFORE_LAUNCH = false`：v1.13.5 引入的四态探询被这个常量短路，打包时被**整段静态消除**
+（产物里 `ACTIVATE_CS`/`probeTargetState`/`clickTrayIconFor` 命中数均为 0）。详见下方 ㊳。
+
+**2) 全量审查（主进程 / 渲染端 / 构建打包三路并行）后修掉的真实 bug**
+
+| 级别 | 问题 | 修法 |
+|---|---|---|
+| 🔴 | `env.d.ts` 与 preload 的 `runApp` 类型还留着已删除的 `'probe-failed'` | 类型同步为 `true \| false \| 'in-tray'` |
+| 🔴 | `toggleDesktopIcons` 声明 `Promise<boolean>`，主进程读不到时却 `resolve(null)` —— 类型把「状态未知」抹掉了，而 `null` 走假值正是 v1.13.7/1.13.8 两次「文案卡死」的成因 | preload + `env.d.ts` 统一 `Promise<boolean \| null>` |
+| 🔴 | **几何缓存失效条件漏了「条目顺序」**：依赖是 `[apps.length, ...]`，而拖拽重排是**纯置换**（长度不变、图标宽都是 60px、中心点数组一模一样），封顶时 `.dock-inner` 盒宽也不变、ResizeObserver 不回调 → 缓存里 `el↔cx` 失配，表现为「鼠标划过后面的图标、放大的却是前面的图标」 | 依赖改为条目签名 `apps.map(a => a.id).join(',')` |
+| 🔴 | **分组面板里手抖拖 6px 会把成员踢出分组**：「从面板拖出」的命中区用 `.dock` 的 rect（占满整窗，y 覆盖窗口下沿 174px），而面板图标行与玻璃条**纵向重叠** → 面板内小幅拖动也判成「落在 Dock 上」 | 命中区改为「玻璃条内 **且** 光标不在面板矩形内」 |
+| 🔴 | **「+」按钮永远关不掉自己打开的菜单**：document 的 mousedown 先把 `menuPos` 置 null（按钮不在 `menuRef` 内），React 在 mousedown 与 click 之间提交这次更新 → click 时闭包读到 null → 又开一次（菜单只闪一下） | mousedown 处理器里放行 `addBtnRef`，开关交给 `handleAddToggle` |
+| 🔴 | **空列表时键盘导航彻底不可用**：`resumeNavId` 返回 null → 唤醒分支直接 return，连「+」都够不到（`ADD_BTN_ID` 只在 `→` 走到最右时才设置） | 回落到 `ADD_BTN_ID` |
+| 🔴 | **孤儿分组成员永久不可见、不可删**：`groupId` 指向不存在的分组 → 既不在顶层渲染、也不在任何面板里，而每次保存都把它写回磁盘（与历史「哨兵→空串」同类的自锁坏数据） | 加载时归一化：这类成员降级为顶层条目 |
+| 🟡 | `showOpenDialogSafe` 的 `disabled: true` 是**空操作**（`OpenDialogOptions` 无此字段；靠对象展开骗过了 TS 的多余属性检查），注释还在说它是模态的来源 | 删掉该键，注释改为「模态由 parent 参数提供」 |
+| 🟡 | `desktopPath()` 硬编码 `D:\Desktop`，而它决定**扫描哪个目录 + fs.watch 盯哪个目录 + 三个对话框默认位置** | 改为以 `app.getPath('desktop')` 为唯一真相源（桌面重定向时它本就返回该路径） |
+| 🟡 | `run-as-admin` 无论成败都 `return true`，UAC 被取消时用户只见「Dock 消失又回来」；`open-path`/`openFileLocation`/`copyText` 的失败也全静默 | 返回真实结果 + renderer 逐条补提示 |
+| 🟡 | `extractIcon` 把**整段 stdout** 当 base64（v1.13.8 那类「多漏一行就静默坏」的坑） | 取最后一行 |
+| 🟡 | 拖入多个快捷方式时**串行** await（每个 ~900ms，20 个 = IPC 挂 ~18s，界面像卡死） | 限并发 4 并行（结果按下标写回，顺序不变） |
+| 🟡 | `probeTargetState` 里有 520ms **同步忙等**（开关一旦打开，最坏 3×(0.9s+0.26s)≈3.5s 主进程假死 —— 本项目「execFileSync 卡死 Dock」同族） | 改为 `await`（函数转 async） |
+| 🟡 | `toggleWindow` 只判 `!mainWindow`、漏 `isDestroyed()`（全文件唯一漏点，退出序列里会抛） | 补上 |
+| 🟡 | 主进程只有 `setWindowOpenHandler`，**没有 `will-navigate`** 兜底（拖文件导航到 `file://` 白屏只靠 renderer 的 preventDefault） | 补 `will-navigate` 拒绝一切非 dev-server 导航 |
+| ⚪ | `SINK_GRACE_MS(2500)` 与 `verifyDockOnTop` 巡检链（5×250=1250ms）存在**隐式数值耦合**：调到 ≤1250ms 会让位 100% 失效，而回归脚本把 `canSinkNow()` 硬编码成 `true`、测不出来 | 把不变量写进注释（含推理与更彻底的解法） |
+
+**3) 版本号 `1.13.8 → 1.14.0`**（`package.json` + `package-lock.json` 两处）
+
+**4) ⚠️ 过程事故（如实记录）**：审查期间有外部写入把 `package.json` 剥成了最小版
+（丢掉 `scripts` 与 `devDependencies`、版本回退到 1.13.7）。已按 `HEAD` 内容恢复并升到 1.14.0，
+恢复后 `typecheck` / `build` / 全部回归探针**重跑通过**。若再出现「`npm run build` 报 Missing script」，
+先 `git diff package.json` 看这一处。
+
+**5) 本版回归证据（全绿）**
+| 套件 | 结果 | 覆盖 |
+|---|---|---|
+| `.dsh-vision-toolkit/probe/regression.cjs` | **20/20** | Dock 几何 / 横向滚动可达性 / 拖拽后几何缓存新鲜度 / 分组徽标重叠 / 「+」菜单几何 / 键盘导航层级 |
+| `.dsh-vision-toolkit/probe/flip-e2e.cjs` | **7/7** | 桌面图标文案与系统注册表真值同步翻转、主进程无 `toggle read failed` |
+| `.dsh-vision-toolkit/probe/runapp-open-always.cjs` | **5/5** | Clash Verge（进程在、无窗口）等目标点了**必须能打开**、且不多开 |
+| `npm run typecheck` + `npm run build` | 通过 | — |
+
+**6) 已知未修（留到下一版）**：`sandbox: false` 可收紧为 `true`；`ready-to-show` 少了 `sinkSeq++`，
+且 `--autostart` 会无条件改写意图状态（开机自启后 1s 内按 Alt+Space 要多按一次）；
+用户在**系统桌面右键菜单**里切换「显示桌面图标」后，Dock 菜单文案会停在旧值（有意取舍：菜单打开时不再探测）；
+`recreateWindowForEdge` 目前不可达（三档窗口尺寸相同），左/右停靠落地时须重审监听器与定时器归属；
+`parseLnkFile` 的 `JSON.parse(整段 stdout)` 仍是「整段当载荷」的写法。
+
+### v1.13.1 (2026-09-24) 及之后的滚动条目（含 v1.13.2 ~ v1.13.8）
 
 **专项修复：一次全项目 bug 审计（代码 + UI）发现的 19 个缺陷**。审计方式：类型检查 + 通读三个进程的全部源码 + 用**真实构建产物**在真实 Chromium 里驱动真实 UI（新增 8 个探针脚本，见文末）。下面按「用户能感知的严重度」排列。
 
@@ -372,6 +421,213 @@ npm run package    # 构建并打包为可执行安装包
     实测本项目其它 C# 常量（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `WinZ`）**都是 0 个非 ASCII 字符**
     —— 那不是巧合，是这条约定在撑着。**新增内嵌 C# 时务必保持纯 ASCII**，说明写在 TS 那一侧
 
+- **㉛ 收在托盘里的程序：用 UI Automation 点它的托盘图标把它唤出来（v1.13.7，用户要求）**
+  - **背景**：v1.13.6 只做到「不重复启动」，托盘态让用户自己去点托盘图标。用户追问「真的没办法打开了吗」，
+    要求应用直接帮他点 —— 结果是**有办法，而且我上一轮说"技术上不可行"是错的**。走 UIA：托盘图标本身就是
+    UIA 元素、有 `Invoke` 模式，等价于用户自己点它，**不碰应用的窗口、不开进程、不动鼠标**。
+  - **实测（真实应用内，非探针）**：`probeTargetState = tray` → `clickTrayIconFor = true`（1856ms）→
+    微信窗口 `visible 0 → 1`、进程数 5→5 不变、未响应 0 个、临时脚本残留 0 个
+  - **四个坑（都很隐蔽，改这块必读）**
+    1. 🚩 **`FindAll(NameProperty, 中文)` 恒返回 0**：名字确实传对了（实测 C# 侧收到
+       `663E 793A 9690 85CF 7684 56FE 6807` = 显示隐藏的图标），条件就是匹配不上。
+       **改成遍历子树、在 C# 里用 `Name == want` 比较**（实测「遍历到 35 个元素、精确命中 1」）
+    2. 🚩 **`powershell.exe -Command` 传中文会被截成半个字符**：实测报
+       `[QLTray]::ClickTrayIcon('显示隐藏的图�?, …) 字符串缺少终止符` → 整条脚本解析失败，
+       而且 stdout 已被消费、**看不到任何输出**，表现成「调用方静默死住」。
+       **改成写「带 UTF-8 BOM 的 .ps1」再用 `-File` 执行**（BOM 不能省，否则 PS 5.1 按 ANSI 代码页读文件）；
+       顺带也不再依赖系统区域设置（中文 Win 是 GBK，别的语言机器本来会直接坏掉）
+    3. 🚩 **`Process.MainWindowTitle` 在窗口隐藏时是空的**：于是候选名退化成 `Weixin`，
+       而托盘图标叫「微信」，**永远匹配不上**（这是"点了没反应"的直接原因）。
+       **改用 `EnumWindows` + `GetWindowText` 取该程序所有顶层窗口的标题**（微信的托盘 tooltip == 它的窗口标题）
+    4. 🚩🚩 **`execFileSync` 阻塞主进程事件循环**：UIA 的 `Invoke` 那一步在完整应用里会卡住不返回
+       （最小 Electron 应用里同样的脚本却正常），于是**整个 Dock 卡死**、连 `app.exit(0)` 都执行不到。
+       **改成 `execFile` + Promise + 9s 超时兜底**。⚠️ 这条不只影响本功能：
+       **任何走 `execFileSync` 的 PowerShell 调用都可能把 Dock 卡死**，新代码优先用异步
+  - **匹配策略**：候选名 = 该程序所有顶层窗口标题 + exe 名兜底；匹配不到就**什么都不点**（列出面板里的
+    名字也没关系，绝不乱点别人的托盘图标），退回「提示用户自己点」
+  - **收尾**：点击后自动把溢出面板关掉，不留残影（实测残留 0）
+  - 回归验证：`node .dsh-vision-toolkit/probe/tray-bom.cjs`（BOM 文件方案，连跑两次都返回 1）、
+    `tray-v2.cjs`（树遍历法）、`uia-diag5.cjs`（证明「遍历 35 个、精确命中 1」）
+- **㉜ 桌面图标开关：文案不再「先显示隐藏、再立马切成显示」（v1.13.7 修，用户反馈）**
+  - **现象**：系统里桌面图标**已隐藏**时，打开「+」菜单会先显示「隐藏桌面图标」、随即翻成「显示桌面图标」
+  - **根因（两条叠加）**
+    1. `desktopIconsHidden` 的初始值是硬编码 `false`（= 图标可见），而真值要等异步读取；
+       系统里实际是隐藏的话，读回来必然翻转一次文案。**读的时机也太晚** —— 只在菜单打开时才读。
+    2. `readDesktopIconsHidden()` **读失败时返回 `false`**，把「读失败」和「图标可见」混为一谈：
+       启动那次读失败 → 状态停在「可见」；菜单打开再读（这次成功）→ 文案当场翻转。
+       实测把 `null` 和 `false` 分开后可复现两种路径的差异。
+  - **修法（三道）**
+    ① 主进程加**缓存** `desktopIconsHiddenCache` + `get-desktop-icons-hidden-sync`（`sendSync`），
+       preload 暴露 `desktopIconsHiddenInitial()`，renderer 用它做 `useState` 的初始值 ——
+       **首帧就是对的，根本没有异步窗口可以翻转**。应用启动时预热一次缓存；
+       切换成功后也写回缓存。（⚠️ 必须缓存：`sendSync` 要求处理器**同步**设置 `event.returnValue`，
+       而读操作要起 PowerShell、是异步的，在 `.then` 里赋值已经晚了 —— 这条弯路走了一半才发现）
+    ② `readDesktopIconsHidden()` 与 `toggle-desktop-icons` 失败时返回 **`null`**（状态未知），
+       不再编一个 `false` 冒充「图标可见」；renderer 收到 `null` 时**保持现状、不翻转**
+    ③ 切换失败时返回缓存里的已知值（连缓存都没有才返回 `null`）
+  - **实测**（`flip-test.cjs`，真实构建产物 + 模拟「图标已隐藏」）：
+    `desktopIconsHiddenInitial()` 返回 `true`，菜单打开后 1.2s 内采样 20 次文案集合 = `["显示桌面图标"]`，
+    **零翻转**；再把异步读全改成 `null`（模拟读全失败）后文案依旧正确、依旧零翻转
+- **㉝ 「+」菜单底部显示版本号（v1.13.7，用户要求）**
+  - 新增 IPC `get-app-version`（`app.getVersion()`，打包/开发同一个字段），菜单最底部一行
+    `快捷方式面板 v1.13.7`，非交互元素
+  - ⚠️ **必须做成「可滚动内容 + 固定页脚」两段式**：整窗只有 300px，菜单可用高度约 200px，
+    而内容（4 个菜单项 + 停靠位置 + 主题两行 + 分隔线）已经接近这个量。第一版把版本行直接
+    放在菜单容器里，它被挤进滚动区 —— 实测 `rect.top=292` 而菜单底只有 `209`，**用户永远看不到**。
+    现在 `.dropdown-menu` 是 flex 纵向布局、`.dropdown-scroll` 负责滚动（`min-height: 0`）、
+    版本行在滚动区之外。以后再加菜单项也只滚内容区、页脚始终可见
+  - 顺带修正 `overlayAvail` 的**基准错误**（原来用常量 `BASE_WINDOW_H(300)` 减锚点偏移，
+    而锚点偏移是从**真实** `window.innerHeight` 推出的，两者差几像素；菜单内容本就贴着上限，
+    差这几像素就把主题选择器推进了滚动区）。现在直接用 `window.innerHeight - anchorOffset`。
+    ⚠️ 也**不能在 render 里读 `dockBgRef.getBoundingClientRect()`**：首帧 ref 还没挂上，
+    会回退到兜底值把菜单压成 120px（实测踩过）
+  - 回归验证：`menu-version.cjs`（文案 + computed 样式 + 截图）、`menu-geom2.cjs`（几何与裁切）
+- **㉞ 澄清：「点开微信后 Dock 隐藏到托盘」是既定行为，不是 bug（v1.13.7 与用户确认）**
+  - 用户报「点开微信后软件就退出到后台」，实测**应用进程没有退出**：
+    `runApp` 返回 `true`、主窗口 `visible=false destroyed=false`、5 秒后仍存活，微信窗口 0→1 成功唤出。
+    实际就是设计中的「启动目标后隐藏到托盘，把桌面让出来」。用户确认「就是正常的隐藏到系统托盘」，
+    明确**不需要改**。以后再遇到「应用退出」类报障，先量进程存活再改代码
+
+- **㉟ 桌面图标开关：文案「永远卡在『隐藏桌面图标』」的真凶 —— PowerShell 里漏掉的 `[void]`（v1.13.8 修，用户反馈）**
+  - **现象**：菜单里隐藏/显示桌面图标**都正常**（图标真的会变），但菜单文案**永远显示「隐藏桌面图标」**，
+    点几次都不变。v1.13.7 那三道修法（缓存 + 同步首帧 + `null` 不写进 state）都没治住它 ——
+    因为它们防的是「首帧渲染错值」，而这个 bug 根本不在渲染侧。
+  - **根因**：`toggle-desktop-icons` 的 PowerShell 脚本里
+    `[DesktopIcons]::SendMessage($dv, 0x0111, 0x7402, 0)` **没写 `[void]`**。
+    PowerShell 会把**未赋值方法调用的返回值**也写进 stdout —— 于是 stdout 变成两行
+    `"0\n1"`（第一行是 SendMessage 的 IntPtr 返回值，第二行才是注册表真值）。
+    旧解析对**整段** stdout 做等值判断（`raw !== '0' && raw !== '1'`）→ 判成「读失败」：
+    - `toggle-desktop-icons` 返回 `null` → 主进程缓存**永不更新**（始终停在启动时那份 `false`）；
+    - renderer 虽然保住了乐观值，但**下一次打开菜单**又读到那份陈旧缓存 `false` → 文案退回「隐藏桌面图标」；
+    - 结果就是「图标在翻、文案不动」，而且每次点完都精确回到同一个错值 —— 看起来像文案被写死了。
+  - **修法（三道）**
+    1. **`[void][DesktopIcons]::SendMessage(...)`** —— 从源头堵住 stdout 污染（真正的根因）
+    2. **标记式输出 + 只认标记**：脚本改为输出 `HIDEICONS=0|1`（读不到时输出 `HIDEICONS=?`），
+       主进程 `parseDesktopIconsHidden()` 只扫这个标记、忽略其它任何行 ——
+       以后再有东西往 stdout 漏（Add-Type 警告、新加的方法调用……）都不会中招。
+       顺带修掉「`FindListView` 拿不到却编一个 `0`（= 可见）」：现在明确输出「未知」，交给上层保持现状
+    3. **读不到结果时的兜底**：0x7402 是**翻转**语义，命令确实发出去了（`TOGGLED=1`）时把缓存取反，
+       不让它永远停在旧值上
+  - **实测**（`.dsh-vision-toolkit/probe/flip-e2e.cjs`：真实 main + 真实 preload + 真实 renderer，
+    从外部读注册表当真值）：修前 `注册表 0→1` 而文案 `隐藏桌面图标 → 隐藏桌面图标`（复现用户报障）、
+    主进程日志 `[desktop-icons] toggle read failed: undefined | stdout: "0\n1"`；
+    修后 7/7 通过（文案与系统真值同步翻转、日志干净）
+  - ⚠️ **为什么 v1.13.7 的探针没抓到**：`flip-test.cjs` 用的是**模拟 IPC**
+    （`ipcMain.on('get-desktop-icons-hidden-sync', e => { e.returnValue = true })`），
+    它证明的是「首帧文案正确」，**从未跑过那段 PowerShell**。
+    教训：凡是「外部命令输出解析」类的 bug，模拟 IPC 的探针一律测不出来，必须起真实主进程。
+    另外 `flip-real.cjs` 名字也误导 —— 它其实只把应用起起来、连 CDP 都没连上（脚本里自己写了
+    「本脚本不引入依赖」就收工了），所以这轮补了 `flip-e2e.cjs` 并把旧脚本的缺口写在注释里
+  - ⚠️ **同类坑的现成防线**：托盘点击那条路径早就在用
+    `String(stdout).trim().split(/\r?\n/).pop()`（只取最后一行）。
+    **解析 PowerShell 输出时不要对整段做等值判断** —— 谁也不知道脚本里还有没有别的语句会往 stdout 漏东西
+
+- **㊱ 点图标「有的直接打开、有的弹『没能确认是否已在运行』」的真凶 —— 四态探询把两种相反的结果混成同一个返回值（v1.13.8 修，用户反馈）**
+  - **现象**：Dock 上有的图标点一下直接打开，有的点一下只弹
+    「没能确认是否已在运行，为避免多开已取消：请再点一次」。
+    实测最严重的一条：**当前没在运行的程序，永远点不开**。
+  - **根因（两处，叠加）**
+    1. `QLActivate.Activate` 把「**根本没有这个进程**」和「**进程在、但还没建出带标题的窗口**」
+       都返回 `0`；上层把 `0` 一律当「没探到、值得重试」，3 次之后判 `failed`（= 拒绝启动）。
+       于是 **`absent` 对「exe 存在但没在运行」是不可达的** —— 而这是最常见的情形。
+       实测 `charmap.exe` 没在运行时：`Activate = 0` → 重试 3 次（**2.4s**）→ `probe-failed` → **进程数 0 → 0**。
+       带启动参数的条目（quark / WPS / 钉钉 / GamePP）走 `if (!args)` 直接跳过探询、
+       文件夹 / URL / `shell:` 在 `activateRunningInstance` 里直接返回 `absent` ——
+       所以「有的点开就能直接打开」，**差别在有没有启动参数 / 是不是文件系统路径，与 App 本身无关**。
+    2. `Activate` 的后半段**也**返回 `0`：窗口找到了、`IsWindowVisible` 为真，但
+       `SetForegroundWindow` 被 Windows 前台锁拒绝时 `return ok ? 1 : 0` → 0。
+       上层读到 0 又当「没有窗口」，于是一个**明明在运行、窗口就在那儿**的程序也被判成
+       「无法判定」→ 什么都不做。实测：`FindWindow = 7932662`（句柄有效、`visible=True`、非最小化）而 `Activate = 0`。
+    ⇒ 合起来：**没在运行的点不开；在运行的也可能被判成「无法判定」**；只有带参数 / 文件夹 / URL 能直接打开。
+  - **为什么之前的验证没抓到**：`activate-3state.cjs` 用例 1 用的是
+    `C:\__no_such_app__\nope.exe` —— **路径都不存在**，那条路在 TS 层就被 `existsSync` 短路了，
+    根本没进探询；真正要命的「exe 存在但没在运行」从没测过。
+    `retry-logic.cjs` 的参考模型更把「3 次 retry → `absent`」（= 会启动）写成期望，
+    而源码里是 `failed`（= 不启动）—— 两边语义从来就不一致。
+  - **修法（三道）**
+    1. **拆开返回值**：新增 `QLActivate.Probe`，四个码各表一态 ——
+       `1` 在运行（已置前，或至少已把窗口抬起来）、`-1` 在运行但窗口隐藏（收托盘）、
+       `0` 进程在但还没有带标题的窗口（可重试）、**`2` 根本没这个进程（唯一允许启动新实例的码）**。
+       `absent` 从此可达：没在运行的程序**第一次探询就返回 2**，直接进启动流程，还省掉了 3 次重试的 2.5s
+    2. **前台锁拒绝 ≠ 没有窗口**：`SetForegroundWindow` 失败时不再返回 0，改为
+       `SetWindowPos(HWND_TOP) + BringWindowToTop` 把窗口抬起来，**仍返回 `1`**
+       （程序确实在运行，绝不能再启动一个）
+    3. **进程匹配加文件名兜底**：读 `MainModule.FileName` 对提权 / 受保护进程会抛异常
+       （实测本机 273 个进程里 **148 个**读不到路径），只按全路径匹配会把**正在运行**的程序
+       误判成「没在运行」→ 多开。现在同名进程也算「在运行」（安全侧）；
+       只有全路径命中时才优先用它们的窗口
+  - **实测**（`.dsh-vision-toolkit/probe/runapp-four-states.cjs`：真实应用 + CDP 直接调 `window.api.runApp`）
+    | 用例 | 修前 | 修后 |
+    |---|---|---|
+    | 没在运行 + 无参数 | `probe-failed`（2.4s）**进程 0 → 0，什么都没发生** | `true`（878ms）**进程 0 → 1，真的起来了** |
+    | 已在运行 + 无参数 | `probe-failed` | `true`（848ms）**进程 1 → 1，不多开** |
+    | 没在运行 + 带参数 | `true`（跳过探询） | `true`（不变） |
+    | 文件夹 | `true` | `true`（不变） |
+    负向对照：把构建产物里的 `case 2: return 'absent'` 改回 `'retry'`，用例 1 立刻退回
+    `probe-failed` + 进程 0 → 0（精确复现用户报障）—— 说明这条断言真的守得住
+  - 附带：`probe-failed` 的菜单提示改为「程序已在运行但还没出现窗口：为避免多开，请稍等再点一次」——
+    现在它只剩这一种情形了（原来那句「没能确认是否已在运行」其实是在替这个 bug 背锅）
+  - ⚠️ **教训：一个返回值不要承载两种语义**。「没有窗口」与「没有进程」是**相反**的结论 ——
+    前者必须什么都不做（多开就是登录窗），后者必须启动。挤在同一个 `0` 里，就注定有一条路走错。
+    另外这条路径的输出解析也一并换成标记式（`STATE=<code>`），理由同 ㉟
+
+- **㊲ 点 Clash Verge 这类「托盘型应用」永远打不开 —— `failed` 态改成 fail-open（v1.13.8 修，用户反馈）**
+  - **现象**（用户报障原话 + 主进程日志）：
+    `[launcher] 无法判定目标是否在运行，为避免多开实例而放弃本次启动: E:\ClashVerge\Clash Verge.exe`
+    —— 点几次都不开；而带启动参数 / 文件夹 / URL 的条目一切正常。
+  - **先证伪「是今天新改的那段代码搞坏的」**：在**那个状态下**实测（`.dsh-vision-toolkit/probe/diag-clash-state.cjs`）——
+    该进程的窗口清单里**只有**托盘窗口 / 无标题窗口 / 输入法辅助窗口，今天的 `Probe = 0`、`FindWindow = 0`；
+    而**昨天**的 `Activate` 用的就是**同一套「只认有标题窗口」的判定**（路径匹配那一层也正常：WMI 能读到
+    `E:\ClashVerge\Clash Verge.exe`、`pids=1`），所以它同样返回 `0` → 同样 retry 3 次 → 同样 `failed`。
+    **两版行为一致 ⇒ 问题不在那次改动，而在「探不出结论就不启动」这条约束本身**（四态探询才是今天新增的）。
+  - **真因**：Clash Verge 是 **Tauri 托盘型应用**，空闲时**根本没有主窗口**。实测本机（应用收在托盘）：
+    ```
+    pid=99776  cls=tao_system_tray_app      title=[]  visible=False   ← 只有托盘窗口
+    pid=99776  cls=Tao Thread Event Target  title=[]  visible=True    ← 可见但无标题
+    pid=99776  cls=MSCTFIME UI / IME                                  ← 输入法辅助窗口（本就跳过）
+    ```
+    `FindWindow` 只认**有标题**的顶层窗口（这是为了不把 Qt/Electron 的无标题辅助窗口置前），
+    于是它永远返回 0 → `retry` ×3 → `failed` → 旧逻辑「不启动」→ **用户永远点不开它**。
+    也就是说：「探不出结论就不启动」这条约束，在「目标连窗口都还没有」时**方向是反的** ——
+    此时启动才是唯一能拿到窗口的办法（单实例应用会自己把窗口显示出来）。
+  - **修法**：`failed` 不再拦，**直接落到启动流程**（fail-open）。
+    `running`（有窗口 → 置前，绝不新开）与 `tray`（窗口隐藏 → 点托盘图标唤出，绝不强行 `ShowWindow`）
+    两条保护**原样保留**；同时删掉 `RunAppResult` 的 `'probe-failed'` 与 renderer 的那条提示分支。
+  - **实测**（`.dsh-vision-toolkit/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）：
+    | 用例 | 结果 |
+    |---|---|
+    | Clash Verge（进程在、无窗口） | 返回 `true`（2.5s），**进程 1 → 1 不多开**，窗口标题 `""` → `Clash Verge`（真的出来了） |
+    | 普通 exe 没在运行 | `true`，真的启动 |
+    | 普通 exe 已在运行 | `true`，激活且不多开 |
+  - ⚠️ **教训：安全约束要先算清「拦下来的代价」**。这里拦下来 = 用户 **100% 点不开**；
+    放行的代价 = 极少数情况下多开一个实例 —— 而「窗口隐藏但确实存在」的微信/QQ
+    早已被 `-1`（tray）那一态保护住。宁可偶尔多开一次，也不要让用户点不开。
+    另外：报障时**先用同一输入对比新旧两版行为**，能立刻分清「今天的改动」还是「既有设计」——
+    这次就是靠这一步避免了一次方向错误的大回退
+
+- **㊳ 按用户要求：把「点图标先探询」整个关掉，启动逻辑退回 v1.13.4（v1.13.8）**
+  - **背景**：v1.13.5 引入、v1.13.6 扩成四态的这套探询，遇到「进程在、但没有主窗口」的目标
+    （Clash Verge 这类 Tauri 托盘应用）必然判 `failed`；即便按 ㊲ 改成 fail-open，每次点击仍要先花
+    约 0.9s 探一次。用户明确要求**回到 v1.13.4 的行为：点图标一律直接启动**。
+  - **做法：一个开关，代码不删**
+    ```ts
+    const PROBE_BEFORE_LAUNCH = false   // ← 唯一需要改的一行
+    ```
+    `run-app` 里整段探询被这个常量短路；`false` 时打包器会把 `ACTIVATE_CS` / `probeTargetState` /
+    `clickTrayIconFor` **整段静态消除**——实测构建产物 `out/main/index.js` 里这三个名字的命中数都是 **0**，
+    运行时行为与 v1.13.4 完全一致（`run-app` 第一件事就是收起 Dock 然后 spawn）。
+  - **实测**（`.dsh-vision-toolkit/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）
+    | 用例 | 结果 |
+    |---|---|
+    | Clash Verge（进程在、无窗口） | `true` **10ms**，窗口真的出现，进程 1 → 1 |
+    | 普通 exe 没在运行 | `true` **6ms**，真的启动 |
+    | 普通 exe 已在运行 | `true` **4ms**，进程 1 → 2（**会多开一个 —— 这就是 v1.13.4 的既定行为**） |
+  - ⚠️ **代价（用户已知悉并选择）**：微信 / QQ 收在托盘时再点图标会**多开一个实例（弹登录窗）**，
+    这正是 v1.13.5 当初要解决的问题。想恢复那套保护：把上面那行改成 `true`，再 `npm run build`。
+  - ⚠️ **开关只对源码有效**：`false` 时探询代码被静态消除，直接改 `out/main/index.js` 是没用的。
+  - 配套：`runapp-four-states.cjs` 会先检查构建产物里有没有探询代码，没有就打印说明并跳过（退出码 0）；
+    `flip-e2e.cjs`（桌面图标文案）不受影响，仍然 7/7
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
@@ -398,6 +654,13 @@ npm run package    # 构建并打包为可执行安装包
 | `wechat-launch.cjs` | 实测 `execFile` 与 `Start-Process` 对微信是否新开进程（结论：都会，与启动方式无关） |
 | `ActivateProbe.cs` | 验证「ShowWindow + AttachThreadInput + SetForegroundWindow」能否把托盘里的微信唤出 |
 | `activate-real.cjs` | 从**构建产物**抠出真实 `ACTIVATE_CS` 再跑，确认激活成功且进程数不变 |
+| `tray-bom.cjs` | BOM+.ps1 方案的托盘点击（连跑两次）；`tray-v2.cjs` 树遍历法；`uia-diag5.cjs` 证明「遍历 35 个、精确命中 1」 |
+| `flip-test.cjs` | 桌面图标文案零翻转（含「异步读全失败」的极端情形；⚠️ 用的是**模拟 IPC**，测不出 PowerShell 输出解析类 bug） |
+| `flip-e2e.cjs` | **桌面图标文案端到端（v1.13.8 补）**：起真实应用 + CDP 点菜单项，核对「系统注册表真值 ↔ 菜单文案」是否同步翻转，并断言主进程没有 `toggle read failed`；退出码 0/1 可直接进 CI |
+| `runapp-four-states.cjs` | **点图标的四态端到端（v1.13.8 补）**：真实应用 + CDP 调 `window.api.runApp`，四个用例（没在运行/已在运行/带参数/文件夹）逐一核对返回值**与进程数**（尤其是「没在运行 → 必须真的启动」）；退出码 0/1 |
+| `runapp-open-always.cjs` | **「点了必须能打开」端到端（v1.13.8 补）**：重点用例是 Clash Verge 这类**空闲时没有主窗口**的 Tauri 托盘应用（进程在、窗口为空），核对返回 `true` **且窗口真的出现**、进程数不爆炸；退出码 0/1 |
+| `diag-clash-state.cjs` | 把同一个目标路径同时喂给「今天的 `Probe`」与「昨天的 `Activate`」，用**同一台机器的同一状态**证明两版行为一致（排除「是今天改坏的」） |
+| `menu-version.cjs` / `menu-geom2.cjs` | 版本号文案与 computed 样式 / 菜单几何与裁切判定 |
 
 #### ⚠️ 探针环境里一个查了很久的坑：`devicePixelRatio` 会漂成 3
 

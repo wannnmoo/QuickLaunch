@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename, extname, dirname } from 'path'
-import { readFileSync, writeFileSync, existsSync, statSync, watch, promises as fsp, type FSWatcher, type Dirent } from 'fs'
+import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, promises as fsp, type FSWatcher, type Dirent } from 'fs'
 import { execFile, execFileSync, exec } from 'child_process'
 
 
@@ -46,6 +46,15 @@ let dockTrayHidden = false
 // 所以把「启动/唤回之后 2.5s 内」的 blur 一律忽略：这段时间里 Dock 本来就还没进入
 // 稳定置顶态，沉底要么立刻被恢复逻辑撤销（白跑一个进程），要么把 Dock 压到底。
 let dockShownAt = 0
+/** 「刚显示出来」的沉底宽限期。
+ *  ⚠️⚠️ **这个值必须 > `verifyDockOnTop()` 巡检链的最长寿命（5 次 × 250ms = 1250ms）**，
+ *  这是一条没写在代码里的隐式耦合：`blur` 路径**不会** `sinkSeq++`，所以能拦住巡检把窗口
+ *  重新置顶的只有宽限期。推理：任何合法的沉底都要求距最近一次 `markDockShown()` 已过
+ *  2.5s，而那次 `markDockShown()` 启动的巡检链最多活 1.25s，必然早已结束 → 今天不冲突。
+ *  **若把这里调到 ≤1250ms（比如为了「让位更跟手」）或加大巡检重试次数，巡检就会在沉底后
+ *  重新 `setAlwaysOnTop(true) + moveTop()`，让位特性 100% 失效**（与 v1.13.1 那次回归同症状），
+ *  而回归脚本 `sink-logic.cjs` 把 `canSinkNow()` 硬编码成 `return true`，**测不出来**。
+ *  更彻底的解法是让 `blur` 也 `sinkSeq++`（代际守卫天然覆盖，不再依赖宽限期长度）。 */
 const SINK_GRACE_MS = 2500
 
 /** 记录一次「Dock 应该在上面」的显示时机：恢复置顶与显示窗口的所有路径都要调用它。
@@ -116,7 +125,9 @@ function verifyDockOnTop(win: BrowserWindow, startSeq: number, attempt: number):
  * 键盘导航模式（恢复到上次选中的位置，没有记忆则第一个图标）；托盘点击等鼠标路径不进入导航。
  */
 function toggleWindow(fromKeyboard = false): void {
-  if (!mainWindow) return
+  // ⚠️ 必须连 isDestroyed() 一起判：退出序列里 mainWindow 仍指向已销毁的窗口，
+  //    下面第一句 isVisible() 会抛 "Object has been destroyed"（全文件唯一漏点）。
+  if (!mainWindow || mainWindow.isDestroyed()) return
   if (dockTrayHidden || !mainWindow.isVisible()) {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
     dockTrayHidden = false
@@ -222,18 +233,29 @@ function runPowerShell(psScript: string, timeout: number, done: (r: PSResult) =>
 $b64 = [IconExtractor]::GetIconBase64('${iconFile.replace(/'/g, "''")}', ${iconIndex}, ${size})
 Write-Output $b64`
     runPowerShell(psScript, 10000, ({ err, stdout }) => {
-      if (err || !stdout.trim()) { resolve(''); return }
-      const b64 = stdout.trim()
-      resolve(b64 ? 'data:image/png;base64,' + b64 : '')
+      // ⚠️ 只取**最后一行**：这个脚本里 `Add-Type` 编译、`[Console]::OutputEncoding`
+      //    赋值以及将来任何新增的语句都可能往 stdout 漏一行（v1.13.8 就因为
+      //    「未抑制的方法返回值」把桌面图标开关整条特性搞哑了）。base64 是最后写的，
+      //    取最后一行即可，比「整段 trim 当载荷」稳得多（与 clickTrayIconFor 一致）。
+      const lines = String(stdout ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+      const b64 = lines.length > 0 ? lines[lines.length - 1] : ''
+      if (err || !b64) { resolve(''); return }
+      resolve('data:image/png;base64,' + b64)
     })
   })
 }
 
 // ─── IPC: parse .lnk shortcut file via PowerShell ──────────────────────────
 
-// 新增文件/文件夹对话框的默认起始目录：优先用户重定向到 D 盘的桌面，回退系统桌面
+// 新增文件/文件夹对话框的默认起始目录 = 桌面。
+// ⚠️ 不要写 `existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')`：
+//    这个值同时决定 `scan-desktop-folders` **扫哪个目录**、`startDesktopWatch` 用
+//    `fs.watch` **盯哪个目录**、以及三个对话框的默认位置。桌面被重定向到 D:\Desktop 的
+//    机器上 `app.getPath('desktop')` 本来就会返回 D:\Desktop；而在「D:\Desktop 恰好存在
+//    但并不是桌面」的机器上，硬编码会让 Dock 把那个目录当成桌面（扫描/监听全错，真桌面
+//    新增的文件夹永远不出现）。以系统 shell 文件夹为唯一真相源。
 function desktopPath(): string {
-  return existsSync('D:\\Desktop') ? 'D:\\Desktop' : app.getPath('desktop')
+  return app.getPath('desktop')
 }
 const DEFAULT_DIALOG_PATH = desktopPath()
 
@@ -386,9 +408,14 @@ if (-not $displayName -and -not $isUrl -and $targetPath) {
 /** 弹系统文件/文件夹对话框（三个 IPC 共用）。
  *  ① 对话框打开期间置 dialogOpen + 把 Dock 顶到最前：模态对话框跟随父窗口层级，
  *     否则会被其他软件压下去；
- *  ② `disabled: mainWindow` 让对话框成为窗口的**真模态子窗口**——不仅挡住 Dock 的
- *     输入（避免用户在对话框开着时又点开菜单/右键菜单，把弹层状态搞乱），
- *     Windows 也会把对话框排进父窗口的 z-order 组，不再需要靠 setAlwaysOnTop 硬顶。 */
+ *  ② 把 `mainWindow` 作为 **parent** 传进去，对话框才是窗口的**真模态子窗口**——
+ *     挡住 Dock 的输入（避免用户在对话框开着时又点开菜单/右键菜单，把弹层状态搞乱），
+ *     Windows 也会把对话框排进父窗口的 z-order 组。
+ *  ⚠️ 不要写 `disabled: true`：`OpenDialogOptions` **没有这个字段**（Electron 的
+ *     showOpenDialog 选项只有 title/defaultPath/buttonLabel/filters/properties/message/
+ *     securityScopedBookmarks），写进去是空操作；它能骗过 TS 只是因为它是通过
+ *     `...(parent ? { disabled: true } : {})` 展开进去的（多余属性检查对展开不生效）。
+ *     真正提供模态的是 parent 参数。 */
 function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
   dialogOpen = true
   mainWindow?.setAlwaysOnTop(true)
@@ -399,7 +426,7 @@ function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electr
   // `if (dialogOpen) return` 会让 Dock 再也不沉底（直到重启）。
   try {
     return dialog
-      .showOpenDialog(parent!, { ...options, ...(parent ? { disabled: true } : {}) })
+      .showOpenDialog(parent!, options)
       .finally(() => { dialogOpen = false })
   } catch (err) {
     dialogOpen = false
@@ -826,50 +853,158 @@ public static class DesktopIcons {
 '@
 [Console]::OutputEncoding = [Text.Encoding]::UTF8`
 
-/** 读当前桌面图标隐藏状态：ListView 不可见 = 图标隐藏；找不到 ListView 时回退读注册表。 */
-function readDesktopIconsHidden(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const psScript = `${DESKTOP_ICONS_CS}
-$lv = [DesktopIcons]::FindListView()
-if ($lv -eq [IntPtr]::Zero) {
-  $v = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced' -Name HideIcons -ErrorAction SilentlyContinue).HideIcons
-  if ($null -eq $v) { Write-Output '0' } else { Write-Output $v }
+/** 读「桌面图标是否隐藏」的 PowerShell 片段（probe 与 toggle 共用）。
+ *
+ *  读法顺序（v1.13.7 第三次修定下来的，别改回去）：
+ *    ① **先读注册表 `HideIcons`**。它由 Explorer 维护、每次切换同步更新（实测
+ *       WM_COMMAND 0x7402 之后注册表立刻从 0 变 1），是最可靠的来源；
+ *       `IsWindowVisible(ListView)` 只是佐证，在自动化/无桌面的上下文里可能拿不到。
+ *    ② 每个 `if` 都要有 `else`：原来写的是
+ *         `if ($lv -eq 0) { 读注册表 } else { IsWindowVisible }`
+ *       —— 一旦 FindListView 成功但 IsWindowVisible 不可靠，结果就偏了。
+ *    ③ 两条路都拿不到 → 输出 `HIDEICONS=?`（= 状态未知），**不要**编一个 0 冒充「可见」。
+ *
+ *  ⚠️⚠️ 输出必须**带标记**（`HIDEICONS=<0|1>`），解析时只认标记（v1.13.8 修）：
+ *    这里踩过一个把整个特性掩盖掉的坑 —— toggle 脚本里的
+ *    `[DesktopIcons]::SendMessage(...)` **漏了 `[void]`**，而 PowerShell 会把
+ *    **未赋值方法调用的返回值**（IntPtr 0）也写进 stdout，于是 stdout 变成两行
+ *    `"0\n1"`；旧解析 `raw !== '0' && raw !== '1'` 把整段判成「读失败」→
+ *    toggle 返回 null → 主进程缓存永不更新 → 菜单文案**永远卡在「隐藏桌面图标」**，
+ *    而图标本身切换完全正常（用户报的就是「功能好、文案不动」）。
+ *    标记式输出 = 「只扫自己那一行」，比「猜整段 stdout 长什么样」稳得多，
+ *    以后任何往 stdout 漏东西的写法（Add-Type 警告、新加的方法调用……）都不会再中招。
+ *    （同一类坑在托盘点击那条路径上早就有防线：那边用 `split(/\r?\n/).pop()` 取最后一行。） */
+const DESKTOP_ICONS_READ_PS = `
+$reg = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced' -Name HideIcons -ErrorAction SilentlyContinue).HideIcons
+if ($null -ne $reg -and "$reg" -ne '') {
+  Write-Output "HIDEICONS=$reg"
 } else {
-  if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
+  $lv = [DesktopIcons]::FindListView()
+  if ($lv -eq [IntPtr]::Zero) {
+    Write-Output 'HIDEICONS=?'
+  } elseif ([DesktopIcons]::IsWindowVisible($lv)) {
+    Write-Output 'HIDEICONS=0'
+  } else {
+    Write-Output 'HIDEICONS=1'
+  }
 }`
-    runPowerShell(psScript, 5000, ({ err, stdout }) => {
-      if (err || !stdout.trim()) { resolve(false); return }
-      resolve(stdout.trim() === '1')
+
+/** 解析脚本 stdout 里的 `HIDEICONS=` 标记。
+ *  找不到（脚本没跑完 / 两路都拿不到）返回 **null（状态未知）**，
+ *  **不要**返回 false —— false 的语义是「图标可见」，把「读不到」当「可见」
+ *  会让文案先渲染错值、再翻成对值（v1.13.7 踩过）。 */
+function parseDesktopIconsHidden(stdout: string): boolean | null {
+  const hits = String(stdout ?? '').match(/HIDEICONS=([01])/g)
+  if (!hits || hits.length === 0) return null
+  return hits[hits.length - 1].endsWith('1')
+}
+
+/** 真正去探测桌面图标是否隐藏（要起 PowerShell，异步）。结果写入缓存。
+ *
+ *  ⚠️ 返回 `boolean | null`：**探测失败时返回 null，不要返回 false**。
+ *  返回 false 的语义是「图标可见」，而探测失败（超时 / PS 起不来 / 输出为空）时我们
+ *  **根本不知道**真实状态。把两者混为一谈会让文案先渲染错值、再翻成对值。
+ *
+ *  ⚠️ 这个函数**只在启动时调用一次**（且被 await），用它把缓存填好，见 primeDesktopIconsHidden。
+ *  不要在别处随手调用：它耗时 50~200ms，任何「菜单打开时再探测一次」都会让文案二次翻转。 */
+function probeDesktopIconsHidden(): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const psScript = `${DESKTOP_ICONS_CS}${DESKTOP_ICONS_READ_PS}`
+    runPowerShell(psScript, 5000, ({ stdout }) => {
+      // 只认标记，不因为 err 就丢弃已经拿到的结果（PS 的非终止错误也会让退出码非零）
+      const v = parseDesktopIconsHidden(stdout)
+      if (v === null) {
+        resolve(null)
+        return
+      }
+      desktopIconsHiddenCache = v
+      resolve(v)
     })
   })
 }
 
+/** 启动时**同步等**出第一份真值（在 createWindow 之前 await）。
+ *
+ *  ⚠️⚠️ 这里必须 await、不能「先建窗再异步预热」（v1.13.7 第二次踩）：
+ *    renderer 用 `sendSync` 拿 useState 的初始值，那一刻缓存**必须已经填好**；
+ *    否则初始值落回 false（= 图标可见），系统里其实是隐藏的 → 菜单先渲染「隐藏桌面图标」，
+ *    等挂载后的异步读回来再翻成「显示桌面图标」—— 用户看到的正是这个（报障截图）。
+ *    实测：缓存异步预热时同步读拿到 null，文案必然先错后翻。
+ *    代价是启动多等约 50~200ms（一次 PowerShell），换文案从首帧就对，值得。 */
+async function primeDesktopIconsHidden(): Promise<void> {
+  await probeDesktopIconsHidden()
+}
+
+/** 读桌面图标隐藏状态 —— **只认缓存，不探测**。
+ *
+ *  这样「菜单打开时读一次」是零成本、且返回值与 useState 的初始值**必然一致**，
+ *  文案不可能翻转。真值由启动时的 primeDesktopIconsHidden() 填、每次切换后写回。
+ *  缓存为 null（启动探测失败）时返回 null，renderer 保持现状不翻转。
+ *
+ *  ⚠️ 不要改成「每次都去探测」：探测 50~200ms，菜单打开时读到的是旧值、
+ *  等结果回来再覆盖 → 文案二次翻转（v1.13.7 踩过两次）。 */
+function readDesktopIconsHidden(): Promise<boolean | null> {
+  return Promise.resolve(desktopIconsHiddenCache)
+}
+
 ipcMain.handle('get-desktop-icons-hidden', () => readDesktopIconsHidden())
 
+// 桌面图标隐藏状态的**缓存**：给「渲染进程首帧之前就要拿到真值」用。
+// ⚠️ 必须缓存，不能用 sendSync + 异步读：sendSync 要求处理器**同步**设置 event.returnValue，
+//    而探测要起 PowerShell、是异步的，在 .then 里赋值就已经晚了。
+// ⚠️ 也必须**在 createWindow 之前填好**（见 primeDesktopIconsHidden）：否则首帧拿不到真值。
+// 更新路径：① 启动时同步等一次（primeDesktopIconsHidden）② 每次切换后写回实际结果。
+// 值为 null = 尚未知 / 探测失败，renderer 端保持默认且不翻转文案。
+let desktopIconsHiddenCache: boolean | null = null
+
+
+ipcMain.on('get-desktop-icons-hidden-sync', (event) => {
+  event.returnValue = desktopIconsHiddenCache
+})
+
+// 版本号（给「+」菜单底部显示）。用 Electron 的 app.getVersion()：打包后读的是
+// package.json 里的 version（electron-builder 写进 app 的 package.json），
+// 开发模式读的也是同一个字段，两处一致。
+ipcMain.handle('get-app-version', () => app.getVersion())
+
+
 ipcMain.handle('toggle-desktop-icons', async () => {
-  return new Promise<boolean>((resolve) => {
+  return new Promise<boolean | null>((resolve) => {
     const psScript = `${DESKTOP_ICONS_CS}
 $dv = [DesktopIcons]::FindDefView()
 if ($dv -eq [IntPtr]::Zero) {
-  Write-Output '0'
+  Write-Output 'TOGGLED=0'
+  Write-Output 'HIDEICONS=?'
 } else {
-  [DesktopIcons]::SendMessage($dv, 0x0111, [IntPtr]0x7402, [IntPtr]::Zero)
+  # [void] is REQUIRED here: SendMessage returns an IntPtr which PowerShell would
+  # otherwise write to stdout as an extra line (that stray line broke the parse,
+  # see DESKTOP_ICONS_READ_PS). No Chinese here - embedded scripts stay ASCII.
+  [void][DesktopIcons]::SendMessage($dv, 0x0111, [IntPtr]0x7402, [IntPtr]::Zero)
+  Write-Output 'TOGGLED=1'
   Start-Sleep -Milliseconds 500
-  $lv = [DesktopIcons]::FindListView()
-  if ($lv -eq [IntPtr]::Zero) {
-    $v = (Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced' -Name HideIcons -ErrorAction SilentlyContinue).HideIcons
-    if ($null -eq $v) { Write-Output '0' } else { Write-Output $v }
-  } else {
-    if ([DesktopIcons]::IsWindowVisible($lv)) { Write-Output '0' } else { Write-Output '1' }
-  }
+  ${DESKTOP_ICONS_READ_PS}
 }`
     runPowerShell(psScript, 5000, ({ err, stdout, stderr }) => {
-      if (err) {
-        console.error('[desktop-icons] PS error:', err.message, '| stderr:', stderr?.slice(0, 300))
-        resolve(false)
+      const raw = String(stdout ?? '')
+      const next = parseDesktopIconsHidden(raw)
+      if (next !== null) {
+        desktopIconsHiddenCache = next // 切换后同步缓存，供下次首帧同步读取
+        resolve(next)
         return
       }
-      resolve(stdout.trim() === '1')
+      console.error('[desktop-icons] toggle read failed:', err?.message, '| stdout:', JSON.stringify(raw.trim()), '| stderr:', stderr?.slice(0, 200))
+      // 读不到结果时的兜底：0x7402 是**翻转**语义，只要命令真的发出去了
+      // （TOGGLED=1），新状态必然是旧状态的反面。用它更新缓存，至少不会让缓存
+      // 永远停在旧值上（那正是「文案卡住」的成因）。
+      // 连缓存都没有（启动探测也失败）才返回 null，renderer 会保留自己的乐观值。
+      if (/TOGGLED=1/.test(raw) && desktopIconsHiddenCache !== null) {
+        desktopIconsHiddenCache = !desktopIconsHiddenCache
+        resolve(desktopIconsHiddenCache)
+        return
+      }
+      // ⚠️ 读不到就读不到，返回 null 表示「状态未知」——
+      //    调用方（renderer）据此**保留自己的乐观值**，不要把它当成「图标可见」。
+      resolve(null)
     })
   })
 })
@@ -931,17 +1066,34 @@ function splitArgs(input: string): string[] {
   return result
 }
 
+/** 点图标前是否先探询「目标是不是已经在运行」。
+ *
+ *  ⚠️⚠️ **v1.13.8 起默认 `false`（= 回到 v1.13.4 的启动逻辑：点图标一律直接启动）**。
+ *  用户明确要求：今天新增的这套探询（v1.13.5 引入 / v1.13.6 扩成四态）在遇到
+ *  「进程在、但连主窗口都还没有」的目标（Clash Verge 这类 Tauri 托盘应用）时会判成
+ *  `failed`，而 `failed` 又拒绝启动 —— 结果就是**点了永远打不开**。改成 fail-open 之后
+ *  仍然会先花 ~0.9s 探一次，用户要求干脆彻底回到「直接启动」。
+ *
+ *  == true== ：先探询（running→激活；tray→点托盘图标唤出；其余→启动）——
+ *              好处是**不会**对已在运行的单实例应用（微信/QQ）多开一个进程，
+ *              代价是点了要等约 1 秒、且极少数探不到窗口的目标要靠 fail-open 兜。
+ *  == false== ：不探询，直接 spawn（v1.13.4 的行为）——点下去就是打开；
+ *              代价是**微信/QQ 收在托盘时再点会多开一个实例（弹登录窗）**。
+ *
+ *  想切回去只改这一行；下面的探询代码与提示分支都完整保留着。 */
+const PROBE_BEFORE_LAUNCH = false
+
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
-  // ⚠️ 先判断「目标是不是已经在运行」——是的话激活它的窗口，**绝不再开一个进程**。
+  // 先判断「目标是不是已经在运行」——是的话激活它的窗口，**绝不再开一个进程**。
   // 必须在隐藏 Dock 之前做：这一路是同步的（PowerShell 约 0.8s），若先隐藏、
   // 再发现只是激活了已有窗口，用户会看到 Dock 无谓地闪一下。
   //
   // 只对「无启动参数的本地 exe」这么做：带参数时用户要的多半是明确的新行为
   // （例如某些工具用参数开新窗口），不能替他改语义。
-  if (!args) {
-    const state = probeTargetState(targetPath)
+  if (PROBE_BEFORE_LAUNCH && !args) {
+    const state = await probeTargetState(targetPath)
     if (state === 'running') {
       // 已经是用户想要的那个窗口在前台了。仍然把 Dock 收起来——
       // 与「启动成功」一致：用户是点图标切过去的，Dock 让出桌面。
@@ -954,20 +1106,44 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     }
     if (state === 'tray') {
       // 程序在运行、但窗口收在托盘里（微信/QQ 关到托盘就是这种状态）。
-      // ⚠️ 这里**故意不启动新进程**：那会多开一个实例，微信会弹登录窗口 ——
-      //    用户报的正是这个。也**故意不强行 ShowWindow**：实测把一个本该隐藏的
-      //    窗口强行显示出来有概率让它可见但失去响应（看起来像卡死，已踩过）。
-      // 正确做法是让应用自己走「从托盘恢复」的流程，那只能由用户点托盘图标触发。
-      console.log('[launcher] 目标已在运行但窗口在托盘，提示用户点托盘图标:', targetPath)
-      return 'in-tray' // renderer 据此提示「点右下角托盘图标」
+      // ⚠️ **绝不能启动新进程**：那会多开一个实例，微信会弹登录窗口 —— 用户报的正是这个。
+      // ⚠️ 也**不能对隐藏窗口 ShowWindow 强行显示**：实测会「可见但失去响应」（卡死，踩过）。
+      // 正确做法：用 UI Automation 点它的托盘图标，让应用自己走「从托盘恢复」的流程
+      // （见 clickTrayIconFor；等价于用户自己点托盘图标，不碰它的窗口、不动鼠标）。
+      const clicked = await clickTrayIconFor(targetPath)
+      if (clicked) {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          dockTrayHidden = true
+          sinkSeq++
+          mainWindow.hide()
+        }
+        return true // 已唤出，等同于启动成功
+      }
+      // UIA 不可用 / 没找到它的托盘图标：退回「提示用户自己点托盘图标」，
+      // **依然不启动新进程**（多开出来的是登录窗口，比让用户多点一下糟得多）
+      console.log('[launcher] 托盘图标未能点击，提示用户自行点击:', targetPath)
+      return 'in-tray'
     }
     if (state === 'failed') {
-      // 探询本身没成功（超时 / C# 编译失败 / 首次枚举未就绪）。
-      // **绝不能在这里启动** —— 那正是「又多开一个」的来源。宁可什么都不做。
-      console.log('[launcher] 无法判定目标是否在运行，为避免多开实例而放弃本次启动:', targetPath)
-      return 'probe-failed' // renderer 提示「请再试一次」
+      // ⚠️⚠️ v1.13.8 修：这里**不再拦**（fail-open），直接落到下面的启动流程。
+      //
+      // 为什么改成「放行」：`failed` 的真实含义是「进程在、但一个带标题的窗口都没有」
+      // （3 次都没探到）。这类目标**恰恰是最需要启动**的 —— 典型就是 Clash Verge
+      // 这类 Tauri 托盘型应用：空闲时它只有托盘窗口（`tao_system_tray_app`，隐藏）
+      // 和「Tao Thread Event Target」（可见但无标题），**主窗口根本不存在**。
+      // 实测（本机，Clash Verge 在托盘里）：
+      //   pid=99776  cls=tao_system_tray_app    title=[] visible=False
+      //   pid=99776  cls=Tao Thread Event Target title=[] visible=True
+      //   pid=99776  cls=MSCTFIME UI / IME      ← 输入法辅助窗口
+      // 于是任何版本的探询都只能给出 0，而「拦住不启动」的结果就是**用户永远点不开它**。
+      // 既然连窗口都没有，启动它就是唯一能拿到窗口的办法（单实例应用会自己把窗口显示出来）。
+      // 用户报的「点了 Clash Verge 只弹提示、打不开」正是这一条。
+      //
+      // 注意这不等于取消保护：`running`（有窗口 → 激活，绝不新开）与 `tray`
+      // （窗口隐藏 → 点托盘图标唤出，绝不强行 ShowWindow）两条依旧照旧。
+      console.log('[launcher] 进程在但探不到带标题的窗口，按「直接启动」处理（fail-open）:', targetPath)
     }
-    // 'absent' = 确认没在运行 → 继续走下面的启动流程
+    // 'absent' = 确认没在运行（或探询给不出结论）→ 继续走下面的启动流程
   }
 
   // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
@@ -1080,6 +1256,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   return true
 })
 
+
 /** 启动失败后把 Dock 还给用户：点图标时已经先隐藏到托盘，若不还回来，
  *  用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回。
  *
@@ -1186,29 +1363,39 @@ ipcMain.handle('describe-paths', async (_e, paths: unknown) => {
   const slots: (DroppedEntry | null)[] = new Array(list.length).fill(null)
   const rejected: string[] = []
   const execIdx: number[] = []
+  const lnkIdx: number[] = []
 
   for (let i = 0; i < list.length; i++) {
     const p = list[i]
     const ext = extname(p).toLowerCase()
     if (SHORTCUT_EXTS.has(ext)) {
-      try {
-        const info = await parseLnkFile(p)
-        // 目标为空的坏快捷方式不入 Dock（点了也启动不了）
-        if (!info.targetPath) { rejected.push(p); continue }
-        slots[i] = {
-          targetPath: info.targetPath,
-          arguments: info.arguments || '',
-          workingDirectory: info.workingDirectory || '',
-          description: info.description || basename(p, ext),
-          iconDataUrl: info.iconDataUrl || ''
-        }
-      } catch { rejected.push(p) }
+      lnkIdx.push(i)
     } else if (EXEC_EXTS.has(ext) && existsSync(p)) {
       execIdx.push(i)
     } else {
       rejected.push(p)
     }
   }
+
+  // 快捷方式：**限并发 4** 解析。每个 .lnk/.url 都要起一个 powershell.exe（实测 ~900ms
+  // 含 Add-Type 编译），原来在循环里串行 await —— 一次拖 20 个就是 IPC 挂 ~18s、
+  // renderer 只能干等（用户看到的是「拖进去了但半天没反应」）。
+  // 顺序不受影响：结果按下标写进 slots；rejected 的先后顺序无关紧要。
+  await forEachLimited(lnkIdx, 4, async (i) => {
+    const p = list[i]
+    try {
+      const info = await parseLnkFile(p)
+      // 目标为空的坏快捷方式不入 Dock（点了也启动不了）
+      if (!info.targetPath) { rejected.push(p); return }
+      slots[i] = {
+        targetPath: info.targetPath,
+        arguments: info.arguments || '',
+        workingDirectory: info.workingDirectory || '',
+        description: info.description || basename(p, extname(p).toLowerCase()),
+        iconDataUrl: info.iconDataUrl || ''
+      }
+    } catch { rejected.push(p) }
+  })
 
   if (execIdx.length > 0) {
     const metas = await describeExecutables(execIdx.map((i) => list[i]))
@@ -1617,14 +1804,19 @@ $wdStr = '${(workingDir || '').replace(/'/g, "''")}'
 if ($argStr) { $p['ArgumentList'] = $argStr }
 if ($wdStr) { $p['WorkingDirectory'] = $wdStr }
 Start-Process @p`
-  runPowerShell(psScript, 10000, ({ err, stderr }) => {
-    if (!err) return
-    // UAC 被用户取消（The operation was canceled by the user）也走这里：
-    // 此时同样要把 Dock 还给用户，否则「点了没反应 + Dock 消失」没有任何出路
-    console.error('[launcher] run-as-admin failed:', err.message, '| stderr:', (stderr || '').slice(0, 300))
-    restoreDockAfterFailedLaunch(hideSeq)
+  // ⚠️ 必须把**真实结果**返回给 renderer：原来无论成败都 `return true`，于是
+  //    「UAC 被取消」时用户只看到「Dock 藏起来又回来、什么都没发生」，没有任何说明
+  //    （run-app 早就做到返回真值了，这里漏了一处）。
+  return new Promise<boolean>((resolve) => {
+    runPowerShell(psScript, 10000, ({ err, stderr }) => {
+      if (!err) { resolve(true); return }
+      // UAC 被用户取消（The operation was canceled by the user）也走这里：
+      // 此时同样要把 Dock 还给用户，否则「点了没反应 + Dock 消失」没有任何出路
+      console.error('[launcher] run-as-admin failed:', err.message, '| stderr:', (stderr || '').slice(0, 300))
+      restoreDockAfterFailedLaunch(hideSeq)
+      resolve(false)
+    })
   })
-  return true
 })
 
 // 在资源管理器中定位目标（文件夹在父目录中选中该文件夹；文件直接选中）
@@ -1698,6 +1890,7 @@ const ACTIVATE_CS = `
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -1713,29 +1906,47 @@ public static class QLActivate
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
     const int SW_SHOW = 5;
     const int SW_RESTORE = 9;
+    const uint SWP_NOSIZE = 0x0001;
+    const uint SWP_NOMOVE = 0x0002;
+    const uint SWP_SHOWWINDOW = 0x0040;
 
-    /// Find the app's main window. Returns 0 if none. Does NOT change any state.
-    /// Only titled windows are considered: Qt/Electron apps create many untitled
-    /// helper windows (message-only, IME) which must never be foregrounded.
-    public static IntPtr FindWindow(string exePath)
+    /// Pids of the target app.
+    /// Match by full exe path when readable; ALSO accept a match on the exe file
+    /// NAME, because reading MainModule.FileName fails for elevated / protected
+    /// processes (148 of 273 processes on the dev box). Without that fallback we
+    /// would report "not running" for an app that IS running and start a second
+    /// copy - which is exactly what this whole feature exists to prevent.
+    /// preferPath gets the pids that matched the full path (used to pick a window).
+    static HashSet<int> Pids(string exePath, out HashSet<int> preferPath)
     {
         string want = exePath.ToLowerInvariant();
-        var pids = new HashSet<int>();
+        string wantName = Path.GetFileNameWithoutExtension(exePath).ToLowerInvariant();
+        var all = new HashSet<int>();
+        preferPath = new HashSet<int>();
         foreach (var p in Process.GetProcesses())
         {
+            int id; string nm;
+            try { id = p.Id; nm = p.ProcessName; } catch { continue; }
+            if (nm == null || !string.Equals(nm.ToLowerInvariant(), wantName, StringComparison.Ordinal)) continue;
             try {
-                if (!string.Equals(p.MainModule.FileName.ToLowerInvariant(), want, StringComparison.Ordinal)) continue;
-            } catch { continue; }
-            pids.Add(p.Id);
+                string fn = p.MainModule.FileName;
+                if (string.Equals(fn.ToLowerInvariant(), want, StringComparison.Ordinal)) { preferPath.Add(id); all.Add(id); }
+                else all.Add(id);      // same name, different path: still counts as running
+            } catch { all.Add(id); }   // path unreadable: trust the name (safe side)
         }
-        if (pids.Count == 0) return IntPtr.Zero;
+        return all;
+    }
 
+    static IntPtr FindWindowIn(HashSet<int> pids)
+    {
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, l) =>
         {
@@ -1751,13 +1962,35 @@ public static class QLActivate
         return found;
     }
 
-    /// Bring the app's window to the foreground.
-    /// Returns: 1 = activated, 0 = no window found, -1 = window found but hidden (tray).
-    /// A hidden window is NOT force-shown: doing so can leave the app's window visible
-    /// while its session is not ready, which looks like a freeze. The caller decides.
-    public static int Activate(string exePath)
+    /// Find the app's main window. Returns 0 if none. Does NOT change any state.
+    /// Only titled windows are considered: Qt/Electron apps create many untitled
+    /// helper windows (message-only, IME) which must never be foregrounded.
+    public static IntPtr FindWindow(string exePath)
     {
-        IntPtr target = FindWindow(exePath);
+        HashSet<int> prefer;
+        var all = Pids(exePath, out prefer);
+        if (all.Count == 0) return IntPtr.Zero;
+        return FindWindowIn(prefer.Count > 0 ? prefer : all);
+    }
+
+    /// Decide what the caller should do. THE CODES MATTER - do not collapse them:
+    ///   1 = process running, window visible/minimized: shown, raised, focus attempted
+    ///  -1 = process running, window hidden (tray). Caller must NOT force-show it.
+    ///   0 = process running but NO titled window found (maybe still starting up)
+    ///   2 = no such process at all -> the only code that may start a new instance
+    ///
+    /// History: this used to return 0 both for "no window found" AND for
+    /// "window found but SetForegroundWindow was rejected by the foreground lock".
+    /// The caller reads 0 as "maybe still starting" and retries, so a running app
+    /// whose focus request was refused ended up as "cannot determine" and the click
+    /// did nothing at all. A window that exists must never look like "nothing".
+    public static int Probe(string exePath)
+    {
+        HashSet<int> prefer;
+        var all = Pids(exePath, out prefer);
+        if (all.Count == 0) return 2;
+
+        IntPtr target = FindWindowIn(prefer.Count > 0 ? prefer : all);
         if (target == IntPtr.Zero) return 0;
         if (!IsWindowVisible(target) && !IsIconic(target)) return -1;
 
@@ -1769,37 +2002,76 @@ public static class QLActivate
         bool ok;
         try { ok = SetForegroundWindow(target); }
         finally { if (attached) AttachThreadInput(me, fgThread, false); }
-        return ok ? 1 : 0;
+        if (!ok)
+        {
+            // Foreground lock refused the focus request. Still raise the window so the
+            // user sees it, and report 1: the app IS running, launching again would
+            // create a duplicate.
+            SetWindowPos(target, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            BringWindowToTop(target);
+        }
+        return 1;
+    }
+
+    /// Legacy 3-code view kept for the regression probes (1 = done, 0 = nothing, -1 = tray).
+    public static int Activate(string exePath)
+    {
+        int r = Probe(exePath);
+        return r == 2 ? 0 : (r == 0 ? 0 : r);
     }
 }
 `
 
 /** 判断目标程序当前处于哪种状态，决定「激活 / 提示 / 启动」。
  *
- *  ⚠️ 核心约束（这一条是整个特性的安全底线）：**探询失败时绝不允许启动新进程**。
- *  宁可什么都不做、让用户再点一次，也不能多开一个实例 —— 多开出来的是登录窗口，
- *  用户看到的正是「点了微信又弹一个要我登录」。
+ *  ⚠️ **方向是「宁可多开一次，也不要让用户点不开」**（v1.13.8 修正，此前是反的）。
+ *  这条特性存在的理由：`execFile` / `Start-Process` 对单实例应用（微信、QQ 等）
+ *  **都会新开一个进程**，所以「已经在运行就别再启动」必须由我们主动判断。
+ *  但判断**不出来的那部分不能拿来拦住用户** —— 被拦住的代价是「点了永远没反应」。
  *
- *  三态：
- *    running  有可见（或最小化）窗口 → 已置前，调用方直接返回
- *    tray     进程在、窗口隐藏（收托盘）→ **不启动、不强行显示**，提示用户点托盘图标
- *    absent   确认没在运行 → 调用方才去启动
- *    failed   探询本身没成功（超时/编译失败/枚举未就绪）→ **不启动**，交给用户重试
+ *  四态与各自的处置（处置在 run-app 里）：
+ *    running  有可见/最小化窗口     → 置前，不启动
+ *    tray     进程在、窗口隐藏      → 点托盘图标唤出；点不动才提示用户自己点，不启动
+ *    absent   确认没这个进程        → 启动
+ *    failed   进程在、但没有带标题的窗口（3 次都没探到）→ **照旧启动**（fail-open）
+ *
+ *  ⚠️ `failed` 为什么必须放行：Clash Verge 这类 **Tauri 托盘型应用**空闲时
+ *  **根本不存在主窗口**，只有托盘窗口（`tao_system_tray_app`，隐藏）和一个
+ *  无标题的 `Tao Thread Event Target`。实测本机（应用收在托盘）：
+ *    pid=99776  cls=tao_system_tray_app     title=[] visible=False
+ *    pid=99776  cls=Tao Thread Event Target title=[] visible=True
+ *    pid=99776  cls=MSCTFIME UI / IME
+ *  任何探询都只能给出 0。如果因此拦住不启动，用户就**永远点不开它**（报障原话：
+ *  「点了只弹『没能确认是否已在运行』」）。既然连窗口都没有，启动它是唯一能拿到窗口的办法。
  *
  *  为什么要重试：实测应用刚启动时**第一次调用会返回 0**（进程/窗口枚举尚未就绪），
- *  一次失败就掉到「启动新进程」就会多开 —— 用户的报障正是这个。 */
-function probeTargetState(targetPath: string): 'running' | 'tray' | 'absent' | 'failed' {
+ *  重试能把这种「正在启动」与「真的没有窗口」区分开一部分。 */
+async function probeTargetState(targetPath: string): Promise<'running' | 'tray' | 'absent' | 'failed'> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const r = activateRunningInstance(targetPath, 3000)
     if (r !== 'retry') return r
     if (attempt < 2) {
-      // 同步小睡：这里在 IPC handler 里、用户正等结果，几百毫秒无感，
-      // 换来的是「不误判成未运行」—— 比多开一个进程划算得多
-      const until = Date.now() + 260
-      while (Date.now() < until) { /* busy-wait，避免为此引入 async 复杂度 */ }
+      // 小睡 260ms 再试：应用刚启动时第一次枚举常常还没就绪，立刻判「没在运行」就会多开。
+      // ⚠️ 必须是 **await**，不能写成 `while (Date.now() < until) {}` 那种同步忙等：
+      //    忙等会**阻塞主进程事件循环** 520ms（本项目「execFileSync 卡死整个 Dock」同族问题），
+      //    而且这段探询一旦被开关打开（PROBE_BEFORE_LAUNCH=true），
+      //    最坏路径 = 3×(execFileSync ~0.9s + 忙等 0.26s) ≈ 3.5s 主进程假死。
+      await new Promise((resolve) => setTimeout(resolve, 260))
     }
   }
   return 'failed'
+}
+
+/** 解析探询脚本的 `STATE=<code>` 标记（**只认标记**，不要对整段 stdout 做等值判断 ——
+ *  见 DESKTOP_ICONS_READ_PS 那段注释：漏出来的方法返回值曾把整条特性搞失效）。
+ *  取最后一行标记；找不到返回 NaN（= 探询失败，按「retry」处理，绝不启动新进程）。 */
+function parseProbeState(stdout: string): number {
+  const lines = String(stdout ?? '').split(/\r?\n/)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^\s*STATE=(-?\d+)\s*$/.exec(lines[i])
+    if (m) return Number(m[1])
+  }
+  return NaN
 }
 
 /** 单次探测/激活。'retry' 表示这次没能得到结论、值得重试。 */
@@ -1816,18 +2088,290 @@ function activateRunningInstance(targetPath: string, timeoutMs: number): 'runnin
 Add-Type -TypeDefinition @'
 ${ACTIVATE_CS}
 '@
-[QLActivate]::Activate('${escaped}')`],
+$r = [QLActivate]::Probe('${escaped}')
+Write-Output "STATE=$r"`],
       { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }
     )
-    const n = Number(String(out).trim())
-    if (n === 1) { console.log('[launcher] 已激活运行中的实例:', targetPath); return 'running' }
-    if (n === -1) { console.log('[launcher] 目标在运行但窗口收在托盘里:', targetPath); return 'tray' }
-    // 0 = 没找到窗口：可能「进程刚起来还没建窗」也可能「真的没在运行」，
-    // 一次分不清 → 交给上层重试（**不要**在这里就断言 absent）
-    return 'retry'
+    switch (parseProbeState(String(out))) {
+      case 1: console.log('[launcher] 已激活运行中的实例:', targetPath); return 'running'
+      case -1: console.log('[launcher] 目标在运行但窗口收在托盘里:', targetPath); return 'tray'
+      // ⚠️⚠️ 2 = **根本没有这个进程** —— 这是唯一允许去启动新实例的返回值。
+      //    在此之前 `absent` 对「exe 存在但没在运行」是**不可达**的：C# 把
+      //    「没这个进程」和「进程在但没建窗」都返回 0，上层一律当 retry，
+      //    3 次之后判 failed → **一个没在运行的程序永远点不开**，只弹
+      //    「没能确认是否已在运行…请再点一次」。用户报的「有的图标点开就这样」即此。
+      case 2: return 'absent'
+      // 0 = 进程在、但还没找到带标题的窗口（多半是刚启动还没建窗）→ 值得重试
+      case 0: return 'retry'
+      default:
+        console.log('[launcher] 探询输出无法解析（按 retry 处理，不启动）:', JSON.stringify(String(out).trim().slice(0, 120)))
+        return 'retry'
+    }
   } catch (err) {
     console.log('[launcher] activate probe failed:', err instanceof Error ? err.message : String(err))
     return 'retry'
+  }
+}
+
+// ─── 用 UI Automation 点托盘图标，把「收在托盘里」的窗口唤出来（v1.13.7）──────
+// 为什么需要它：单实例/托盘型应用（微信、QQ）关到托盘后，**没有别的安全办法**能让
+// 它把窗口显示出来 ——
+//   • execFile / Start-Process 都会新开一个进程（微信就是弹登录窗，用户报的正是这个）
+//   • 对隐藏窗口调 ShowWindow 强行显示，实测有概率让它「可见但失去响应」（卡死，踩过）
+//   • 模拟鼠标点托盘图标：Win11 的托盘图标在溢出面板里，跨进程读它的位置需要注入内存
+// UI Automation 是正路：托盘图标本身就是 UIA 元素、有 Invoke 模式 ——
+// 等价于用户自己点它，而**不碰应用的窗口**、不开进程、不动鼠标。
+//
+// 实测（本机 Win11 + 微信 4.1）：打开隐藏图标面板 → 面板里点「微信」→
+// 窗口 visible=False → True、前台切过去、进程数不变、未响应 0 个、面板自动收起。
+//
+// ⚠️⚠️ 这段 C# 必须纯 ASCII，而且**不能含反斜杠转义序列**：
+//   ① 纯 ASCII —— powershell.exe -Command 按系统 ANSI 代码页解码命令行，UTF-8 的中文注释
+//      会把源码解坏 → Add-Type 编译失败 → 功能静默失效。
+//   ② 无反斜杠 —— 这段 C# 嵌在 TS 的模板字符串里，写 "\n" 会被 JS 解成真换行、
+//      把 C# 字符串常量截断（踩过两次）。检查脚本见 .dsh-vision-toolkit/probe/cs-escapes.cjs。
+//   所有中文（按钮名、面板名、目标名）都由 TS 侧以**参数**传进来。
+const TRAY_CLICK_CS = `
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Automation;
+
+public static class QLTray
+{
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+
+    const string TRAY_CLS = "Shell_TrayWnd";
+    const string OVERFLOW_CLS = "TopLevelWindowForOverflowXamlIsland";
+
+    static string NameOf(AutomationElement e) { try { return e.Current.Name ?? ""; } catch { return ""; } }
+    static string ClassOf(AutomationElement e) { try { return e.Current.ClassName ?? ""; } catch { return ""; } }
+
+    static AutomationElementCollection TopLevel()
+    {
+        try { return AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition); }
+        catch { return null; }
+    }
+
+    static AutomationElement FindTopByClass(string cls)
+    {
+        var tops = TopLevel();
+        if (tops == null) return null;
+        foreach (AutomationElement e in tops) if (ClassOf(e) == cls) return e;
+        return null;
+    }
+
+    // NOTE: FindAll(NameProperty, <localized string>) returns 0 on this system even though the
+    // value arrives intact and the element exists (verified by dumping every name as codepoints).
+    // Walking the subtree and comparing names in managed code works, so that is what we do.
+    static void Walk(AutomationElement el, int depth, int maxDepth, string want, ref AutomationElement found)
+    {
+        if (found != null || depth > maxDepth) return;
+        AutomationElementCollection kids;
+        try { kids = el.FindAll(TreeScope.Children, Condition.TrueCondition); } catch { return; }
+        foreach (AutomationElement k in kids)
+        {
+            if (NameOf(k) == want) { found = k; return; }
+            Walk(k, depth + 1, maxDepth, want, ref found);
+            if (found != null) return;
+        }
+    }
+
+    static AutomationElement FindButton(string showHiddenName)
+    {
+        var tray = FindTopByClass(TRAY_CLS);
+        if (tray == null) return null;
+        AutomationElement found = null;
+        Walk(tray, 0, 8, showHiddenName, ref found);
+        return found;
+    }
+
+    static bool Click(AutomationElement el)
+    {
+        object p;
+        if (el == null) return false;
+        try
+        {
+            if (el.TryGetCurrentPattern(InvokePattern.Pattern, out p)) { ((InvokePattern)p).Invoke(); return true; }
+            if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out p))
+            {
+                var ep = (ExpandCollapsePattern)p;
+                if (ep.Current.ExpandCollapseState == ExpandCollapseState.Collapsed) ep.Expand(); else ep.Collapse();
+                return true;
+            }
+            if (el.TryGetCurrentPattern(TogglePattern.Pattern, out p)) { ((TogglePattern)p).Toggle(); return true; }
+        }
+        catch { }
+        return false;
+    }
+
+    // Titles of the target's top-level windows, joined by '|'.
+    // These are the tray-tooltip candidates: WeChat's window title equals its tray tooltip, while
+    // Process.MainWindowTitle is EMPTY for a hidden window. That was the real bug - the candidate
+    // list fell back to the exe name ("Weixin") and the tray icon ("WeChat-CN") never matched.
+    // Returned as ONE string on purpose: a C# array would make the PowerShell caller iterate.
+    public static string WindowTitles(string exePath)
+    {
+        string want = exePath.ToLowerInvariant();
+        var pids = new HashSet<int>();
+        foreach (var p in System.Diagnostics.Process.GetProcesses())
+        {
+            try { if (string.Equals(p.MainModule.FileName.ToLowerInvariant(), want, StringComparison.Ordinal)) pids.Add(p.Id); }
+            catch { }
+        }
+        if (pids.Count == 0) return "";
+        var found = new List<string>();
+        EnumWindows((h, l) =>
+        {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (!pids.Contains((int)pid)) return true;
+            var c = new StringBuilder(128); GetClassName(h, c, 128);
+            string cls = c.ToString();
+            if (cls.IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (cls.IndexOf("MessageWindow", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            var t = new StringBuilder(256); GetWindowText(h, t, 256);
+            if (t.Length == 0) return true;
+            string s = t.ToString();
+            if (!found.Contains(s)) found.Add(s);
+            return true;
+        }, IntPtr.Zero);
+        return string.Join("|", found.ToArray());
+    }
+
+    // Click the tray icon whose tooltip contains any candidate name.
+    // Returns 1 = clicked, 0 = no matching icon (nothing clicked), -1 = tray panel unavailable.
+    // The flyout is closed again afterwards so it is never left sitting on screen.
+    public static int ClickTrayIcon(string showHiddenName, string[] candidates)
+    {
+        var btn = FindButton(showHiddenName);
+        if (btn == null) return -1;
+
+        bool openedHere = FindTopByClass(OVERFLOW_CLS) == null;
+        if (openedHere && !Click(btn)) return -1;
+
+        AutomationElement panel = null;
+        // The flyout can close again quickly when focus changes, so poll fast.
+        for (int i = 0; i < 45 && panel == null; i++)
+        {
+            Thread.Sleep(60);
+            panel = FindTopByClass(OVERFLOW_CLS);
+        }
+        if (panel == null) return -1;
+
+        AutomationElement target = null;
+        AutomationElementCollection items;
+        try
+        {
+            items = panel.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+        }
+        catch { items = null; }
+        if (items != null)
+        {
+            foreach (AutomationElement b in items)
+            {
+                string n = NameOf(b);
+                if (n.Length == 0) continue;
+                foreach (string cand in candidates)
+                {
+                    if (string.IsNullOrEmpty(cand)) continue;
+                    if (n.IndexOf(cand, StringComparison.OrdinalIgnoreCase) >= 0) { target = b; break; }
+                }
+                if (target != null) break;
+            }
+        }
+
+        int rc = 0;
+        if (target != null && Click(target)) { rc = 1; Thread.Sleep(700); }
+
+        // never leave the flyout on screen
+        if (openedHere && FindTopByClass(OVERFLOW_CLS) != null) Click(btn);
+        return rc;
+    }
+}
+`
+
+// 托盘相关的中文名（UIA 元素的 Name 是中文）。放 TS 侧，C# 保持纯 ASCII。
+// 溢出面板用**类名** TopLevelWindowForOverflowXamlIsland 定位（C# 里），它的中文 Name
+// 在不同系统语言下会变，所以不靠名字。这个按钮的名字是稳定的。
+const TRAY_SHOW_HIDDEN_NAME = '显示隐藏的图标'
+
+/** 目标程序收在托盘时，用 UIA 点它的托盘图标把它唤出来。
+ *  返回 true = 已点击（调用方按「已唤出」处理）。
+ *
+ *  ⚠️⚠️ 脚本必须写成**带 UTF-8 BOM 的 .ps1 再 `-File` 执行，不能用 `-Command` 传文本**
+ *  （这条是踩出来的，非常隐蔽）：`-Command` 的文本要经过**系统 ANSI 代码页**解码，
+ *  脚本里的中文会被截成半个字符 —— 实测报
+ *  `[QLTray]::ClickTrayIcon('显示隐藏的图�?, …) 字符串缺少终止符`，
+ *  整条 PowerShell 解析失败、又因为 stdout 已被消费而**看不到任何输出**，
+ *  表现就是「调用方静默死住」。带 BOM 的 .ps1 由 PowerShell 按 UTF-8 读，编码有确定保证，
+ *  也不再依赖系统区域设置（中文 Win 是 GBK，其它语言机器会直接坏掉）。
+ *  实测：`-Command` 失败 / BOM+.ps1 `-File` 连续两次成功。 */
+function clickTrayIconFor(targetPath: string): Promise<boolean> {
+  const exeName = basename(targetPath).replace(/\.[^.]+$/, '') // Weixin.exe → Weixin
+  const scriptPath = join(app.getPath('temp'), `ql-tray-${process.pid}.ps1`)
+  try {
+    const escaped = targetPath.replace(/'/g, "''")
+    const script = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$wpf = Join-Path $env:WINDIR 'Microsoft.NET\\Framework64\\v4.0.30319\\WPF'
+Add-Type -ReferencedAssemblies @("$wpf\\UIAutomationClient.dll", "$wpf\\UIAutomationTypes.dll", "$wpf\\WindowsBase.dll") -TypeDefinition @'
+${TRAY_CLICK_CS}
+'@
+# 候选名 = 该程序所有顶层窗口的标题（微信的托盘 tooltip 就是它的窗口标题「微信」）+ exe 名兜底。
+# ⚠️ 不能用 $_.MainWindowTitle：窗口**隐藏**时它是空的（实测），候选会退化成 exe 名而永远匹配不上。
+$cands = New-Object System.Collections.Generic.List[string]
+foreach ($t in ([QLTray]::WindowTitles('${escaped}') -split '\\|')) { if ($t) { [void]$cands.Add($t) } }
+[void]$cands.Add('${exeName}')
+[QLTray]::ClickTrayIcon('${TRAY_SHOW_HIDDEN_NAME}', $cands.ToArray())`
+    // BOM 不能省：没有它 PowerShell 5.1 会按 ANSI 代码页读文件，中文同样会坏
+    writeFileSync(scriptPath, '\ufeff' + script, 'utf8')
+
+    // ⚠️ 必须异步 + 超时，不能用 execFileSync：
+    //   实测在完整应用里 UIA 的 Invoke 那一步会卡住不返回（最小 Electron 应用里同样的脚本却正常），
+    //   而 execFileSync 会**阻塞主进程事件循环** —— 表现为整个 Dock 卡死、连 app.exit 都执行不了。
+    //   改成子进程 + 回调，卡住也只是一个 8s 超时的后台任务，主进程始终活着。
+    return new Promise<boolean>((resolve) => {
+      let settled = false
+      const finish = (v: boolean): void => {
+        if (settled) return
+        settled = true
+        try { rmSync(scriptPath, { force: true }) } catch { /* ignore */ }
+        resolve(v)
+      }
+      const child = execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+        { timeout: 8000, windowsHide: true, maxBuffer: 1 << 20 },
+        (err, stdout) => {
+          if (err) {
+            console.log('[launcher] tray click failed:', err.message)
+            finish(false)
+            return
+          }
+          const n = Number(String(stdout).trim().split(/\r?\n/).pop())
+          if (n === 1) { console.log('[launcher] 已通过托盘图标唤出:', targetPath); finish(true) }
+          else { console.log('[launcher] 托盘图标未点击（返回值 ' + String(stdout).trim() + '）:', targetPath); finish(false) }
+        }
+      )
+      // 兜底：execFile 的 timeout 只杀子进程，回调理论上会来；但万一子进程杀不掉也不拖着 run-app
+      setTimeout(() => {
+        if (settled) return
+        console.log('[launcher] tray click 超时，按未点击处理:', targetPath)
+        try { child.kill() } catch { /* ignore */ }
+        finish(false)
+      }, 9000)
+    })
+  } catch (err) {
+    console.log('[launcher] tray click setup failed:', err instanceof Error ? err.message : String(err))
+    try { rmSync(scriptPath, { force: true }) } catch { /* ignore */ }
+    return Promise.resolve(false)
   }
 }
 
@@ -2015,6 +2559,16 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     })
     return { action: 'deny' }
   })
+  // ⚠️ 第二道防线：renderer 目前靠 document 级 `dragover`/`drop` 的 preventDefault 挡
+  //    「把文件拖到窗口上 → Chromium 导航到 file:// → 白屏」，但那只在 renderer 生效
+  //    （脚本出错/新窗口/页面重载瞬间都可能有空档）。主进程这里直接拒绝任何导航：
+  //    Dock 窗口只加载一次页面，之后不应该再发生任何 top-level 导航。
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const devUrl = process.env['ELECTRON_RENDERER_URL']
+    if (devUrl && url.startsWith(devUrl)) return // 开发模式 HMR 重载用
+    event.preventDefault()
+    console.error('[window] blocked navigation:', url.slice(0, 200))
+  })
 
   if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -2023,9 +2577,15 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // 未获得单实例锁：本实例正在退出流程中，不初始化窗口/托盘
   if (!gotSingleInstanceLock) return
+
+  // ⚠️ 必须先 await 填好「桌面图标是否隐藏」的缓存，**再**建窗：
+  //    renderer 用 sendSync 在首帧之前读它，缓存没填好就会落回 false（=图标可见），
+  //    系统里其实是隐藏的 → 菜单先渲染「隐藏桌面图标」、随后翻成「显示桌面图标」。
+  //    代价约 50~200ms（一次 PowerShell），换文案从首帧就对。
+  await primeDesktopIconsHidden()
 
   // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
   createWindow(readDockEdge(), startHiddenAtLogin)

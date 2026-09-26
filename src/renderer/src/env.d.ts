@@ -46,12 +46,13 @@ interface Window {
       description: string
       iconDataUrl: string
     }[]>
-    // true / false / 'in-tray' / 'probe-failed' —— 语义见 preload 的 RunAppResult
+    // true / false / 'in-tray' —— 语义见 preload 的 RunAppResult
+    // （v1.13.8 起不再有 'probe-failed'：探不出结论时一律直接启动，fail-open）
     runApp: (
       targetPath: string,
       args: string,
       workingDir: string
-    ) => Promise<true | false | 'in-tray' | 'probe-failed'>
+    ) => Promise<true | false | 'in-tray'>
     getPathForFile: (file: File) => string
     describePaths: (paths: string[]) => Promise<{
       accepted: { targetPath: string; arguments: string; workingDirectory: string; description: string; iconDataUrl: string }[]
@@ -82,8 +83,13 @@ interface Window {
     /** 退出前落盘：renderer 的保存有防抖，主进程退出时会推这条事件 */
     onFlushPendingSave: (callback: () => void) => () => void
     onNavEnter: (callback: () => void) => () => void
-    getDesktopIconsHidden: () => Promise<boolean>
-    toggleDesktopIcons: () => Promise<boolean>
+    /** null = 状态未知（读取失败），此时保持已知状态、不翻转文案 */
+    getDesktopIconsHidden: () => Promise<boolean | null>
+    /** 同步读取（sendSync）：用作 useState 初始值，保证首帧文案就是对的。null = 尚不知 */
+    desktopIconsHiddenInitial: () => boolean | null
+    toggleDesktopIcons: () => Promise<boolean | null>
+    /** 应用版本号（显示在「+」菜单底部）。 */
+    getAppVersion: () => Promise<string>
     getAutoStart: () => Promise<boolean>
     setAutoStart: (enabled: boolean) => Promise<boolean>
     dockPointer: (inside: boolean) => void

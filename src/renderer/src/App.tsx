@@ -215,10 +215,26 @@ function App(): React.ReactElement {
   const [editIconUrl, setEditIconUrl] = useState('')
   // 横向滚动边界状态：true 表示该侧还有图标未显示，用于显示渐隐提示
   const [scrollState, setScrollState] = useState({ left: false, right: false })
-  // 桌面图标当前是否隐藏（决定菜单项文案「隐藏/显示桌面图标」）
-  const [desktopIconsHidden, setDesktopIconsHidden] = useState(false)
+  // 桌面图标当前是否隐藏（决定菜单项文案「隐藏/显示桌面图标」）。
+  // ⚠️ 初始值走**同步**读取（sendSync，主进程读的是启动时预热好的缓存）：
+  //    用 useState(false) + 挂载后异步读，会在系统里图标「已隐藏」时先渲染「隐藏桌面图标」、
+  //    读到真值后再翻成「显示桌面图标」—— 用户看到的就是「打开菜单先显示隐藏、然后立马切成显示」。
+  // ⚠️⚠️ 这个 state 的类型必须是**纯 boolean，永远不写 null**：
+  //    它同时充当「是否隐藏」的布尔值和菜单文案的依据。写入 null 会让渲染时
+  //    null 走假值分支 → 文案显示「隐藏桌面图标」，而点击时 `target = !null = true`
+  //    → 每次都只请求「显示」→ **文案永远卡在「隐藏桌面图标」**（功能却正常）。
+  //    这正是 v1.13.7 报的「点了能切换显隐、但文案不再变」。所有赋值点都要
+  //    用 `typeof v === 'boolean'` 守住，见 handleToggleDesktopIcons / 挂载 effect。
+  const [desktopIconsHidden, setDesktopIconsHidden] = useState<boolean>(() => {
+    try {
+      const v = window.api.desktopIconsHiddenInitial()
+      return typeof v === 'boolean' ? v : false
+    } catch { return false }
+  })
   // 开机自启动是否开启（注册表 Run 登录项，菜单打开时从主进程读取）
   const [autoStart, setAutoStart] = useState(false)
+  // 应用版本号（显示在「+」菜单底部）
+  const [appVersion, setAppVersion] = useState('')
   // 主题：黑夜（默认）/ 白天 / 透明（背景全透明，仅图标悬浮桌面），偏好持久化到 localStorage
   const [theme, setTheme] = useState<'dark' | 'light' | 'transparent'>(() => {
     const saved = localStorage.getItem('ql-theme')
@@ -401,7 +417,11 @@ function App(): React.ReactElement {
   // 直接 CreateProcess，对 .md/.txt/.png 这类非可执行文件必然失败，点了没反应。
   const openFolderChild = (item: FolderChild): void => {
     closeFolderCard()
-    window.api.openPath(item.path)
+    // open-path 在目标已删除 / 无关联程序时返回 false —— 不读返回值就是「点了没反应」
+    window.api
+      .openPath(item.path)
+      .then((ok) => { if (ok === false) showDropHint('打不开：文件可能已被删除或移动') })
+      .catch(() => showDropHint('打不开该文件'))
   }
 
   // ─── 驱动器信息（「此电脑」悬停卡片 + 图标用量条） ─────────────────────
@@ -416,6 +436,21 @@ function App(): React.ReactElement {
 
   // 启动时拉一次，之后每次打开卡片时再刷新（容量变化不常发生，无需轮询）
   useEffect(() => { loadDrives() }, [loadDrives])
+
+  // 启动时同步「桌面图标是否隐藏」+ 版本号。
+  // ⚠️ 桌面图标状态必须在**挂载时**就读一次，不能只在菜单打开时读：
+  //    初始 state 是 false（= 图标可见），菜单文案就先渲染成「隐藏桌面图标」；
+  //    若系统里图标其实是隐藏的，异步读取回来会把文案**当场翻成「显示桌面图标」**——
+  //    用户看到的就是「打开菜单先显示隐藏、然后立马切成显示」。开机自启本来就只在
+  //    菜单打开时读，没有这个可见的翻转问题，但既然都是轻量读取，一并在这里预热。
+  useEffect(() => {
+    // v = null 表示「读失败、状态未知」——**不要**写进 state（见 handleToggleDesktopIcons 的说明：
+    // null 会让文案卡死在「隐藏桌面图标」）。只在拿到明确布尔值时更新。
+    window.api.getDesktopIconsHidden().then((v) => {
+      if (typeof v === 'boolean' && !desktopIconsDirtyRef.current) setDesktopIconsHidden(v)
+    }).catch(() => {})
+    window.api.getAppVersion().then(setAppVersion).catch(() => {})
+  }, [])
 
   // 三个都用 useCallback 固定引用：它们会被 handleIconMouseDown / handleContextMenu 的
   // useCallback 依赖引用，每次渲染换新函数会让那些回调的缓存失效
@@ -582,11 +617,18 @@ function App(): React.ReactElement {
     panelCenters.current = measureCenters(panelIconRefs.current, panelInnerRef.current)
   }
 
-  // 显式失效：这些依赖一变就让两处几何缓存全部重建（见上方注释 ①）
+  // 显式失效通道 ①：这些依赖一变就让两处几何缓存全部重建（见上方注释 ①）。
+  // ⚠️ 依赖必须是**条目签名**而不是 `apps.length`：拖拽重排是**纯置换** —— 长度不变、
+  //    Dock 图标宽度都是 60px、中心点数组一模一样，只是同一批 DOM 节点换了位置，
+  //    `apps.length` 判不出变化。而封顶时 `.dock-inner` 的盒宽也不变（插入线只改
+  //    scrollWidth 不改 clientWidth），ResizeObserver 同样不回调 → 缓存里 `el↔cx`
+  //    的对应关系就会过期，表现为「鼠标划过后面的图标、放大的却是前面的图标」
+  //    （v1.12.1 修过同类症状，这里是它的另一个入口）。签名比较是零成本且确定性的。
+  const appsOrderKey = apps.map((a) => a.id).join(',')
   useLayoutEffect(() => {
     geoSeq.current += 1
     setGeometryTick(geoSeq.current)
-  }, [apps.length, theme, edge, openGroupId])
+  }, [appsOrderKey, theme, edge, openGroupId])
 
   // Calculate which insertion index the cursor is closest to
   // 返回的是「位置」（在渲染出来的顶层图标中排序后的下标），不是数组下标
@@ -700,9 +742,18 @@ function App(): React.ReactElement {
       const draggedId = drag.id
       const overGroup = dragOverGroupRef.current
       const target = dropIdxRef.current
-      // 「从面板拖出」必须在 Dock 区域内松手才算数：否则面板内的小幅拖动会把条目误踢出分组
-      const dockRect = dockRef.current?.getBoundingClientRect()
-      const inDockBand = !!dockRect && e.clientY >= dockRect.top && e.clientY <= dockRect.bottom
+      // 「从面板拖出」必须在 Dock 玻璃条上松手才算数。
+      // ⚠️ 两个 rect 都要，不能只看 `.dock`（它占满整窗，y 覆盖窗口下沿 174px）：
+      //    分组面板是浮在 Dock 上方的卡片，它的图标行与玻璃条**在纵向上是重叠的**，
+      //    所以「光标在玻璃条带内」在面板上也成立 —— 只看这个判断，用户在面板里
+      //    手抖拖 6px（阈值是 |dx|<5 **且** |dy|<5 才算点击）就会把成员悄悄踢出分组。
+      //    正解：光标落在**面板矩形之内**时一律不算「在 Dock 上」。
+      const panelRect = panelRef.current?.getBoundingClientRect()
+      const overPanel = !!panelRect &&
+        e.clientX >= panelRect.left && e.clientX <= panelRect.right &&
+        e.clientY >= panelRect.top && e.clientY <= panelRect.bottom
+      const barRect = dockBarRef.current?.getBoundingClientRect()
+      const inDockBand = !overPanel && !!barRect && e.clientY >= barRect.top && e.clientY <= barRect.bottom
 
       setDragId(null)
       setDropIdx(null)
@@ -812,6 +863,11 @@ function App(): React.ReactElement {
   // Close menus when clicking outside
   useEffect(() => {
     const handler = (e: MouseEvent) => {
+      // ⚠️ 「+」按钮必须放行：它不在 .dropdown-menu 的 DOM 里，若在这里把 menuPos 置 null，
+      //    React 会在 mousedown 与 click 之间提交这次更新（两个独立事件），于是随后
+      //    handleAddToggle 读到的 menuPos 已经是 null → 又把菜单开回来。
+      //    净效果是「点按钮菜单只闪一下、永远关不掉」。交给 handleAddToggle 自己判断开关。
+      if (addBtnRef.current?.contains(e.target as Node)) return
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuPos(null)
       }
@@ -1149,14 +1205,15 @@ function App(): React.ReactElement {
     autoStartDirtyRef.current = false
     desktopIconsDirtyRef.current = false
     window.api.getDesktopIconsHidden().then((v) => {
-      if (!desktopIconsDirtyRef.current) setDesktopIconsHidden(v)
+      // typeof 守卫：null（状态未知）不写进 state，见 state 声明处的说明
+      if (typeof v === 'boolean' && !desktopIconsDirtyRef.current) setDesktopIconsHidden(v)
     }).catch(() => {})
     window.api.getAutoStart().then((v) => {
       if (!autoStartDirtyRef.current) setAutoStart(v)
     }).catch(() => {})
   }, [menuPos])
 
-  // 切换桌面图标显隐（乐观更新：点击立即切换菜单文案，IPC 结果再校正）
+  // 切换桌面图标显隐（乐观更新：点击立即切换文案，IPC 结果再校正）
   const handleToggleDesktopIcons = () => {
     const target = !desktopIconsHidden
     desktopIconsDirtyRef.current = true
@@ -1165,7 +1222,14 @@ function App(): React.ReactElement {
     window.api
       .toggleDesktopIcons()
       .then((next) => {
-        if (next !== target) setDesktopIconsHidden(next)
+        // ⚠️⚠️ `next === null` 表示「主进程没读到结果（状态未知）」，**绝不能**写进 state
+        //   （v1.13.7 第三次修，这是个把我坑了两轮的 bug）：
+        //   `desktopIconsHidden` 同时充当「是否隐藏」的布尔值和菜单文案的依据，
+        //   一旦被写成 null，渲染时 null 是假值 → 文案显示「隐藏桌面图标」，
+        //   而点击时 `target = !null = true` → 每次都只请求「显示」，
+        //   于是文案**永远卡在「隐藏桌面图标」**，但功能其实是好的（点击仍能切换显隐）。
+        //   正解：只在拿到**明确布尔值**时才校正；null 时保留乐观值。
+        if (typeof next === 'boolean' && next !== target) setDesktopIconsHidden(next)
       })
       .catch((err) => {
         console.error('[desktop-icons] toggle failed:', err)
@@ -1303,15 +1367,15 @@ function App(): React.ReactElement {
     lastRunAtRef.current.set(app.targetPath, now)
     // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
     // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」。
-    // 'in-tray'：目标已在运行但窗口收在托盘里（微信/QQ 关到托盘就是这种）。
-    //   主进程**故意不新开进程**、也不强行显示它的窗口（强行显示有概率让它失去响应），
-    //   所以这里必须明确告诉用户「去点托盘图标」——否则就是「点了没反应」。
-    // 'probe-failed'：没能判定是否在运行，主进程为避免多开实例故意不启动，提示重试。
+    // 'in-tray'：目标已在运行但窗口收在托盘里（微信/QQ 关到托盘就是这种），而且主进程
+    //   没能用 UIA 点开它的托盘图标。主进程**故意不新开进程**、也不强行显示它的窗口
+    //   （强行显示有概率让它失去响应），所以这里必须明确告诉用户「去点托盘图标」。
+    //   ⚠️ v1.13.8 起不再有 'probe-failed' 分支：探不出结论时主进程改为**直接启动**
+    //   （fail-open）—— 原来那条分支会把「进程在但连窗口都没有」的目标永久挡在门外。
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
       .then((ok) => {
         if (ok === false) showDropHint('启动失败：目标不存在或无法运行')
         else if (ok === 'in-tray') showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
-        else if (ok === 'probe-failed') showDropHint('没能确认是否已在运行，为避免多开已取消：请再点一次')
       })
       .catch(() => showDropHint('启动失败：目标不存在或无法运行'))
   }, [dragId, openGroupId, closeGroupPanel, showDropHint])
@@ -1499,7 +1563,12 @@ function App(): React.ReactElement {
         }
       }
     }
-    return top[0]?.id ?? null
+    // ⚠️ 一个条目都没有时也要给「+」按钮（ADD_BTN_ID），不能返回 null：
+    //    返回 null 会让 EnterNavigation 的唤醒分支直接 return —— 键盘用户
+    //    Alt+Space 之后按 ←/→ 毫无反应，连「+」都够不到（而 ADD_BTN_ID 原本
+    //    只在 ArrowRight 走到最右时才被设置，形成死锁）。空列表时第一个可导航项
+    //    就是「+」，用它兜底。
+    return top[0]?.id ?? ADD_BTN_ID
   }, [])
 
   // 主进程通知：Alt+Space 唤出 Dock（托盘点击等鼠标路径不会触发）
@@ -1712,17 +1781,22 @@ function App(): React.ReactElement {
 
   const handleRunAdmin = (app: AppEntry) => {
     setContextMenu(null)
-    window.api.runAsAdmin(app.targetPath, app.arguments, app.workingDirectory)
+    // ⚠️ 必须读返回值并提示：UAC 被取消 / 提权失败时主进程返回 false，
+    //    此时 Dock 会回来但什么都没发生 —— 没有这句话用户只能猜「点了没反应」。
+    window.api
+      .runAsAdmin(app.targetPath, app.arguments, app.workingDirectory)
+      .then((ok) => { if (ok === false) showDropHint('已取消提权，或无法以管理员身份运行') })
+      .catch(() => showDropHint('以管理员身份运行失败'))
   }
 
   const handleOpenLocation = (app: AppEntry) => {
     setContextMenu(null)
-    window.api.openFileLocation(app.targetPath)
+    window.api.openFileLocation(app.targetPath).catch(() => showDropHint('无法在资源管理器中定位'))
   }
 
   const handleCopyPath = (app: AppEntry) => {
     setContextMenu(null)
-    window.api.copyText(app.targetPath)
+    window.api.copyText(app.targetPath).catch(() => showDropHint('复制失败'))
   }
 
   // ─── Persistence ──────────────────────────────────────────────────────
@@ -1838,24 +1912,39 @@ function App(): React.ReactElement {
     let cancelled = false
     window.api.loadShortcuts().then((saved) => {
       if (cancelled) return
-      if (saved && saved.length > 0) {
+      // ⚠️ 归一化「孤儿分组成员」：groupId 指向一个不存在的分组时，这个条目
+      //    既不在 Dock 顶层渲染（顶层 = 没有 groupId）、也不在任何面板里
+      //    （面板按 groupId === openGroupId 取成员）→ **用户看不见它，也就删不掉它**，
+      //    而每次保存都会把它原样写回磁盘，于是永久占据、永不消失。
+      //    与历史上「文件夹图标哨兵 → 空串」属于同一类自锁问题（写坏数据比少写数据糟得多），
+      //    必须在第一次写回之前修掉：把这类成员降级成普通顶层条目。
+      //    归一化后的 list 要贯穿本 effect 的后续步骤（prune / scan 都拿它当基准），
+      //    否则归一化结果会被后面基于原始 saved 的 setApps 覆盖掉。
+      const groupIds = new Set((saved || []).filter((a) => a.isGroup).map((a) => a.id))
+      const list = (saved || []).map((a) => {
+        if (a.groupId === undefined || groupIds.has(a.groupId)) return a
+        const promoted = { ...a }
+        delete promoted.groupId
+        return promoted
+      })
+      if (list.length > 0) {
         // 认下主进程给的那份共享文件夹图标（所有文件夹条目都是同一张图），
         // 它是下面「修复空图标」的数据源。自己在带图标的文件夹条目上取一份也行
-        const withIcon = saved.find((a) => a.isFolder && a.iconDataUrl)
+        const withIcon = list.find((a) => a.isFolder && a.iconDataUrl)
         if (withIcon) sharedFolderIcon = withIcon.iconDataUrl
-        setApps(saved)
-        nextId = Math.max(-1, ...saved.map((a) => a.id)) + 1
+        setApps(list)
+        nextId = Math.max(-1, ...list.map((a) => a.id)) + 1
       }
       // 加载完成即解锁保存（不等同步结束，启动早期用户操作也能正常持久化）
       loadedRef.current = true
       desktopSyncBusyRef.current = true
       const sync = async () => {
         try {
-          await pruneMissingFolders(saved || [])
+          await pruneMissingFolders(list)
           if (cancelled) return
           // 注意顺序：mergeDesktopScan 内部会把主进程这次扫描回来的共享图标记进
           // sharedFolderIcon，所以「修复空图标」必须排在它后面（数据源先就位）
-          await mergeDesktopScan(saved || [])
+          await mergeDesktopScan(list)
           if (cancelled) return
           repairEmptyFolderIcons()
         } finally {
@@ -1968,7 +2057,21 @@ function App(): React.ReactElement {
   // height = 容器高 - top - bottom（负数）→ 只剩内边距，菜单被压成一条白线。
   const overlayBottomOffset = overlayBottom()
   const overlayTopOffset = overlayTop()
-  const overlayAvail = Math.max(120, BASE_WINDOW_H - (isTop ? overlayTopOffset : overlayBottomOffset) - 8)
+  // 浮层可用高度 = 从贴边锚点外侧到窗口另一侧，再留 8px 边距。
+  //
+  // ⚠️ 这里过去写的是 `BASE_WINDOW_H - offset - 8`，**基准取错了**：
+  //    `overlayBottom()` 返回的是「窗口底边 → 玻璃条顶边 + 8px 贴边间距」，
+  //    所以真实的玻璃条顶边在 `window.innerHeight - overlayBottomOffset + 8`，
+  //    可用高度就是 `window.innerHeight - overlayBottomOffset - 8 + 8` =
+  //    **`window.innerHeight - overlayBottomOffset`**（8px 加一次又减一次抵消）。
+  //    用常量 BASE_WINDOW_H(300) 会与真实 innerHeight 差几像素，而菜单内容本来就贴着上限，
+  //    差这几像素就会把主题选择器推进滚动区（用户得滚动才看得到）。
+  //    ⚠️ 也不能在 render 里读 dockBgRef.getBoundingClientRect()：首帧 ref 还没挂上，
+  //    会回退到兜底值把菜单压到 120px（实测踩过）。从 offset 代数推出最稳。
+  const overlayAvail = Math.max(
+    120,
+    (isTop ? window.innerHeight - overlayTopOffset : window.innerHeight - overlayBottomOffset) - 8
+  )
   const overlayAnchor: React.CSSProperties = isTop
     ? { top: overlayTopOffset, bottom: 'auto', maxHeight: overlayAvail, height: 'auto' }
     : { bottom: overlayBottomOffset, top: 'auto', maxHeight: overlayAvail, height: 'auto' }
@@ -2438,7 +2541,11 @@ function App(): React.ReactElement {
             transform: 'translateX(-50%)'
           }}
         >
-          <button className="dropdown-item" onClick={handleAdd}>
+          {/* 菜单是「可滚动内容」容器（.dropdown-scroll）：整窗只有 300px，
+              菜单可用高度约 200px 而内容约 270px，必须能滚。
+              版本号是滚动内容里的**最后一项**（见文件末尾附近），随内容滚动。 */}
+          <div className="dropdown-scroll">
+            <button className="dropdown-item" onClick={handleAdd}>
             添加快捷方式
           </button>
           <button className="dropdown-item" onClick={handleAddFolder}>
@@ -2507,6 +2614,12 @@ function App(): React.ReactElement {
             >
               白天
             </button>
+          </div>
+          {/* 版本号：作为菜单项的**最后一项**（在滚动区内，紧跟主题选择器之后），纯展示。
+              用户要求「放到上拉菜单菜单项最后面，不要一直显示在下面」——
+              所以它不再是固定页脚，而是滚动内容的最后一行。 */}
+          <div className="dropdown-divider" />
+          <div className="dropdown-version">快捷方式面板 v{appVersion || '—'}</div>
           </div>
         </div>
       )}
