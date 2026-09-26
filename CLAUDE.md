@@ -183,6 +183,25 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     （旧定时器代际不符自动作废，永远只有一个待执行）。**别改成「只在状态变化时才 ++」**
   - ⚠️ 已知取舍：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时会有 ~0.4s 消失再回来 + 提示。
     要消除闪烁得在隐藏前做存在性预检，但对 `shell:` / URL / 裸命令名会误判，风险大于收益，故保留
+- **点图标时「已在运行就激活、否则才启动」（v1.13.5）**：`run-app` 在隐藏 Dock **之前**
+  先调 `tryActivateRunningInstance(targetPath)`，成功就直接返回（不启动新进程）。
+  - **为什么需要它**：`execFile`（CreateProcess）与 `Start-Process`（ShellExecuteEx）对
+    单实例/托盘型应用（微信、QQ 等）**都会新开一个进程**（实测两者各新增 1 个进程）——
+    这**不是**启动方式的问题，换 ShellExecuteEx 修不了，只能主动激活已有窗口
+  - **窗口在哪**：微信收托盘时主窗口是 `title=[微信] class=Qt51514QWindowIcon visible=False`，
+    窗口**还在**、只是隐藏。`ShowWindow(SW_SHOW)` 即可真正显示；但 `SetForegroundWindow`
+    会被 Windows 前台锁拒绝（实测 False），**必须配 `AttachThreadInput`** 挂到当前前台线程才成功
+  - 匹配用**可执行文件路径**（大小写不敏感）而非进程名；跳过无标题窗口与 IME 辅助窗口；
+    **只对「无启动参数的本地 exe」生效**（带参数时用户要的多半是明确的新行为，别替他改语义）
+  - 回归验证：`node .dsh-vision-toolkit/probe/activate-real.cjs`
+    （从**构建产物**里抠出真实 C# 再跑，确认 `ACTIVATED` 且进程数不变）
+  - 🚫🚫 **内嵌的 C# 必须纯 ASCII，一个中文注释都不能有（踩过一次，静默失效）**：
+    `powershell.exe -Command <文本>` 按**系统 ANSI 代码页**（中文 Windows = GBK/936）解码命令行，
+    而我们的脚本文本是 UTF-8。C# 里出现中文注释时，GBK 解码会解错多字节序列、
+    **把注释结尾的 `*/` 吃掉** → 整段源码语法错误 → `Add-Type` 编译失败 →
+    `FindPid` 永远返回 0 → **功能静默失效**（只表现为"没生效"，不报错，极难定位）。
+    ⚠️ 本项目**所有** C# 常量（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `WinZ` / `ACTIVATE_CS`）
+    实测都是 **0 个非 ASCII 字符** —— 这不是巧合，是这条约定在撑着。中文说明写在 TS 那一侧
 - **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色与主题分段选择器统一——`--switch-on-bg`/`--switch-on-knob` 按主题定义：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）
 - **单实例锁**：模块顶层 `app.requestSingleInstanceLock()`——未获得锁直接 `app.quit()`，`whenReady` 开头 `return` 跳过初始化；`second-instance` 事件唤起已有窗口（防止开机自启 + 手动启动出现两个 Dock）
 

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename, extname, dirname } from 'path'
 import { readFileSync, writeFileSync, existsSync, statSync, watch, promises as fsp, type FSWatcher, type Dirent } from 'fs'
-import { execFile, exec } from 'child_process'
+import { execFile, execFileSync, exec } from 'child_process'
 
 
 let mainWindow: BrowserWindow | null = null
@@ -934,6 +934,23 @@ function splitArgs(input: string): string[] {
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
 
+  // ⚠️ 先判断「目标是不是已经在运行」——是的话激活它的窗口，**不要再开一个进程**。
+  // 必须在隐藏 Dock 之前做：这一路是同步的（PowerShell 约 0.3~0.6s），若先隐藏、
+  // 再发现只是激活了已有窗口，用户会看到 Dock 无谓地闪一下。
+  //
+  // 只对「无启动参数的本地 exe」这么做：带参数时用户要的多半是明确的新行为
+  // （例如某些工具用参数开新窗口），不能替他改语义。
+  if (!args && tryActivateRunningInstance(targetPath)) {
+    // 已经是用户想要的那个窗口在前台了。仍然把 Dock 收起来——
+    // 与「启动成功」一致：用户是点图标切过去的，Dock 让出桌面。
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      dockTrayHidden = true
+      sinkSeq++
+      mainWindow.hide()
+    }
+    return true
+  }
+
   // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
   // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 dockTrayHidden
   // 意图状态判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
@@ -1638,6 +1655,143 @@ ipcMain.on('dock-pointer', (_e, inside: boolean) => {
   recoverDock(mainWindow)
   mainWindow.focus()
 })
+
+// ─── 「已在运行的目标 = 激活它的窗口」而不是再开一个（v1.13.5）────────────────
+// 背景：点 Dock 图标是 execFile → CreateProcess，对**单实例/托盘型**应用（微信、
+// QQ、各类 IM）不会去激活已有实例，而是**又开一个进程**。实测（本机微信 4.1）：
+//   execFile        → 新增 1 个进程
+//   Start-Process   → 新增 1 个进程
+// 也就是说这**不是**启动方式的问题（换 ShellExecuteEx 也一样），
+// 必须由我们主动把已有窗口提到前台。
+//
+// 实测可行路径（探针 ActivateProbe.cs 验证）：
+//   ShowWindow(SW_SHOW) 就能让微信那个 `visible=False` 的隐藏主窗口真的显示出来
+//   （持续可见、不被它自己再藏回去）；但 SetForegroundWindow 会被 Windows 前台锁拒绝，
+//   必须配 AttachThreadInput 把我们的线程挂到当前前台线程上才成功。
+//
+// ⚠️⚠️ 下面这段 C# **必须是纯 ASCII，一个中文注释都不能有**（踩过一次，很隐蔽）：
+//   powershell.exe -Command <脚本文本> 是按**系统 ANSI 代码页**解码命令行的（中文 Windows
+//   是 GBK/936），而我们的脚本是 UTF-8。C# 里出现中文注释时，GBK 解码会把多字节序列解错，
+//   把注释的结尾 `*/` 吃掉 → **整段源码语法错误** → Add-Type 编译失败 →
+//   FindPid 永远返回 0，"激活"功能静默失效（表面看只是"没生效"，不报错）。
+//   本项目其它 C# 常量（ICON_EXTRACTOR_CS / DESKTOP_ICONS_CS / WinZ）实测都是 0 个非 ASCII
+//   字符 —— 那不是巧合，是这条约定在撑着。改这里请保持纯 ASCII，说明写在 TS 这一侧。
+const ACTIVATE_CS = `
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class QLActivate
+{
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+    const int SW_SHOW = 5;
+    const int SW_RESTORE = 9;
+
+    // Collect pids whose executable path equals exePath (case-insensitive).
+    // Skip processes whose path cannot be read (access denied / bitness mismatch).
+    public static int FindPid(string exePath)
+    {
+        string want = exePath.ToLowerInvariant();
+        var pids = new HashSet<int>();
+        foreach (var p in Process.GetProcesses())
+        {
+            try {
+                if (!string.Equals(p.MainModule.FileName.ToLowerInvariant(), want, StringComparison.Ordinal)) continue;
+            } catch { continue; }
+            pids.Add(p.Id);
+        }
+        if (pids.Count == 0) return 0;
+
+        int found = 0;
+        EnumWindows((h, l) =>
+        {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (!pids.Contains((int)pid)) return true;
+            var t = new StringBuilder(256); GetWindowText(h, t, 256);
+            var c = new StringBuilder(256); GetClassName(h, c, 256);
+            if (t.Length == 0) return true;
+            // Skip IME / input-method helper windows: they are never the main window
+            if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            found = (int)pid;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    // Show the app's window and bring it to the foreground. Returns false if no window.
+    public static bool Activate(string exePath)
+    {
+        int pid = FindPid(exePath);
+        if (pid == 0) return false;
+        IntPtr target = IntPtr.Zero;
+        EnumWindows((h, l) =>
+        {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if ((int)p != pid) return true;
+            var t = new StringBuilder(256); GetWindowText(h, t, 256);
+            var c = new StringBuilder(256); GetClassName(h, c, 256);
+            if (t.Length == 0) return true;
+            if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            target = h;
+            return false;
+        }, IntPtr.Zero);
+        if (target == IntPtr.Zero) return false;
+
+        // Minimized -> restore; hidden (tray) -> SW_SHOW actually reveals it
+        ShowWindow(target, IsIconic(target) ? SW_RESTORE : SW_SHOW);
+        // Foreground lock: without AttachThreadInput, SetForegroundWindow is refused
+        IntPtr fg = GetForegroundWindow();
+        uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, IntPtr.Zero);
+        uint me = GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+        bool ok;
+        try { ok = SetForegroundWindow(target); }
+        finally { if (attached) AttachThreadInput(me, fgThread, false); }
+        return ok;
+    }
+}
+`
+
+/** 若目标程序的窗口已存在，就把它激活并返回 true（调用方据此跳过启动）。
+ *  只对「看起来是本地可执行文件」的路径尝试：shell: / URL 没有进程可匹配。 */
+function tryActivateRunningInstance(targetPath: string): boolean {
+  if (!/\.(exe|com)$/i.test(targetPath)) return false
+  if (!existsSync(targetPath)) return false
+  try {
+    const escaped = targetPath.replace(/'/g, "''")
+    const out = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -TypeDefinition @'
+${ACTIVATE_CS}
+'@
+if ([QLActivate]::Activate('${escaped}')) { 'ACTIVATED' } else { 'NONE' }`],
+      { encoding: 'utf8', timeout: 4000, windowsHide: true }
+    )
+    const activated = String(out).includes('ACTIVATED')
+    if (activated) console.log('[launcher] 已激活运行中的实例:', targetPath)
+    return activated
+  } catch (err) {
+    // 超时/编译失败都不该影响正常启动：静默回退到「启动新进程」
+    console.log('[launcher] activate probe failed, will launch instead:', err instanceof Error ? err.message : String(err))
+    return false
+  }
+}
 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
 // 只能通过 SetWindowPos 调 Windows API 实现真正沉底。

@@ -347,6 +347,31 @@ npm run package    # 构建并打包为可执行安装包
     Dock 消失约 0.4s 再回来 + 提示。要消除这个闪烁得在隐藏前做存在性预检，
     但那对 `shell:`/URL/裸命令名（PATH 里解析）会误判，风险大于收益，故保留现状
 
+- **㉚ 点图标时不再重复开进程：已在运行的目标改为「激活它的窗口」（v1.13.5，用户反馈）**
+  - **现象**：点 Dock 上的微信图标会**又开一个进程窗口**，而不是切到已经开着的那个
+  - **先排除误判**：写探针（`wechat-launch.cjs`）实测对比两种启动方式，目标都是 `E:\WeChat\Weixin\Weixin.exe`：
+    | 方式 | 结果 |
+    |---|---|
+    | `execFile`（= 应用当时的做法，CreateProcess） | 新增 1 个进程 |
+    | `Start-Process`（= 资源管理器双击，ShellExecuteEx） | 新增 1 个进程 |
+    **两者都新开进程** —— 所以这**不是**启动方式的问题，换 ShellExecuteEx 也修不了。必须由我们主动把已有窗口提到前台
+  - **可行为什么是可能的**（探针 `ActivateProbe.cs` 实测）：微信收在托盘时那个主窗口是
+    `class=Qt51514QWindowIcon title=[微信] visible=False` —— 它**还在**，只是被隐藏了。
+    `ShowWindow(SW_SHOW)` 就能让它真的显示出来（持续可见、不被它自己再藏回去）；
+    但 `SetForegroundWindow` 会被 Windows 前台锁**拒绝**（实测返回 False），
+    必须配 **`AttachThreadInput`** 把我们的线程挂到当前前台线程上才成功
+  - **实现**：`run-app` 在隐藏 Dock **之前**先判断「目标是否已在运行」——
+    是则激活其窗口并直接返回，不启动新进程。匹配用**进程可执行文件路径**（大小写不敏感）而不是进程名；
+    跳过无标题窗口与 IME 辅助窗口；只对「无启动参数的本地 exe」生效（带参数时用户要的多半是明确的新行为，不替他改语义）
+  - **实测**（探针 `activate-real.cjs`，从**构建产物**里抠出真实 C# 再跑）：
+    `ACTIVATED`，且 Weixin 进程数 **1 → 1（没有新增）** ✔
+  - ⚠️⚠️ **踩坑：这段 C# 必须纯 ASCII，中文注释会让它静默失效**。第一版我写了中文注释 →
+    `powershell.exe -Command <文本>` 是按**系统 ANSI 代码页**（中文 Windows = GBK/936）解码命令行的，
+    而脚本是 UTF-8：GBK 解码把多字节序列解错、**把注释结尾的 `*/` 吃掉** → 整段源码语法错误 →
+    Add-Type 编译失败 → `FindPid` 永远返回 0 → 功能静默失效（只表现为"没生效"，不报错，极难查）。
+    实测本项目其它 C# 常量（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `WinZ`）**都是 0 个非 ASCII 字符**
+    —— 那不是巧合，是这条约定在撑着。**新增内嵌 C# 时务必保持纯 ASCII**，说明写在 TS 那一侧
+
 #### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
 
 跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
@@ -370,6 +395,9 @@ npm run package    # 构建并打包为可执行安装包
 | `runapp-timing.cjs` | **`run-app` 返回值时序**：证明原实现 ~1ms 就返回 true、而 ENOENT 要 ~400ms 后才到 |
 | `runapp-fixed.cjs` | 同上，验证修好后 handler 能等到 spawn 结果（false / true 各一例） |
 | `visibility-state.cjs` | **弹出/消失状态机**的 5 个场景（正常回滚 / 用户已唤回 / 第二个应用已启动 / URL 失败 / UAC 取消） |
+| `wechat-launch.cjs` | 实测 `execFile` 与 `Start-Process` 对微信是否新开进程（结论：都会，与启动方式无关） |
+| `ActivateProbe.cs` | 验证「ShowWindow + AttachThreadInput + SetForegroundWindow」能否把托盘里的微信唤出 |
+| `activate-real.cjs` | 从**构建产物**抠出真实 `ACTIVATE_CS` 再跑，确认激活成功且进程数不变 |
 
 #### ⚠️ 探针环境里一个查了很久的坑：`devicePixelRatio` 会漂成 3
 
