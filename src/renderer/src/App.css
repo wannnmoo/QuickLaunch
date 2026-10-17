@@ -1403,8 +1403,9 @@ html[data-glass-fx='off'] .dock-bg::after {
   display: flex;
   align-items: flex-end;
   gap: 4px;
-  /* 顶部 56px 透明放大区 + 图标区上下各 8px（与 .dock-bg 的 76px 玻璃条一致） */
-  padding: 64px 12px 8px;
+  /* 顶部 56px 透明放大区 + 图标区上下各 8px（与 .dock-bg 的 76px 玻璃条一致）；
+     左右 16px 与主 Dock 的内边距对齐，面板打开时两张 Dock 的图标列看起来同一套网格 */
+  padding: 64px 16px 8px;
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
@@ -1515,6 +1516,15 @@ html[data-glass-fx='off'] .dock-bg::after {
   -webkit-backdrop-filter: none;
   border-color: transparent;
   box-shadow: none;
+}
+
+/* 空分组是唯一「只有文字、没有图标」的子 Dock 状态，给一层深色药丸兜底；
+   正常成员靠图标本身 + 标签药丸就够读，不需要整块底。 */
+.app.theme-transparent .group-panel-empty {
+  margin: 0 8px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.55);
 }
 
 /* ─── 分隔符 / 空白占位 ─────────────────────────────────────────────── */

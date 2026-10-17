@@ -316,6 +316,9 @@ function App(): React.ReactElement {
   // 高度固定 —— 所以完全不需要改变窗口尺寸，也就没有透明窗口 resize 的白闪）
   const [openGroupId, setOpenGroupId] = useState<number | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  // 面板水平中心：打开时对齐到「分组图标中心」，而不是永远窗口居中。
+  // 分组靠右时如果面板还在窗口中央，看起来会像跟分组脱节的两块 UI。
+  const [panelLeft, setPanelLeft] = useState<number | null>(null)
   // 面板滚动容器 + 面板内图标的 ref（悬停放大与主 Dock 共用同一套算法）
   const panelInnerRef = useRef<HTMLDivElement>(null)
   const panelIconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
@@ -2238,6 +2241,14 @@ function App(): React.ReactElement {
   const overlayAnchor: React.CSSProperties = isTop
     ? { top: overlayTopOffset, bottom: 'auto', maxHeight: overlayAvail, height: 'auto' }
     : { bottom: overlayBottomOffset, top: 'auto', maxHeight: overlayAvail, height: 'auto' }
+  // 分组面板内的文件夹/盘符卡片要落到面板**上方**（top 布局则在下方），
+  // 否则卡片会从 Dock 条上方弹出来、正好盖住面板成员。面板高 132 + 8 间距。
+  const groupPanelBand = 140
+  const cardOverlayAnchor: React.CSSProperties = openGroup
+    ? isTop
+      ? { top: overlayTopOffset + groupPanelBand, bottom: 'auto', maxHeight: Math.max(120, overlayAvail - groupPanelBand), height: 'auto' }
+      : { bottom: overlayBottomOffset + groupPanelBand, top: 'auto', maxHeight: Math.max(120, overlayAvail - groupPanelBand), height: 'auto' }
+    : overlayAnchor
   // 分组 → 可显示成员（排除分隔线）：分组图标的缩略拼图与数量徽标用它，
   // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大。
   // （面板渲染用的是 openGroupMembers，不需要另建一份含分隔线的表）
@@ -2263,6 +2274,25 @@ function App(): React.ReactElement {
   const viewTopLevel = useMemo(() => topLevel.map(viewOf), [topLevel])
   const viewGroupMembers = useMemo(() => openGroupMembers.map(viewOf), [openGroupMembers])
   const viewOpenGroup = openGroup
+
+  // 面板水平居中到「打开它的分组图标」，而不是永远窗口居中：分组在 Dock 右侧时，
+  // 居中的面板会离分组很远，看起来像两块互不相关的 UI。宽度随成员数变化，
+  // 所以每次打开/成员数变化/换边/换主题都重新量一次，并钳制在窗口内。
+  useLayoutEffect(() => {
+    if (openGroupId === null) {
+      setPanelLeft(null)
+      return
+    }
+    const panel = panelRef.current
+    const icon = iconRefs.current.get(openGroupId)
+    if (!panel || !icon) return
+    const r = icon.getBoundingClientRect()
+    const half = panel.offsetWidth / 2
+    const anchor = r.left + r.width / 2
+    const min = half + 16
+    const max = Math.max(min, window.innerWidth - half - 16)
+    setPanelLeft(Math.min(Math.max(anchor, min), max))
+  }, [openGroupId, viewGroupMembers.length, edge, theme, appsOrderKey])
   const viewCtxApp = ctxApp
 
   return (
@@ -2470,6 +2500,8 @@ function App(): React.ReactElement {
           style={{
             // 两轴都写：.group-panel 的 CSS 兜底 bottom: 154px 若仍生效，只设 top 会把面板压扁
             ...(isTop ? { top: overlayTopOffset, bottom: 'auto' } : { bottom: overlayBottomOffset, top: 'auto' }),
+            // 水平中心对齐分组图标；首帧还没量到时先用 50% 兜底（layout effect 在 paint 前会修正）
+            left: panelLeft ?? '50%',
             // 浮层互斥：右键菜单（z-index 200）与「+」菜单（100）都锚在 Dock 外侧的
             // 同一条带里，而面板是 150——不藏起来就会盖住菜单项、抢走点击。
             // 菜单关闭后同帧显示回来，不会出现重叠空档
@@ -2551,7 +2583,7 @@ function App(): React.ReactElement {
                   <line x1="17.5" y1="13.7" x2="17.5" y2="20.7" />
                 </svg>
                 <span className="es-main">空分组</span>
-                <span className="es-sub">把图标拖到分组图标上即可加入</span>
+                <span className="es-sub">把图标或文件夹拖到分组图标上即可加入</span>
               </div>
             )}
           </div>
@@ -2564,17 +2596,23 @@ function App(): React.ReactElement {
         <div
           className="drives-card"
           style={{
-            ...overlayAnchor,
-            // 浮层互斥：五块浮层（两张卡片 / 「+」菜单 / 右键菜单 / 分组面板）同处 Dock 外侧
-            // 一条带，窗口只有 300px 高叠不开。卡片 z-index 最高（200 > 面板 150 > 菜单 100），
-            // 不做互斥就会盖住菜单项/面板成员并抢走点击
-            visibility: menuPos || contextMenu || openGroup ? 'hidden' : 'visible'
+            ...cardOverlayAnchor,
+            // 与「+」菜单 / 右键菜单互斥；分组面板开着时**不隐藏**——面板里的
+            // 「此电脑」成员也要能弹盘符卡片，卡片已改锚到面板外侧。
+            visibility: menuPos || contextMenu ? 'hidden' : 'visible'
           }}
           onMouseEnter={() => {
-            // 鼠标移进卡片：取消正在计时的关闭/打开，保持展开
+            // 鼠标移进卡片：取消正在计时的关闭/打开，保持展开；也把面板当同一组悬停，
+            // 避免从面板成员移进卡片时 180ms 后面板自己收起、卡片悬空。
             if (drivesCardTimer.current) { clearTimeout(drivesCardTimer.current); drivesCardTimer.current = null }
+            panelHoverRef.current = true
+            cancelPanelAutoClose()
           }}
-          onMouseLeave={closeDrivesCard}
+          onMouseLeave={() => {
+            panelHoverRef.current = false
+            schedulePanelAutoClose()
+            closeDrivesCard()
+          }}
         >
           <div className="drives-card-title">
             此电脑 · 驱动器{driveSummary ? `（可用 ${fmtSize(driveSummary.free)}）` : ''}
@@ -2622,14 +2660,21 @@ function App(): React.ReactElement {
           className="drives-card folder-card"
           style={{
             left: folderCardLeft ?? folderCard.anchorX,
-            ...overlayAnchor,
-            // 与「+」菜单 / 右键菜单 / 分组面板互斥（同一条带，窗口只有 300px 高，叠不开）
-            visibility: menuPos || contextMenu || openGroup ? 'hidden' : 'visible'
+            ...cardOverlayAnchor,
+            // 与「+」菜单 / 右键菜单互斥；分组面板开着时**不隐藏**——面板里的
+            // 文件夹成员也要能弹预览卡片，卡片已改锚到面板外侧。
+            visibility: menuPos || contextMenu ? 'hidden' : 'visible'
           }}
           onMouseEnter={() => {
             if (folderCardTimer.current) { clearTimeout(folderCardTimer.current); folderCardTimer.current = null }
+            panelHoverRef.current = true
+            cancelPanelAutoClose()
           }}
-          onMouseLeave={closeFolderCard}
+          onMouseLeave={() => {
+            panelHoverRef.current = false
+            schedulePanelAutoClose()
+            closeFolderCard()
+          }}
         >
           <div className="folder-card-head">
             <div className="folder-card-title">
