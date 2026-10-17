@@ -802,9 +802,10 @@ function App(): React.ReactElement {
           // 把「此电脑」拖进分组时 `specialType: 'this-pc'` 会跟着进组，于是这个成员在面板里
           // 仍然被当成系统位置渲染（标签被改写成「此电脑 · 可用 …」、图标上还挂一条用量细条），
           // 而它的 targetPath 是 `shell:` 命令、语义上根本不是普通成员。
-          // isFolder 同理：桌面缺失清理与右键菜单会按「文件夹」对待这个其实是系统的条目。
+          // isFolder **要保留**：文件夹进组后仍是文件夹，面板里的悬停预览卡片、右键菜单
+          // （隐藏「以管理员身份运行」等）都依赖这个标记；早前把它一起删掉，导致文件夹
+          // 一进组就退化成普通快捷方式。
           const member: AppEntry = { ...item, groupId: overGroup }
-          delete member.isFolder
           delete member.specialType
           return [...without.slice(0, at), member, ...without.slice(at)]
         }
@@ -1533,7 +1534,7 @@ function App(): React.ReactElement {
       ]
     })
     scrollDockToEndRef.current = true
-    showDropHint('已新建分组：把图标拖到分组图标上即可加入')
+    showDropHint('已新建分组：把图标或文件夹拖到分组图标上即可加入')
   }
 
   // 解散分组：成员回到顶层（保持在原相对位置），分组条目本身移除
