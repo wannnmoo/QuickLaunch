@@ -319,6 +319,7 @@ function App(): React.ReactElement {
   // 面板水平中心：打开时对齐到「分组图标中心」，而不是永远窗口居中。
   // 分组靠右时如果面板还在窗口中央，看起来会像跟分组脱节的两块 UI。
   const [panelLeft, setPanelLeft] = useState<number | null>(null)
+  const [panelWidth, setPanelWidth] = useState(0)
   // 面板滚动容器 + 面板内图标的 ref（悬停放大与主 Dock 共用同一套算法）
   const panelInnerRef = useRef<HTMLDivElement>(null)
   const panelIconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
@@ -2241,13 +2242,37 @@ function App(): React.ReactElement {
   const overlayAnchor: React.CSSProperties = isTop
     ? { top: overlayTopOffset, bottom: 'auto', maxHeight: overlayAvail, height: 'auto' }
     : { bottom: overlayBottomOffset, top: 'auto', maxHeight: overlayAvail, height: 'auto' }
-  // 分组面板内的文件夹/盘符卡片要落到面板**上方**（top 布局则在下方），
-  // 否则卡片会从 Dock 条上方弹出来、正好盖住面板成员。面板高 132 + 8 间距。
-  const groupPanelBand = 140
-  const cardOverlayAnchor: React.CSSProperties = openGroup
-    ? isTop
-      ? { top: overlayTopOffset + groupPanelBand, bottom: 'auto', maxHeight: Math.max(120, overlayAvail - groupPanelBand), height: 'auto' }
-      : { bottom: overlayBottomOffset + groupPanelBand, top: 'auto', maxHeight: Math.max(120, overlayAvail - groupPanelBand), height: 'auto' }
+  // 分组面板内的文件夹/盘符卡片：放到面板**旁边**，而不是面板上方。
+  // 300px 高的窗口里，面板本身占掉 132px，上方只剩十几像素——再往上叠一张
+  // 120px 的卡片必然顶出窗口（实测 top 为负、被裁掉标题）。面板宽度最多
+  // 340 左右，窗口横向空间足够，所以左右择一侧放置，纵向仍与面板同带。
+  const PANEL_CARD_W = 340
+  const panelSideAnchor = (() => {
+    if (!openGroup || panelLeft === null) return null
+    const w = panelWidth || 340
+    const gap = 10
+    const leftCandidate = panelLeft - w / 2 - gap - PANEL_CARD_W
+    const rightCandidate = panelLeft + w / 2 + gap
+    const maxLeft = Math.max(8, window.innerWidth - PANEL_CARD_W - 8)
+    const left = leftCandidate >= 8 ? leftCandidate : rightCandidate
+    return {
+      left: Math.min(Math.max(left, 8), maxLeft),
+      // 两侧都放不下（面板几乎占满窗口）时退回覆盖面板，至少不把卡片裁到窗口外
+      overlay: leftCandidate < 8 && rightCandidate + PANEL_CARD_W > window.innerWidth - 8
+    }
+  })()
+  const cardOverlayAnchor: React.CSSProperties = panelSideAnchor
+    ? {
+        left: panelSideAnchor.left,
+        right: 'auto',
+        transform: 'none',
+        width: PANEL_CARD_W,
+        top: isTop ? overlayTopOffset : 'auto',
+        bottom: isTop ? 'auto' : overlayBottomOffset,
+        maxHeight: overlayAvail,
+        height: 'auto',
+        zIndex: panelSideAnchor.overlay ? 260 : undefined
+      }
     : overlayAnchor
   // 分组 → 可显示成员（排除分隔线）：分组图标的缩略拼图与数量徽标用它，
   // 否则分隔线会占掉一个拼图格子（空破图）并让计数偏大。
@@ -2287,7 +2312,9 @@ function App(): React.ReactElement {
     const icon = iconRefs.current.get(openGroupId)
     if (!panel || !icon) return
     const r = icon.getBoundingClientRect()
-    const half = panel.offsetWidth / 2
+    const width = panel.offsetWidth
+    setPanelWidth(width)
+    const half = width / 2
     const anchor = r.left + r.width / 2
     const min = half + 16
     const max = Math.max(min, window.innerWidth - half - 16)
@@ -2425,7 +2452,7 @@ function App(): React.ReactElement {
                           }
                           return (
                             <div className={'dock-group-preview' + (members.length === 1 ? ' single' : '')}>
-                              {members.slice(0, 4).map((m) => (
+                              {members.slice(0, 3).map((m) => (
                                 <img key={m.id} src={m.iconDataUrl} alt="" draggable={false} />
                               ))}
                             </div>
@@ -2434,7 +2461,7 @@ function App(): React.ReactElement {
                       ) : (
                         <img className="dock-icon" src={app.iconDataUrl} alt="" draggable={false} />
                       )}
-                      {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 0 && (
+                      {app.isGroup && (groupIconMembersById.get(app.id)?.length ?? 0) > 1 && (
                         <span className="dock-badge">{groupIconMembersById.get(app.id)!.length}</span>
                       )}
                       {/* 「此电脑」：所有盘符的汇总用量细条（贴在图标框底部内侧） */}

@@ -1228,17 +1228,16 @@ html[data-glass-fx='off'] .dock-bg::after {
   background: transparent;
 }
 
-/* 分组图标预览：组内前 4 个成员的缩略图，做成**层叠卡片**（v1.13.2 重做）。
+/* 分组图标预览：组内前 3 个成员的缩略图 + 右下角数量徽标，做成**层叠卡片**。
    设计意图与几何约束（改这块必看）：
-   ① 徽标 `.dock-badge` 是 16×16 锚在图标框右下角（占 `(44,44)..(60,60)`）——
-      所以**第 4 张卡不能占满右下角**。旧版是 54×54 铺满图标框的 2×2 网格，
-      4 成员时第 4 张正好落在那个角上，实测被盖住 **25%**（169/676 px²），
-      看起来就像组里少了一块（用户反馈的就是这个）。
-   ② 卡片走**向右下阶梯**：每张依次 +20/+22 px，既保留「一叠东西」的厚叠观感，
-      又让 4 张都能辨认（试过纯旋转堆叠，44px 下糊成一坨、认不出成员）。
-   ③ 第 4 张落在 (20,20)..(42,42)，右下角距徽标左/上沿 (44,44) 留 2px —— 实测重叠 0 px²。
-   ④ 成员不足 4 个时只渲染有的那几张，位置固定（不重排），所以 2 个成员时是
+   ① 徽标 `.dock-badge` 现在占 2×2 拼图的右下格（20×20，right/bottom 4px），
+      所以**只渲染 3 张缩略图**：4 张图 + 徽标挤在 60px 图标里，右下角必然
+      重叠/发糊（旧版实测盖住 25%，用户反馈「挤到左上」）。
+   ② 卡片走**向右下阶梯**：1 左上、2 右上、3 左下，右下留给徽标；
+      既保留「一叠东西」的厚叠观感，又让 3 张都能辨认。
+   ③ 成员不足 4 个时只渲染有的那几张，位置固定（不重排），所以 2 个成员时是
       「左上 + 右上」，3 个成员时是「上排两个 + 左下」，看起来仍然是同一叠。
+   ④ 单成员仍走 `.single` 大图；此时徽标隐藏（数量 1 没有信息量）。
    ⚠️ 卡片用**绝对定位**，不能用 flex 排（`.dock-icon-wrap` 是 flex + center，
       会把它们居中；而且阶梯 offsets 本身也不适合流式布局）。 */
 .dock-group-preview {
@@ -1268,12 +1267,12 @@ html[data-glass-fx='off'] .dock-bg::after {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
-/* 阶梯：1 左上 → 2 右上(略微上提) → 3 左下 → 4 右下(最前，最后渲染故在最上层)。
-   第 4 张收在 (19,19)..(41,41)，右下角距徽标 (44,44) 留 3px —— 实测残留重叠 0 px² */
+/* 阶梯：1 左上 → 2 右上(略微上提) → 3 左下。
+   第 4 个格子留给右下角的数量徽标（见 .dock-badge）：不再塞第 4 张缩略图，
+   否则 4 张 22px 图 + 16px 徽标会把右下角挤成一团。 */
 .dock-group-preview img:nth-child(1) { left: 2px; top: 2px; }
 .dock-group-preview img:nth-child(2) { left: 22px; top: 0; }
 .dock-group-preview img:nth-child(3) { left: 0; top: 22px; }
-.dock-group-preview img:nth-child(4) { left: 18px; top: 18px; }
 
 /* 单成员：一张大图。40px 居中会与徽标相切（实测重叠 25~36px²），
    所以同样避让到徽标左上沿 (44,44) 之内：36px 放在 (2,2) → 占 2..38，留足余量 */
@@ -1289,21 +1288,21 @@ html[data-glass-fx='off'] .dock-bg::after {
   height: 36px;
 }
 
-/* 成员数量徽标（贴在图标框内侧：bottom/right 用 0 —— 负值会被滚动容器的
-   overflow: hidden 裁掉下沿）。拼图已为它让出右下角 16×16（见 .dock-group-preview）。
-   加一圈与玻璃同色的外描边：徽标可能压在图标/壁纸的任意颜色上，纯色药丸贴上去边界会糊。 */
+/* 成员数量徽标：占据 2×2 拼图的右下格。
+   4/4 起不再把第 4 张缩略图塞在徽标下面，徽标因此有独立的 20×20 空间；
+   两/三位数时宽度自然撑开，但右下锚点不变。 */
 .dock-badge {
   position: absolute;
-  right: 0;
-  bottom: 0;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
+  right: 4px;
+  bottom: 4px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
   border-radius: 999px;
   background: #3a7bd5;
   color: #fff;
-  font-size: 10px;
-  line-height: 16px;
+  font-size: 10.5px;
+  line-height: 20px;
   font-weight: 600;
   text-align: center;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 1.5px var(--label-pill-bg);
