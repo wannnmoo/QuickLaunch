@@ -1506,14 +1506,15 @@ html[data-glass-fx='off'] .dock-bg::after {
   }
 }
 
-/* 透明主题：子 Dock 面板同样需要可读底衬。全透明时白色标签落在白色壁纸上
-   会看不见，因此给一层半透明深色底（与悬停卡片同色系），仍然透出桌面。 */
+/* 透明主题：子 Dock 与主 Dock 保持一致——全透明，不加深色底。
+   成员标签自带 --label-pill-bg 深色药丸，白壁纸上仍能读；
+   只有文字密集的文件夹/盘符预览卡片才需要深色底衬。 */
 .app.theme-transparent .group-panel-bg {
-  background: rgba(16, 20, 28, 0.78);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border-color: rgba(255, 255, 255, 0.16);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  background: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 /* ─── 分隔符 / 空白占位 ─────────────────────────────────────────────── */
