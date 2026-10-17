@@ -7,11 +7,25 @@
 }
 
 :focus-visible {
-  outline: none;
+  /* 可访问焦点：原来全站 outline:none，键盘 Tab 完全看不到焦点。
+     2px 亮蓝 + 2px offset 在深/浅/透明三种主题与毛玻璃上都有足够对比度。 */
+  outline: 2px solid rgba(96, 165, 238, 0.9);
+  outline-offset: 2px;
 }
 
 ::selection {
   background: transparent;
+}
+
+/* 菜单项的基础规则里写了 outline:none（压掉 UA 焦点框），其 specificity 与
+   :focus-visible 相同但源序在后，会把上面的焦点框盖掉；这里用更高 specificity
+   （类 + 伪类）补回。菜单项位于 .dropdown-scroll / .context-menu-scroll（overflow:auto）
+   里，正 offset 在滚动区上下边缘会被裁掉，所以改用负 offset 把焦点框画在胶囊内侧。 */
+.dropdown-item:focus-visible,
+.context-menu-item:focus-visible,
+.theme-seg-btn:focus-visible {
+  outline: 2px solid rgba(96, 165, 238, 0.9);
+  outline-offset: -2px;
 }
 
 html, body {
@@ -272,10 +286,11 @@ button, input, select, textarea {
     linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%) padding-box;
   backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
   -webkit-backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
-  /* 描边颜色交给上面的渐变层渲染，透明边框只用来占位（1px 的绘制区域）。
-     悬停时 .dock:hover .dock-bg 仍可整体换掉 border-color，但被渐变层盖住——
-     平色留给 .dock-bg 的 border-color 兜底与将来取消渐变时复用 */
-  border-color: transparent;
+  /* 描边颜色交给上面的渐变层渲染，但这个透明边框**必须有宽度和样式**：
+     没有 border-width 时 border 盒等于 padding 盒，① 的渐变会铺满整个玻璃面
+     （暗色被 50% 白→12% 白洗淡、亮色上白下灰），②③ 也被垫在下面。
+     悬停时 .dock:hover .dock-bg 换掉的 border-color 画在渐变之上，形成 1px 实色高亮。 */
+  border: 1px solid transparent;
   border-radius: 24px;
   box-shadow: var(--dock-shadow);
   transition: border-color 0.2s, box-shadow 0.2s;
@@ -350,11 +365,12 @@ html[data-glass-fx='off'] .dock-bg::after {
      **左侧那半永远滚不到**（实测 31 个图标时第一个「此电脑」停在 x=−390，
      `scrollLeft` 已是 0 也拉不回来；更隐蔽的是 `scrollWidth` 只有 1582 而实际内容
      是 2012 —— 浏览器根本没把左侧溢出算进可滚动区，所以连"滚到底"都到不了最前面）。
-     纵向位置改由 **padding-top 82 + padding-bottom 8** 决定：`.dock-inner` 被
-     `height: 100%` 撑到 158，内容盒 = 158 − 82 − 8 = 68，衬底 60 从内容盒顶部开始
-     排布 → 落在 bar 内的 82..142；而玻璃条是 82..158（高 76），于是衬底在玻璃内上下各 8px。
-     `align-items: center` 保留：`flex-direction: row` 下它管**横轴**，让每个图标在自己
-     的 60px 轨道里横向居中（图标 44px 在衬底 60px 内居中）。 */
+     纵向位置改由 **padding-top 82 + padding-bottom 0 + align-items:center** 决定：
+     `.dock-inner` 被 `height: 100%` 撑到 158，内容盒 = 158 − 82 = 76，60px 衬底在
+     76px 内容盒里居中 → 落在 bar 内的 90..150；玻璃条是 82..158（高 76），
+     于是衬底在玻璃内上下各 8px。
+     `align-items: center` 保留：`flex-direction: row` 下它是**交叉轴（纵向）**，把每个
+     60px 衬底在 76px 内容盒里纵向居中（衬底内部再用自己的 flex 居中 44px 图标）。 */
   align-items: center;
   gap: 4px;
   /* 图标放不下时横向滚动查看。上方 82px 为透明放大区：hover 放大（1.4× + 8px 上浮）
@@ -529,7 +545,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 /* macOS 式悬停标签：绝对定位悬浮在图标上方（不再占用图标下方的布局行，
-   玻璃条紧凑贴合图标，下方不留空白）；默认隐藏，悬停淡入；显示完整名称不截断 */
+   玻璃条紧凑贴合图标，下方不留空白）；默认隐藏，悬停淡入；常规名称完整显示，
+   超长名称在 min(240px, 60vw) 处省略（见下方 max-width） */
 .dock-label {
   position: absolute;
   bottom: calc(100% + 4px);
@@ -542,6 +559,11 @@ html[data-glass-fx='off'] .dock-bg::after {
   font-weight: 500;
   letter-spacing: 0.02em;
   color: var(--label-color);
+  /* 超长名称（文件夹全路径/网页标题）不再无限横跨：给药丸封顶后省略，
+     否则一条标签能盖住两边几个图标；普通名称（≤240px）仍完整显示。 */
+  max-width: min(240px, 60vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;
   pointer-events: none;
@@ -850,16 +872,19 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* ─── 菜单滚动条：隐藏 ──────────────────────────────────────────────────── */
 /* 滚动条滑块是接近满高的竖条，其方角会盖住菜单右上/右下角的圆角，右边缘看起来
    就成了直角；且原生滚动条与毛玻璃界面格格不入。直接隐藏（与 .dock-inner 横向
-   滚动一致）——菜单超出时用滚轮/触控板滚动，四个角始终保持 16px 圆角。 */
+   滚动一致）——菜单超出时用滚轮/触控板滚动，四个角始终保持 16px 圆角。
+   右键菜单改两段式后滚动发生在 .context-menu-scroll 上，规则一并覆盖。 */
 
 .dropdown-scroll::-webkit-scrollbar,
-.context-menu::-webkit-scrollbar {
+.context-menu::-webkit-scrollbar,
+.context-menu-scroll::-webkit-scrollbar {
   display: none;
 }
 
 /* Firefox（Electron 用 Chromium，此处仅防御性兼容） */
 .dropdown-scroll,
-.context-menu {
+.context-menu,
+.context-menu-scroll {
   scrollbar-width: none;
 }
 
@@ -879,8 +904,40 @@ html[data-glass-fx='off'] .dock-bg::after {
   z-index: 200;
   box-shadow: var(--menu-shadow);
   overflow: hidden;
-  overflow-y: auto; /* 向上弹出 + maxHeight 钳制：空间不足时内部滚动（与下拉菜单一致） */
+  /* 两段式：滚动交给 .context-menu-scroll，底部 .context-menu-footer 常驻——
+     空间不足时「删除」也永远可见，不会被滚出 200px 的可用高度 */
+  display: flex;
+  flex-direction: column;
   animation: context-in 0.14s ease-out;
+}
+
+.context-menu-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 滚动条由上面的「菜单滚动条：隐藏」规则统一隐藏（避免方角盖住 16px 圆角），
+     可滚动性由 footer 上沿的投影提示 */
+}
+
+.context-menu-footer {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* 只有滚动区存在时才画分隔线 / 提示投影：分隔线条目自己的菜单里 footer 是唯一内容，
+   不画线、也不留额外 padding，否则菜单顶部会凭空多一条横线 */
+.context-menu-scroll + .context-menu-footer {
+  border-top: 1px solid var(--divider-bg);
+  padding-top: 4px;
+  /* footer 上方的极轻投影：滚动区还有内容时提示「下面还有」；不遮文字 */
+  box-shadow: 0 -10px 14px -12px rgba(0, 0, 0, 0.55);
+}
+
+/* 普通条目分支在滚动区末尾还留了一条分隔线，而 footer 自带 border-top，
+   滚到底时会并排出现两条线 → 隐藏滚动区的最后一条（footer 那条保留） */
+.context-menu-scroll > .context-menu-divider:last-child {
+  display: none;
 }
 
 .context-menu-item {
@@ -945,6 +1002,12 @@ html[data-glass-fx='off'] .dock-bg::after {
   border-color: #3a7bd5;
 }
 
+/* 全局 ::selection 是 transparent（拖图标时不要出现蓝色选区），
+   但编辑框里必须看得见选中文字，否则全选/拖选像没选中 */
+.edit-input::selection {
+  background: rgba(58, 123, 213, 0.45);
+}
+
 .edit-actions {
   display: flex;
   gap: 4px;
@@ -1001,8 +1064,10 @@ html[data-glass-fx='off'] .dock-bg::after {
   --add-btn-hover-color: #fff;
   /* 透明风格本来就是「没有玻璃」：瓷砖不参与，`.dock-item:hover .dock-icon-wrap`
      里那条常驻冷色辉光也要一起关掉，否则图标会拖着一团蓝雾 */
-  --add-btn-bg: transparent;
-  --add-btn-hover-bg: transparent;
+  /* 加号在浅色壁纸上没有底衬会直接消失；给一层中性深色底（不是玻璃，只是
+     保证可见的对比底），深浅壁纸都能看见。 */
+  --add-btn-bg: rgba(0, 0, 0, 0.42);
+  --add-btn-hover-bg: rgba(0, 0, 0, 0.58);
   /* 菜单文字近黑（浅色壁纸上最清晰），悬停/分隔线同步浅色系；
      深色壁纸下靠白色光晕托住黑字 */
   --menu-text: #1f2430;
@@ -1012,9 +1077,17 @@ html[data-glass-fx='off'] .dock-bg::after {
   --divider-bg: rgba(0, 0, 0, 0.15);
   /* 透明：与近黑菜单文字同色系，靠 --menu-meta 稍微弱一点 */
   --menu-meta: rgba(31, 36, 48, 0.55);
-  --label-pill-bg: rgba(0, 0, 0, 0.30); /* 透明：中性深灰药丸衬底（悬停显示标签） */
+  /* 透明：深色药丸衬底。30% 在白色壁纸上只有中灰，白字对比不足；
+     提高到 62%，同时仍然保留「悬浮在桌面上」的观感。 */
+  --label-pill-bg: rgba(0, 0, 0, 0.62);
+  /* 白色文字在深色药丸/深色卡片上要足够亮；深色主题的 62% 白在浅壁纸+
+     半透明底上仍偏灰，这里直接给纯白（副行再用各自的 opacity 降级）。 */
+  --label-color: #fff;
   --switch-on-bg: rgba(0, 0, 0, 0.75); /* 透明：深色轨道（与近黑菜单文字统一） */
   --switch-on-knob: #fff;
+  /* 关闭态轨道：暗色主题的 22% 白在浅壁纸上几乎看不见（白球也融进去）；
+     透明主题没有玻璃底，改用 28% 黑，浅壁纸上仍是一个可辨认的深色胶囊 */
+  --switch-off-bg: rgba(0, 0, 0, 0.28);
   /* 透明白菜单背景与 Dock 解耦（--menu-bg 不再引用 --dock-bg-*） */
   --menu-bg: transparent;
   --menu-border: transparent;
@@ -1100,49 +1173,40 @@ html[data-glass-fx='off'] .dock-bg::after {
         在字形背后画一圈实心描边，**完全没有模糊**，边缘锐利，缩到 11px 也清楚。
    `paint-order: stroke fill` 是关键：默认描边压在填充之上会把字吃细（发白/发糊），
    改成先描边后填充，描边就完整地垫在字形底下。 */
-.app.theme-transparent .dock-label,
-.app.theme-transparent .drop-hint,
+/* 白色填充的文字（Dock 标签、文件夹/盘符卡片、空态）不能再用白描边：
+   描边骑在字形轮廓上，会把白色笔画整体加粗，11~13px 的汉字尤其容易糊成一团
+   （用户反馈「透明模式字体有点粗、笔画挤在一起」）。白色文字改用深色投影托底：
+   深色壁纸上几乎不可见，浅色壁纸上反而能形成清晰的暗轮廓，也不会改变笔画粗细。
+   只有下面这组**近黑文字**（菜单/编辑表单）才需要白色描边来在深色壁纸上立住。 */
 .app.theme-transparent .dropdown-item,
 .app.theme-transparent .dropdown-version,
 .app.theme-transparent .context-menu-item,
-.app.theme-transparent .edit-label,
-.app.theme-transparent .drives-card,
-.app.theme-transparent .folder-card,
-.app.theme-transparent .group-panel-empty {
+.app.theme-transparent .theme-seg-btn,
+.app.theme-transparent .edit-label {
   /* 0.65px 是实测的平衡点：0.5 以下笔画开始缺、0.8 以上字形被描边吃掉显虚发粗
      （描边是骑在字形轮廓上画的，越粗笔画越细） */
   -webkit-text-stroke: 0.65px rgba(255, 255, 255, 0.92);
   paint-order: stroke fill;
 }
 
-/* 小字号（卡片副行、文件大小、面板空态）再收一档：
-   同样 0.65px 压在 11px 的字上会显粗，把笔画挤细反而更难读 */
-.app.theme-transparent .folder-card-path,
-.app.theme-transparent .folder-row-meta,
-.app.theme-transparent .folder-card-sub,
-.app.theme-transparent .folder-card-more,
-.app.theme-transparent .drives-card-title,
-.app.theme-transparent .drive-nums {
-  -webkit-text-stroke-width: 0.5px;
-}
-/* 描边会随 color 一起继承给内联 SVG 图标（空态图标、加载转圈、加号）：
-   图标本身是 currentColor 细描边（1.7px），再叠 0.65px 白描边会整体变粗发糊；
-   加号本来就有双层深投影，叠白边后更明显。这里在图标上把描边整个清掉。 */
-.app.theme-transparent .drives-empty svg,
-.app.theme-transparent .folder-loading svg,
-.app.theme-transparent .group-panel-empty svg,
-.app.theme-transparent .dock-add-btn svg {
-  -webkit-text-stroke: 0;
+/* 未选中段位在透明主题里没有玻璃底托着，基础 .5 太淡；提高一档，
+   active（1）与 hover（.86）不受影响。 */
+.app.theme-transparent .theme-seg-btn:not(.active) {
+  opacity: 0.72;
 }
 
-/* 透明模式不需要任何投影：轮廓已经由白色描边保证。这里覆盖两个残留来源——
-   ① 基础 .dock-label 自带的深色投影（那是给黑夜/白天毛玻璃用的，压在壁纸上只会脏）；
-   ② `.dock-item:hover .dock-label` 在 hover 时叠加的一层（不压掉的话悬停反而更糊）。 */
-.app.theme-transparent .dock-label,
-.app.theme-transparent .dock-item:hover .dock-label,
-.app.theme-transparent .drop-hint,
+.app.theme-transparent .theme-seg-btn:not(.active):hover {
+  opacity: 0.86;
+}
+
+/* 透明模式下白色文字不再使用白描边，改由深色投影托底：
+   Dock 标签/拖放提示沿用基础规则里的深色投影（本块原先把它们压成 none，
+   现在直接不再覆盖）；文件夹/盘符卡片与空态是浮层，单独补一层轻投影。
+   深色壁纸上投影几乎不可见，浅色壁纸上形成暗轮廓，且不会改变笔画粗细。 */
+.app.theme-transparent .folder-card,
+.app.theme-transparent .drives-card,
 .app.theme-transparent .group-panel-empty {
-  text-shadow: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
 /* 编辑输入框浅色底 + 深色文字（与菜单黑字风格一致） */
@@ -1150,7 +1214,7 @@ html[data-glass-fx='off'] .dock-bg::after {
   background: rgba(255, 255, 255, 0.6);
   color: #1f2430;
 }
-/* 透明风格的标签底衬（--label-pill-bg: rgba(0,0,0,0.30)）已在上方变量块定义；
+/* 透明风格的标签底衬（--label-pill-bg: rgba(0,0,0,0.62)）已在上方变量块定义；
    悬停显示/淡入由基础 .dock-label 规则统一处理（三主题一致） */
 
 /* ─── 分组（Stack）──────────────────────────────────────────────────── */
@@ -1288,6 +1352,9 @@ html[data-glass-fx='off'] .dock-bg::after {
 .dock-item.selected .dock-icon-wrap::before {
   left: 3px;
   border-radius: 3px 1px 1px 3px;
+  /* 基础 .dock-icon-wrap::before 是悬停镜面层（opacity:0），只有 :hover 会置 1；
+     键盘选中时鼠标不在图标上，不显式覆盖就只剩右竖框 */
+  opacity: 1;
 }
 
 .dock-item.drop-target .dock-icon-wrap::after,
@@ -1309,7 +1376,9 @@ html[data-glass-fx='off'] .dock-bg::after {
   bottom: 154px;
   z-index: 150;
   width: max-content;
-  max-width: calc(100vw - 32px);
+  /* 与 .dock-bar 用同一个视口宽度变量：本窗口 innerWidth 比 100vw 小 2px，
+     用 100vw 会让面板比可用区宽 2px（贴边时被窗口裁掉） */
+  max-width: calc(var(--dock-vw, 100vw) - 32px);
 }
 
 /* 玻璃底：只覆盖图标区（顶部 56px 是透明区，供悬停放大 + 悬浮标签顶出） */
@@ -1437,13 +1506,14 @@ html[data-glass-fx='off'] .dock-bg::after {
   }
 }
 
-/* 透明主题：面板同步全透明（与下拉/右键菜单一致） */
+/* 透明主题：子 Dock 面板同样需要可读底衬。全透明时白色标签落在白色壁纸上
+   会看不见，因此给一层半透明深色底（与悬停卡片同色系），仍然透出桌面。 */
 .app.theme-transparent .group-panel-bg {
-  background: transparent;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  border-color: transparent;
-  box-shadow: none;
+  background: rgba(16, 20, 28, 0.78);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
 
 /* ─── 分隔符 / 空白占位 ─────────────────────────────────────────────── */
@@ -1586,13 +1656,15 @@ html[data-glass-fx='off'] .dock-bg::after {
   transition: width 0.2s;
 }
 
-/* 透明风格：卡片同步全透明（与菜单一致） */
+/* 透明风格：卡片不能全透明。白色文字压在白色壁纸/白色文档上会完全看不见，
+   给一层半透明深色底 + 轻毛玻璃：浅色壁纸上文字清晰，深色壁纸上仍能透出背景。
+   这是可读性兜底，不是把透明主题变回毛玻璃——只在悬停卡片这种「必须读字」的浮层上使用。 */
 .app.theme-transparent .drives-card {
-  background: transparent;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  border-color: transparent;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  background: rgba(16, 20, 28, 0.78);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
 
 /* ─── 文件夹悬停预览卡片 ────────────────────────────────────────────── */
@@ -1748,7 +1820,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 .drop-hint {
   position: fixed;
   left: 50%;
-  bottom: 168px; /* Dock 高 158px，留 10px 间隙（v1.13.1：Dock 由 146 改为 158） */
+  bottom: 168px; /* 实测间隙 2px：窗口 300 − 168 = hint 底 132；Dock 高 158 + 窗口下 padding 8 → bar 顶 134 */
   transform: translateX(-50%);
   z-index: 200;
   padding: 6px 14px;
@@ -1788,8 +1860,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .app[data-edge='top'] .dock-inner {
   padding: 0 16px 82px; /* 透明放大区从上改到下（镜像 padding-top: 82px） */
-  /* 纵向居中由基础规则的 justify-content: center 负责，这里只需恢复横轴居中
-     （`align-items` 在 column 方向是横轴；写 flex-start 会让图标靠左） */
+  /* 纵向居中由基础规则的 align-items:center（row 的交叉轴）负责；这里只镜像 padding。
+     绝对不能写 justify-content（基础规则 347-352 已说明它会破坏横向滚动的左侧可滚区） */
   align-items: center;
 }
 

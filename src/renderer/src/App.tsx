@@ -319,6 +319,13 @@ function App(): React.ReactElement {
   // 面板滚动容器 + 面板内图标的 ref（悬停放大与主 Dock 共用同一套算法）
   const panelInnerRef = useRef<HTMLDivElement>(null)
   const panelIconRefs = useRef<Map<number, HTMLDivElement>>(new Map())
+  // 子 Dock 的 hover 自动收起：面板本身与「打开它的分组图标」各记一个 hover 标记，
+  // 指针从任一侧移出后给 180ms 宽限（从图标移到面板、或反过来时跨过中间空隙），
+  // 两边都不在 hover 才真正收起。键盘打开时指针从未进入，两个标记都是 false 且
+  // 不会排定时器，所以键盘导航不会被自动收起打断。
+  const panelHoverRef = useRef(false)
+  const groupHoverRef = useRef(false)
+  const panelAutoCloseTimerRef = useRef<number | null>(null)
   // 新建分组后需要把 Dock 横向滚到末尾（待 apps 渲染完再执行）
   const scrollDockToEndRef = useRef(false)
 
@@ -353,7 +360,12 @@ function App(): React.ReactElement {
     if (folderCardTimer.current) clearTimeout(folderCardTimer.current)
     // 悬停即预取：鼠标刚碰到图标就开始列目录 + 提首批图标（主进程会缓存 5s，
     // 并对着同一目录的在途请求做去重），300ms 后卡片弹出时直接命中缓存
-    window.api.listFolder(app.targetPath).catch(() => {})
+    // 预取失败不弹错误提示（300ms 后真正弹卡时还会再取一次），但要把**同目录**可能开着的
+    // 卡片关掉——否则它停在 spinner 上再也不会自己恢复（别的目录的卡片不动）
+    window.api.listFolder(app.targetPath).catch(() => {
+      setFolderCard((prev) =>
+        (prev && normPath(prev.path) === normPath(app.targetPath) ? null : prev))
+    })
     folderCardTimer.current = setTimeout(() => {
       folderCardTimer.current = null
       // 拖拽/拖入进行中不弹卡片（会挡住落点指示线）
@@ -372,7 +384,13 @@ function App(): React.ReactElement {
       window.api.listFolder(fresh.targetPath)
         .then((data) => setFolderCard((prev) =>
           (prev && normPath(prev.path) === same ? { ...prev, data } : prev)))
-        .catch(() => {})
+        // ⚠️ 失败必须把卡片关掉：listFolder 失败时 state 里的 data 永远是 null，
+        //    卡片会永久停在「读取中…」的骨架屏上（没有错误态、也没有超时），
+        //    用户看到的是「悬停一下就卡住了」。关闭比留一个假 spinner 好。
+        .catch((err) => {
+          console.error('[folder-card] listFolder failed:', err)
+          setFolderCard((prev) => (prev && normPath(prev.path) === same ? null : prev))
+        })
     }, 300)
   }, [])
 
@@ -652,16 +670,18 @@ function App(): React.ReactElement {
   }, [])
 
   // 横向滚动边界状态（两端渐隐提示）：拖拽自动滚动与键盘导航都会用到，故声明在此处
+  // ⚠️ 状态没变必须**原样返回 prev**：拖拽自动滚动时 rAF 每帧都调这里，
+  //    每帧新建一个 {left, right} 会让整个 App（全部图标 + 面板成员 + 分组拼图）
+  //    重渲染一次——这是「贴边拖拽时掉帧」的来源之一。
   const updateScrollState = useCallback(() => {
     const el = dockInnerRef.current
     if (!el) {
-      setScrollState({ left: false, right: false })
+      setScrollState((prev) => (prev.left === false && prev.right === false ? prev : { left: false, right: false }))
       return
     }
-    setScrollState({
-      left: el.scrollLeft > 1,
-      right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1
-    })
+    const left = el.scrollLeft > 1
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1
+    setScrollState((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
   }, [])
 
   // ─── 拖拽到两端自动滚动 ───────────────────────────────────────────────
@@ -1118,6 +1138,10 @@ function App(): React.ReactElement {
   const handleDockDrop = async (e: React.DragEvent) => {
     if (!isFileDragEvent(e)) return
     e.preventDefault()
+    // ⚠️ 落点坐标必须在 await 之前拍下来：① React 合成事件在 await 之后可能已被回收
+    //    （event pooling / 复用的 target），再去读 e.clientX 不可靠；② await 期间列表
+    //    可能变化（拖拽重排、桌面同步），所以下标也要等拿到结果后再算一次。
+    const dropClientX = e.clientX
     // 兜底：只接受落在玻璃条本体上的拖放（见 document 级 dragover 里那段说明）。
     // .dock 占满整窗，不加这道判断时图标少、条很窄，旁边大片透明区也能"接住"文件。
     const bar = dockBarRef.current
@@ -1128,7 +1152,6 @@ function App(): React.ReactElement {
       stopEdgeScroll()
       return
     }
-    const at = calcDropIndex(e.clientX)
     fileDragOverRef.current = false
     setFileDragOver(false)
     setDropIdx(null)
@@ -1148,6 +1171,10 @@ function App(): React.ReactElement {
       showDropHint('解析失败，未添加')
       return
     }
+
+    // 解析耗时（exe 要起一次 PowerShell 取描述与图标）之后才换算落点：
+    // 用开头拍下的 clientX，而不是 await 后的事件对象
+    const at = calcDropIndex(dropClientX)
 
     // 去重：已在 Dock 里的路径跳过（系统位置的 shell: 命令同样参与比较）
     const known = new Set(apps.map((a) => normPath(a.targetPath)))
@@ -1195,6 +1222,11 @@ function App(): React.ReactElement {
     }
     const btn = addBtnRef.current
     if (!btn) return
+    // 浮层互斥：右键菜单（z-index 200）与分组面板（150）都比本菜单（100）高，
+    // 且锚在同一条带里——不先关掉，菜单会被它们盖住、点不到也看不到。
+    // 另外 handleDocumentMouseDown 里点「+」是 early-return 的，不会替我们关右键菜单。
+    setContextMenu(null)
+    setOpenGroupId(null)
     const rect = btn.getBoundingClientRect()
     setMenuPos({ cx: rect.left + rect.width / 2, top: rect.top })
     // 菜单打开时退出键盘导航（与右键菜单同理）：否则选中框被菜单盖住，
@@ -1209,7 +1241,7 @@ function App(): React.ReactElement {
       if (typeof v === 'boolean' && !desktopIconsDirtyRef.current) setDesktopIconsHidden(v)
     }).catch(() => {})
     window.api.getAutoStart().then((v) => {
-      if (!autoStartDirtyRef.current) setAutoStart(v)
+      if (typeof v === 'boolean' && !autoStartDirtyRef.current) setAutoStart(v)
     }).catch(() => {})
   }, [menuPos])
 
@@ -1276,7 +1308,9 @@ function App(): React.ReactElement {
     window.api
       .setAutoStart(target)
       .then((next) => {
-        if (next !== target) setAutoStart(next)
+        // 与 handleToggleDesktopIcons 同一条铁律：只在拿到**明确布尔值**时才校正。
+        // 非布尔（undefined/异常分支）保留乐观值，否则开关会渲染成「关」而实际是开
+        if (typeof next === 'boolean' && next !== target) setAutoStart(next)
       })
       .catch((err) => {
         console.error('[auto-start] toggle failed:', err)
@@ -1326,18 +1360,42 @@ function App(): React.ReactElement {
 
   // ─── Run / context menu ───────────────────────────────────────────────
 
+  const cancelPanelAutoClose = useCallback(() => {
+    if (panelAutoCloseTimerRef.current !== null) {
+      window.clearTimeout(panelAutoCloseTimerRef.current)
+      panelAutoCloseTimerRef.current = null
+    }
+  }, [])
+
   // 收起分组面板：只置空 openGroupId（面板是固定高度的迷你 Dock，不涉及窗口尺寸）。
   // 另外：面板收起后若导航选中项还停在组内成员上，选中框会无处渲染（← 也会变死键），
   // 所以把「停在成员上」的选中一并复位。导航自己的 Esc / ← 走的是直接 setOpenGroupId
   // 并把选中显式移回分组图标，不经过这里，行为不受影响。
   const closeGroupPanel = useCallback(() => {
+    cancelPanelAutoClose()
+    panelHoverRef.current = false
+    groupHoverRef.current = false
     setOpenGroupId(null)
     setNavId((cur) => {
       if (cur === null || cur === ADD_BTN_ID) return cur
       const hit = appsRef.current.find((a) => a.id === cur)
       return hit && hit.groupId !== undefined ? null : cur
     })
-  }, [])
+  }, [cancelPanelAutoClose])
+
+  // 指针离开面板或分组图标后，给 180ms 宽限再收起：两者之间有一段空隙，
+  // 从面板移到图标（或反过来）时会先触发一次 mouseleave，宽限内进入另一侧即取消。
+  // 拖拽中不排定时器——拖成员出组时面板必须保持可见。
+  const schedulePanelAutoClose = useCallback(() => {
+    if (dragRef.current !== null) return
+    cancelPanelAutoClose()
+    panelAutoCloseTimerRef.current = window.setTimeout(() => {
+      panelAutoCloseTimerRef.current = null
+      if (!panelHoverRef.current && !groupHoverRef.current) closeGroupPanel()
+    }, 180)
+  }, [cancelPanelAutoClose, closeGroupPanel])
+
+  useEffect(() => () => cancelPanelAutoClose(), [cancelPanelAutoClose])
 
   const handleRun = useCallback((app: AppEntry) => {
     // 拖拽进行中，禁止点击启动
@@ -1355,6 +1413,9 @@ function App(): React.ReactElement {
     }
     // 分隔符：不启动任何东西（点击/Enter 均无效）
     if (app.isSeparator) return
+    // 启动任意条目（尤其是点面板成员）前先收起子 Dock：主进程 run-app 会立刻把窗口
+    // 隐藏到托盘，如果这里不复位 openGroupId，下次唤回 Dock 时子面板会原样挂着。
+    if (openGroupId !== null) closeGroupPanel()
     // 防连点：**必须按目标分别计时，不能用一个全局时间戳**。
     // 主进程 `run-app` 的第一件事就是 `mainWindow.hide()`（在 CreateProcess 之前），窗口
     // 随即消失、根本来不及被点第二次——所以这个守卫只需要挡住「同一次点击被派发两遍」
@@ -1452,18 +1513,25 @@ function App(): React.ReactElement {
     setContextMenu(null)
     setMenuPos(null)
     const id = nextId++ // id 在 updater 外分配（StrictMode 双调用 updater 时无副作用）
-    setApps((prev) => [
-      ...prev,
-      {
-        id,
-        iconDataUrl: '',
-        targetPath: '',
-        arguments: '',
-        workingDirectory: '',
-        description: `分组 ${prev.filter((a) => a.isGroup).length + 1}`,
-        isGroup: true
-      }
-    ])
+    setApps((prev) => {
+      // 命名要避重：原来用「现存分组数 + 1」，解散中间某个分组后再建就会撞名
+      // （分组 1、分组 3 存在 → 数 2 得「分组 3」）。这里循环探测第一个没被占用的编号。
+      const used = new Set(prev.filter((a) => a.isGroup).map((a) => a.description))
+      let n = 1
+      while (used.has(`分组 ${n}`)) n += 1
+      return [
+        ...prev,
+        {
+          id,
+          iconDataUrl: '',
+          targetPath: '',
+          arguments: '',
+          workingDirectory: '',
+          description: `分组 ${n}`,
+          isGroup: true
+        }
+      ]
+    })
     scrollDockToEndRef.current = true
     showDropHint('已新建分组：把图标拖到分组图标上即可加入')
   }
@@ -1642,6 +1710,17 @@ function App(): React.ReactElement {
         ? appsRef.current.filter((a) => a.groupId === openGroupId && !a.isSeparator)
         : appsRef.current.filter((a) => !a.groupId && !a.isSeparator)
 
+      // 菜单打开时 Esc 必须先能关菜单。⚠️ 这条**必须放在 navId === null 早退之前**：
+      // 打开菜单的两个入口（handleAddToggle / handleContextMenu）都会 setNavId(null)，
+      // 所以菜单打开时 navId 恒为 null，Esc 会在下面那句早退里被 return 掉，
+      // 永远走不到 switch 里的 Escape 分支 —— 菜单只能靠鼠标移出关闭。
+      if (e.key === 'Escape' && (contextMenu || menuPos)) {
+        e.preventDefault()
+        setContextMenu(null)
+        setMenuPos(null)
+        return
+      }
+
       // 未处于导航模式：按 ←/→ 直接「唤醒」选中框（Esc / 鼠标点击退出后仍可随时唤起）
       // 恢复到上次选中的条目；菜单打开时不抢占方向键
       if (navId === null) {
@@ -1717,8 +1796,11 @@ function App(): React.ReactElement {
             if (first) setNavId(first.id)
             return
           }
-          // 启动后 Dock 自动隐藏到托盘，导航随之结束
-          window.api.runApp(current.targetPath, current.arguments, current.workingDirectory)
+          // 启动后 Dock 自动隐藏到托盘，导航随之结束。
+          // 走 handleRun（与鼠标点击同一条路径）：那里有「同目标 600ms 去抖」和
+          // 「启动失败 / 窗口收在托盘」的提示；直接调 runApp 会让键盘启动绕过去抖、
+          // 连按 Enter 重复拉起，失败时也静默无提示。
+          handleRun(current)
           setNavId(null)
           return
         }
@@ -1741,7 +1823,7 @@ function App(): React.ReactElement {
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [navId, openGroupId, contextMenu, menuPos, closeGroupPanel, handleAddToggle, armNavIdle])
+  }, [navId, openGroupId, contextMenu, menuPos, closeGroupPanel, handleAddToggle, armNavIdle, handleRun])
 
   // ─── 分隔线 ───────────────────────────────────────────────────────────
   // 分隔线是一种特殊条目（isSeparator: true）：因此天然参与拖拽排序与持久化
@@ -1815,6 +1897,11 @@ function App(): React.ReactElement {
   useLayoutEffect(() => { appsRef.current = apps }, [apps])
   // 清理/扫描进行中时跳过重复事件（debounce 只聚合了 watch 事件，扫描自身耗时可更长）
   const desktopSyncBusyRef = useRef(false)
+  // 「忙的时候又来了事件」的标记：不能直接丢掉——fs.watch 的 debounce 是 1s，而启动
+  // 那一轮 prune + scan + 图标修复常常跑上百毫秒到几秒，落在这个窗口里的桌面变更
+  // 如果直接 return，就必须等下一次桌面变更才会同步（可能很久以后）。
+  // 置 pending 后由当前这轮结束时补跑一次（合并语义幂等，重复跑无害）。
+  const desktopSyncPendingRef = useRef(false)
 
   // 合并扫描结果：新增的桌面文件夹 / 指向文件夹的 .lnk / 「此电脑」「回收站」加入 Dock。
   // baseline 用于去重（启动时为已加载列表，实时事件时为当前列表）。去重、排序、id 分配
@@ -1906,12 +1993,47 @@ function App(): React.ReactElement {
     })
   }, [])
 
+  // 实时桌面同步的执行器：清理缺失 + 扫描合并。
+  // busy 期间到达的事件不丢——置 pending，等当前这一轮结束后补跑一次。
+  // baseline 用 getter：启动那一刻 setApps 还没提交，appsRef 仍是旧值，不能拿它当去重基准。
+  const runDesktopSync = useCallback((baseline: () => AppEntry[]): void => {
+    desktopSyncBusyRef.current = true
+    const step = async (): Promise<void> => {
+      try {
+        await pruneMissingFolders(baseline())
+        await mergeDesktopScan(baseline())
+      } catch (err) {
+        console.error('[desktop-sync] failed:', err)
+      } finally {
+        desktopSyncBusyRef.current = false
+        if (desktopSyncPendingRef.current) {
+          desktopSyncPendingRef.current = false
+          runDesktopSync(baseline)
+        }
+      }
+    }
+    void step()
+  }, [pruneMissingFolders, mergeDesktopScan])
+
   // 启动：先加载已保存的快捷方式，加载完成后解锁保存，再清理缺失文件夹 + 扫描合并。
   // 顺序（load → prune → scan）链式执行避免竞态——若并行，扫描结果可能被 setApps 覆盖丢失。
   useEffect(() => {
     let cancelled = false
-    window.api.loadShortcuts().then((saved) => {
+    window.api.loadShortcuts().then((res) => {
       if (cancelled) return
+      // v1.14.0：主进程把「文件损坏」从「加载失败」里拆出来单独上报——损坏时它已经
+      // 保留了原文件（必要时从备份恢复），entries 是恢复/降级后的列表。
+      // 这里只负责提示用户，然后照常往下走（⚠️ 绝不能因为损坏就跳过下面的 sync()，
+      // 否则用户会看到一个只有「+」的空 Dock，而且永远不自愈）。
+      if (res.corrupt) {
+        const savedCount = res.entries ? res.entries.length : 0
+        showDropHint(res.recovered
+          ? '配置文件损坏，已从备份恢复'
+          : savedCount > 0
+            ? `配置文件有部分条目无法识别，原文件已保留（本次加载 ${savedCount} 条）`
+            : '配置文件损坏，原文件已保留，本次从空列表启动')
+      }
+      const saved = res.entries || []
       // ⚠️ 归一化「孤儿分组成员」：groupId 指向一个不存在的分组时，这个条目
       //    既不在 Dock 顶层渲染（顶层 = 没有 groupId）、也不在任何面板里
       //    （面板按 groupId === openGroupId 取成员）→ **用户看不见它，也就删不掉它**，
@@ -1920,8 +2042,8 @@ function App(): React.ReactElement {
       //    必须在第一次写回之前修掉：把这类成员降级成普通顶层条目。
       //    归一化后的 list 要贯穿本 effect 的后续步骤（prune / scan 都拿它当基准），
       //    否则归一化结果会被后面基于原始 saved 的 setApps 覆盖掉。
-      const groupIds = new Set((saved || []).filter((a) => a.isGroup).map((a) => a.id))
-      const list = (saved || []).map((a) => {
+      const groupIds = new Set(saved.filter((a) => a.isGroup).map((a) => a.id))
+      const list = saved.map((a) => {
         if (a.groupId === undefined || groupIds.has(a.groupId)) return a
         const promoted = { ...a }
         delete promoted.groupId
@@ -1938,7 +2060,7 @@ function App(): React.ReactElement {
       // 加载完成即解锁保存（不等同步结束，启动早期用户操作也能正常持久化）
       loadedRef.current = true
       desktopSyncBusyRef.current = true
-      const sync = async () => {
+      const sync = async (): Promise<void> => {
         try {
           await pruneMissingFolders(list)
           if (cancelled) return
@@ -1947,36 +2069,62 @@ function App(): React.ReactElement {
           await mergeDesktopScan(list)
           if (cancelled) return
           repairEmptyFolderIcons()
+        } catch (err) {
+          // 启动同步失败不能连累后面的步骤（也不能让 busy 标记永远为真）
+          console.error('[startup-sync] failed:', err)
         } finally {
           desktopSyncBusyRef.current = false
+          // 启动扫描期间到达的 desktop-changed 事件在这里补跑（否则这次变更永久丢失）
+          if (!cancelled && desktopSyncPendingRef.current) {
+            desktopSyncPendingRef.current = false
+            runDesktopSync(() => appsRef.current)
+          }
         }
       }
-      sync()
-    }).catch(() => {
-      // 加载失败也解锁保存（不阻塞后续持久化）
-      if (!cancelled) loadedRef.current = true
+      void sync()
+    }).catch((err) => {
+      // 加载真的失败（IPC 异常）：解锁保存，并**照常扫描桌面**——否则 Dock 会永远
+      // 停在只有一个「+」的空状态（不建「此电脑」「回收站」、也不同步桌面文件夹）
+      console.error('[load-shortcuts] failed:', err)
+      if (cancelled) return
+      showDropHint('读取配置失败，本次从空列表启动')
+      loadedRef.current = true
+      desktopSyncBusyRef.current = true
+      const syncAfterError = async (): Promise<void> => {
+        try {
+          await pruneMissingFolders([])
+          if (cancelled) return
+          await mergeDesktopScan([])
+          if (cancelled) return
+          repairEmptyFolderIcons()
+        } catch (e) {
+          console.error('[startup-sync] failed:', e)
+        } finally {
+          desktopSyncBusyRef.current = false
+          if (!cancelled && desktopSyncPendingRef.current) {
+            desktopSyncPendingRef.current = false
+            runDesktopSync(() => appsRef.current)
+          }
+        }
+      }
+      void syncAfterError()
     })
     return () => { cancelled = true }
-  }, [pruneMissingFolders, mergeDesktopScan, repairEmptyFolderIcons])
+  }, [pruneMissingFolders, mergeDesktopScan, repairEmptyFolderIcons, runDesktopSync, showDropHint])
 
   // 实时同步：主进程 fs.watch 桌面目录（debounce 1s）→ 重新「清理缺失 + 扫描合并」。
-  // 桌面新增文件夹即时入 Dock、删除即时移除；清理/扫描进行中跳过重复事件。
+  // 桌面新增文件夹即时入 Dock、删除即时移除；清理/扫描进行中**不丢事件**——
+  // 置 pending，当前这轮结束（runDesktopSync 的 finally）后补跑一次。
   useEffect(() => {
     const unsubscribe = window.api.onDesktopChanged(() => {
-      if (desktopSyncBusyRef.current) return
-      desktopSyncBusyRef.current = true
-      const sync = async () => {
-        try {
-          await pruneMissingFolders(appsRef.current)
-          await mergeDesktopScan(appsRef.current)
-        } finally {
-          desktopSyncBusyRef.current = false
-        }
+      if (desktopSyncBusyRef.current) {
+        desktopSyncPendingRef.current = true
+        return
       }
-      sync()
+      runDesktopSync(() => appsRef.current)
     })
     return unsubscribe
-  }, [pruneMissingFolders, mergeDesktopScan])
+  }, [runDesktopSync])
 
   // 保存：**必须防抖**。拖动排序每帧都会产生一次 apps 变更，原来每次都立刻
   // `saveShortcuts(apps)` —— 整个数组（含全部图标 data URL）被结构化克隆跨进程传一遍，
@@ -1986,12 +2134,26 @@ function App(): React.ReactElement {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingSave = useRef<AppEntry[] | null>(null)
 
+  // 保存失败提示的节流：400ms 防抖下拖一次图标可能连发好几次写盘请求，逐个提示会把
+  // 气泡刷成一片。15s 内只提示一次即可（真出问题用户一眼就能看到）。
+  const saveErrorHintedAt = useRef(0)
+  const reportSaveError = useCallback(() => {
+    const now = Date.now()
+    if (now - saveErrorHintedAt.current < 15000) return
+    saveErrorHintedAt.current = now
+    showDropHint('保存失败：请检查磁盘空间或权限')
+  }, [showDropHint])
+
   /** 把一份列表写盘。v1.12.2 起状态里存的就是真实 data URL，这里不需要再做任何换算。
    *  （v1.12.0 曾在这里把哨兵换成共享常量——共享常量为空时就把空串写进了磁盘，
-   *   是那个「永久坏、重启不恢复」bug 的最后一环。） */
+   *   是那个「永久坏、重启不恢复」bug 的最后一环。）
+   *  v1.14.0：saveShortcuts 改为返回 boolean——主进程写盘失败（磁盘满 / 权限 / 只读）
+   *  时返回 false。**必须提示**，否则用户只会看到「下次启动我的条目丢了」。 */
   const writeShortcuts = useCallback((data: AppEntry[]): void => {
     window.api.saveShortcuts(data)
-  }, [])
+      .then((ok) => { if (ok === false) reportSaveError() })
+      .catch(() => reportSaveError())
+  }, [reportSaveError])
 
   /** 立刻把待保存的列表写盘（退出前由主进程的 flush-pending-save 触发）。 */
   const flushSave = useCallback((): void => {
@@ -2177,6 +2339,11 @@ function App(): React.ReactElement {
                       if (el) iconRefs.current.set(app.id, el)
                       else iconRefs.current.delete(app.id)
                     }}
+                    // 可访问性：图标容器是 div + onClick，补上语义与名字（屏读器/自动化都依赖它）。
+                    // tabIndex={-1}：不进入 Tab 序列，键盘入口仍只有 Alt+Space 导航模式
+                    role="button"
+                    tabIndex={-1}
+                    aria-label={app.description || (app.isFolder ? '文件夹' : app.isGroup ? '分组' : '快捷方式')}
                     onMouseDown={(e) => handleIconMouseDown(e, app.id)}
                     onClick={() => handleRun(app)}
                     onContextMenu={(e) => handleContextMenu(e, app.id)}
@@ -2185,6 +2352,10 @@ function App(): React.ReactElement {
                     // 两者都先做一次标签钳制，保证贴边图标的悬浮标签不被容器裁掉
                     onMouseEnter={(e) => {
                       clampDockLabel(e.currentTarget as HTMLElement)
+                      if (app.isGroup) {
+                        groupHoverRef.current = true
+                        if (openGroupId === app.id) cancelPanelAutoClose()
+                      }
                       if (app.specialType === 'this-pc') {
                         openDrivesCard()
                       } else if (app.isFolder && app.targetPath) {
@@ -2194,7 +2365,11 @@ function App(): React.ReactElement {
                     }}
                     onMouseLeave={app.specialType === 'this-pc'
                       ? scheduleCloseDrivesCard
-                      : app.isFolder && app.targetPath ? scheduleCloseFolderCard : undefined}
+                      : app.isFolder && app.targetPath ? scheduleCloseFolderCard
+                        : app.isGroup ? () => {
+                          groupHoverRef.current = false
+                          if (openGroupId === app.id) schedulePanelAutoClose()
+                        } : undefined}
                     // 不设 title：App 自己有胶囊悬浮标签，再叠加系统的原生 tooltip 会变成
                     // 光标下方多出一个灰色提示框（与标签重复，观感也差）
                   >
@@ -2264,6 +2439,9 @@ function App(): React.ReactElement {
             <div
               className="dock-icon-wrap dock-add-btn"
               onClick={handleAddToggle}
+              role="button"
+              tabIndex={-1}
+              aria-label="添加"
             >
               <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
                 <line x1="14" y1="6" x2="14" y2="22" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
@@ -2291,10 +2469,10 @@ function App(): React.ReactElement {
           style={{
             // 两轴都写：.group-panel 的 CSS 兜底 bottom: 154px 若仍生效，只设 top 会把面板压扁
             ...(isTop ? { top: overlayTopOffset, bottom: 'auto' } : { bottom: overlayBottomOffset, top: 'auto' }),
-            // 右键菜单锚在 Dock 栏外侧、与面板同处一条带（窗口只有 300px 高，面板另一侧
-            // 只剩十几像素，无法再叠）——菜单打开期间藏起面板；菜单一关闭（鼠标移出即关，
-            // 见菜单自动关闭 effect）面板同帧显示回来，不会出现重叠空档
-            visibility: contextMenu ? 'hidden' : 'visible'
+            // 浮层互斥：右键菜单（z-index 200）与「+」菜单（100）都锚在 Dock 外侧的
+            // 同一条带里，而面板是 150——不藏起来就会盖住菜单项、抢走点击。
+            // 菜单关闭后同帧显示回来，不会出现重叠空档
+            visibility: contextMenu || menuPos ? 'hidden' : 'visible'
           }}
         >
           <div className="group-panel-bg" />
@@ -2302,7 +2480,16 @@ function App(): React.ReactElement {
             className="group-panel-inner"
             ref={panelInnerRef}
             onMouseMove={handlePanelMouseMove}
-            onMouseLeave={handlePanelMouseLeave}
+            onMouseEnter={() => {
+              // 指针在面板里时取消收起；移到分组图标上（中间有空隙）也走同一条宽限
+              panelHoverRef.current = true
+              cancelPanelAutoClose()
+            }}
+            onMouseLeave={() => {
+              panelHoverRef.current = false
+              handlePanelMouseLeave()
+              schedulePanelAutoClose()
+            }}
           >
             {viewGroupMembers.map((m) => (
               m.isSeparator ? (
@@ -2328,7 +2515,20 @@ function App(): React.ReactElement {
                 onMouseDown={(e) => handleIconMouseDown(e, m.id)}
                 onClick={() => handleRun(m)}
                 onContextMenu={(e) => handleContextMenu(e, m.id)}
-                onMouseEnter={(e) => clampDockLabel(e.currentTarget as HTMLElement)}
+                // 与主 Dock 同一套悬停能力：文件夹 → 子项预览卡片；「此电脑」→ 盘符卡片。
+                // 入口一致（都在 mouseenter 里按图标中心算锚点），只是锚点取面板图标的 rect
+                onMouseEnter={(e) => {
+                  clampDockLabel(e.currentTarget as HTMLElement)
+                  if (m.specialType === 'this-pc') {
+                    openDrivesCard()
+                  } else if (m.isFolder && m.targetPath) {
+                    const r = e.currentTarget.getBoundingClientRect()
+                    openFolderCard(m, r.left + r.width / 2)
+                  }
+                }}
+                onMouseLeave={m.specialType === 'this-pc'
+                  ? scheduleCloseDrivesCard
+                  : m.isFolder && m.targetPath ? scheduleCloseFolderCard : undefined}
                 // 同主 Dock：不设 title，避免系统原生 tooltip 与胶囊标签重复
               >
                 <div className="dock-icon-wrap">
@@ -2643,76 +2843,90 @@ function App(): React.ReactElement {
           }}
         >
           {viewCtxApp?.isSeparator ? (
-            // 分隔线自己的菜单：只有删除
-            <button className="context-menu-item" onClick={() => handleDelete(viewCtxApp.id)}>删除</button>
+            // 分隔线自己的菜单：只有删除。删除永远在滚动区之外（见下方各分支），
+            // 这样即使内容需要滚动，用户也始终能点到「删除」
+            <div className="context-menu-footer">
+              <button className="context-menu-item" onClick={() => handleDelete(viewCtxApp.id)}>删除</button>
+            </div>
           ) : editingId === contextMenu.appId && viewCtxApp ? (
             <>
-              <div className="edit-fields">
-                <label className="edit-label">
-                  名称
-                  <input
-                    className="edit-input"
-                    value={editFields.description}
-                    onChange={(e) => setEditFields({ ...editFields, description: e.target.value })}
-                    placeholder={viewCtxApp.description || '名称'}
-                  />
-                </label>
-                {/* 分组没有启动参数/工作目录，表单只留名称 + 图标 */}
-                {!viewCtxApp.isGroup && (
-                  <>
-                    <label className="edit-label">
-                      参数
-                      <input
-                        className="edit-input"
-                        value={editFields.arguments}
-                        onChange={(e) => setEditFields({ ...editFields, arguments: e.target.value })}
-                        placeholder="启动参数（可留空）"
-                      />
-                    </label>
-                    <label className="edit-label">
-                      工作目录
-                      <input
-                        className="edit-input"
-                        value={editFields.workingDirectory}
-                        onChange={(e) => setEditFields({ ...editFields, workingDirectory: e.target.value })}
-                        placeholder="工作目录（可留空）"
-                      />
-                    </label>
-                  </>
-                )}
+              {/* 表单字段可滚动（窗口只有 300px，三条输入框 + 三个按钮很容易顶出可视区），
+                  但「更换图标 / 保存 / 取消」固定页脚——保存永远可见，不用先滚动找它 */}
+              <div className="context-menu-scroll">
+                <div className="edit-fields">
+                  <label className="edit-label">
+                    名称
+                    <input
+                      className="edit-input"
+                      value={editFields.description}
+                      onChange={(e) => setEditFields({ ...editFields, description: e.target.value })}
+                      placeholder={viewCtxApp.description || '名称'}
+                    />
+                  </label>
+                  {/* 分组没有启动参数/工作目录，表单只留名称 + 图标 */}
+                  {!viewCtxApp.isGroup && (
+                    <>
+                      <label className="edit-label">
+                        参数
+                        <input
+                          className="edit-input"
+                          value={editFields.arguments}
+                          onChange={(e) => setEditFields({ ...editFields, arguments: e.target.value })}
+                          placeholder="启动参数（可留空）"
+                        />
+                      </label>
+                      <label className="edit-label">
+                        工作目录
+                        <input
+                          className="edit-input"
+                          value={editFields.workingDirectory}
+                          onChange={(e) => setEditFields({ ...editFields, workingDirectory: e.target.value })}
+                          placeholder="工作目录（可留空）"
+                        />
+                      </label>
+                    </>
+                  )}
+                </div>
               </div>
-              <div className="edit-actions">
-                <button className="context-menu-item edit-action" onClick={handlePickIcon}>更换图标</button>
-                <button className="context-menu-item edit-action" onClick={handleSaveEdit}>保存</button>
-                <button className="context-menu-item edit-action" onClick={handleCancelEdit}>取消</button>
+              <div className="context-menu-footer">
+                <div className="edit-actions">
+                  <button className="context-menu-item edit-action" onClick={handlePickIcon}>更换图标</button>
+                  <button className="context-menu-item edit-action" onClick={handleSaveEdit}>保存</button>
+                  <button className="context-menu-item edit-action" onClick={handleCancelEdit}>取消</button>
+                </div>
               </div>
             </>
           ) : viewCtxApp?.isGroup ? (
-            <>
+            // 分组条目没有「删除」（用「解散分组」），所以整块都是滚动内容
+            <div className="context-menu-scroll">
               <button className="context-menu-item" onClick={() => handleEdit(viewCtxApp)}>编辑</button>
               <div className="context-menu-divider" />
               <button className="context-menu-item" onClick={() => handleDissolveGroup(viewCtxApp.id)}>解散分组</button>
-            </>
+            </div>
           ) : (
             <>
-              {viewCtxApp && (
-                <>
-                  <button className="context-menu-item" onClick={() => handleEdit(viewCtxApp)}>编辑</button>
-                  {isFileSystemPath(viewCtxApp) && (
-                    <button className="context-menu-item" onClick={() => handleOpenLocation(viewCtxApp)}>打开文件位置</button>
-                  )}
-                  {!viewCtxApp.isFolder && !viewCtxApp.specialType && isFileSystemPath(viewCtxApp) && (
-                    <button className="context-menu-item" onClick={() => handleRunAdmin(viewCtxApp)}>以管理员身份运行</button>
-                  )}
-                  {viewCtxApp.targetPath && (
-                    <button className="context-menu-item" onClick={() => handleCopyPath(viewCtxApp)}>复制路径</button>
-                  )}
-                  <button className="context-menu-item" onClick={handleCreateGroup}>新建分组</button>
-                  <button className="context-menu-item" onClick={() => handleInsertSeparator(viewCtxApp.id)}>在此之前插入分隔线</button>
-                  <div className="context-menu-divider" />
-                </>
-              )}
-              <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId!)}>删除</button>
+              <div className="context-menu-scroll">
+                {viewCtxApp && (
+                  <>
+                    <button className="context-menu-item" onClick={() => handleEdit(viewCtxApp)}>编辑</button>
+                    {isFileSystemPath(viewCtxApp) && (
+                      <button className="context-menu-item" onClick={() => handleOpenLocation(viewCtxApp)}>打开文件位置</button>
+                    )}
+                    {!viewCtxApp.isFolder && !viewCtxApp.specialType && isFileSystemPath(viewCtxApp) && (
+                      <button className="context-menu-item" onClick={() => handleRunAdmin(viewCtxApp)}>以管理员身份运行</button>
+                    )}
+                    {viewCtxApp.targetPath && (
+                      <button className="context-menu-item" onClick={() => handleCopyPath(viewCtxApp)}>复制路径</button>
+                    )}
+                    <button className="context-menu-item" onClick={handleCreateGroup}>新建分组</button>
+                    <button className="context-menu-item" onClick={() => handleInsertSeparator(viewCtxApp.id)}>在此之前插入分隔线</button>
+                    <div className="context-menu-divider" />
+                  </>
+                )}
+              </div>
+              <div className="context-menu-footer">
+                <button className="context-menu-item" onClick={() => handleDelete(contextMenu.appId!)}>删除</button>
+              </div>
             </>
           )}
         </div>

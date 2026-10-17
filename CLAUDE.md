@@ -56,7 +56,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
         !win.isFocused() && !dockTrayHidden) return                     // 仍然有效 → 什么都不做
     if (!win.isDestroyed() && win.isVisible()) recoverDock(win)          // 已被拉回 → 补偿
     ```
-    v1.11.0~v1.13.0 写的是「先清 `sinkState`，再调 `stillWanted()`」，而 `stillWanted()` 的第一个条件正是 `sinkState?.win === win` —— 于是它**恒为 false**，补偿分支在**每一次成功沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶，还顺带 `markDockShown()` 重置 2.5s 宽限期（下一次 blur 也被吞掉）。表现就是「点击其他软件后 Dock 立刻自己弹回来」——整个让位特性 100% 失效。回归验证见 `.dsh-vision-toolkit/probe/sink-logic.cjs`（五个场景：正常沉底 / 途中唤回 / 途中隐藏 / PS 失败 / 窗口销毁）
+    v1.11.0~v1.13.0 写的是「先清 `sinkState`，再调 `stillWanted()`」，而 `stillWanted()` 的第一个条件正是 `sinkState?.win === win` —— 于是它**恒为 false**，补偿分支在**每一次成功沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶，还顺带 `markDockShown()` 重置 2.5s 宽限期（下一次 blur 也被吞掉）。表现就是「点击其他软件后 Dock 立刻自己弹回来」——整个让位特性 100% 失效。回归验证见 `devtools/probe/sink-logic.cjs`（五个场景：正常沉底 / 途中唤回 / 途中隐藏 / PS 失败 / 窗口销毁）
 - **关键坑**：`setAlwaysOnTop(false)` 只是从置顶层降级（`HWND_NOTOPMOST`），z-order 仍停在非置顶组顶部——Explorer 也是非置顶窗口，Dock 依然盖在它上面。**必须再 `sendToBottom()` 调 `SetWindowPos(hwnd, HWND_BOTTOM)` 真正沉底**（Electron 没有 `moveBottom()`，只能走 PowerShell P/Invoke）
 - **停靠位置三档（中间 / 下 / 上）**：类型 `DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'`，但 `IMPLEMENTED_EDGES` 只放行 `bottom`/`top`/`middle`——左/右竖排窗口尺寸不同，需要重建窗口（`recreateWindowForEdge` 已留好），是下一阶段的事。坐标由 `presetPosition(edge)` 在主显示器工作区上算：`top` 贴工作区顶边、`bottom` 贴工作区底边、`middle` 垂直居中；三者都水平居中、窗口尺寸（85% 屏宽 ≤ 1200px × 300px）完全相同，所以切换是**原地 `setBounds` + `webContents.send('dock-edge-changed')`**（实测 ~62ms，不重建窗口、不重载页面、无白闪），只有尺寸真的变了才走 `recreateWindowForEdge`。持久化在 `{userData}/window-position.json`（只存 `{"edge":"..."}`，**文件名沿用旧版**；旧版写的 `{x,y,displayId}` 直接忽略；读入与写入都把未实现档位归一化回 `DEFAULT_EDGE` = `middle`，防止手改配置文件改出竖排尺寸的窗口）。`setDockEdge` 对同档位（±2px 内）提前返回时**仍然重发事件**——页面重载过的 renderer 拿的是启动时 argv 里的旧边，不重发它的布局会一直停在旧位置；renderer 挂载时另外用 `get-dock-edge` 主动同步一次。首次参数走 preload 读的 `--ql-edge=<edge>` argv 常量，首帧就是正确方向，不会先画底部再翻上去
 - **窗口不可自由拖动**：代码里没有任何 `-webkit-app-region: drag`（CSS 里只剩两处解释性注释），也没有 `move`/`moved` 监听或位置巡检。原因：透明窗口下 Dock 栏要么贴窗口上沿、要么贴下沿，窗口位置一动就得补偿布局，实测表现为**明显跳动**（做过「边缘区域判定 + 拖动过程中不切位置 + 松手平滑收尾」也压不住），于是位置**只由预设决定**。不要再引入拖拽/位置记忆
@@ -101,7 +101,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     纵向居中只能用 `padding-top: 82px` + `padding-bottom: 0` + `align-items: center`（`flex-direction: row` 下 `align-items` 管的是**纵轴**），**不要用 `justify-content`**。回归断言见 `regression.cjs` 第 7 组（`scrollLeft=0 时第一个图标完整可见` + `scrollWidth 覆盖全部内容` + `从最右用滚轮一路向左能回到第一个图标`）
   - **透明放大区 82px 的来历**：它必须 ≥ 悬浮标签顶部到 `.dock-inner` 顶边的距离（标签 `bottom: calc(100% + 4px)`、高 20px → 在衬底上方 24px），否则标签会被 `.dock-inner` 的 `overflow` 裁掉。实测标签顶边在 `.dock-inner` 顶边下方 58px，余量充足；标签与玻璃条上沿有 **4px 重叠**，那是原有设计（药丸底衬压一点玻璃上沿），不是 bug
   - **拖入文件的命中区按 `.dock-bar` 算，不能按 `.dock`**：`.dock` 占满整窗，图标少时条两侧大片透明区也在 `.dock` 内——不区分就会出现「在空白处松手也能添加，但那里不显示插入线和禁止光标」。`document` 级 `dragover` 用 `elementFromPoint` 判断是否在条上（不用 `e.target`：光标下方可能是被 transform 放大的图标），不在条上就 `dropEffect='none'` 并清掉插入线；`handleDockDrop` 里再用 `dockBarRef` 兜一道
-  - **回归验证脚本**：`node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/probe-main.cjs`——起一个本地 HTTP 服务（**必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽），引用真实构建产物的 CSS，在真实 Chromium 里逐个数图标量 `.dock-bar` 宽度。实测：0 个 → 32px、4 个 → 284px、16 个 → 1052px、20 个 → 封顶 1154px 且开始滚动（内容 1308）、30 个 → 仍 1154px
+  - **回归验证脚本**：`node_modules/electron/dist/electron.exe devtools/probe/probe-main.cjs`——起一个本地 HTTP 服务（**必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽），引用真实构建产物的 CSS，在真实 Chromium 里逐个数图标量 `.dock-bar` 宽度。实测：0 个 → 32px、4 个 → 284px、16 个 → 1052px、20 个 → 封顶 1154px 且开始滚动（内容 1308）、30 个 → 仍 1154px
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）。**落点换算（v1.13.1 修过一次，改这里必看）**：`calcDropIndex` 在 `dockCenters` 上二分，而 `measureCenters` **跳过了分隔线**（`if (el.dataset.sep) return`）——所以它返回的是「**可显示顶层条目**」下标（非分组成员 **且** 非分隔线）。因此：
   - `topAnchorId(list, idx)` 必须基于 `droppableTop(list)`（= `list.filter(a => !a.groupId && !a.isSeparator)`），**不能**只滤 `!a.groupId`：后者含顶层分隔线，每有一条分隔线落在落点左侧，插入位置就偏左一个槽位
   - 插入指示线的渲染同理：按「可显示顶层条目」递增计数，分隔线不占槽位（但「插到分隔线之前」是合法落点，所以在分隔线处也要判一次 `dropIdx === slot`）
@@ -131,10 +131,10 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 |---|---|
 | [`resources/icon.svg`](resources/icon.svg) | 主图标源（应用 / 安装包 / 桌面 / 开始菜单 / 任务栏 / 窗口） |
 | [`resources/tray-icon.svg`](resources/tray-icon.svg) | 托盘源。**必须与 `icon.svg` 逐字节相同**（用户要求两处形象完全一致） |
-| `.dsh-vision-toolkit/make-icons.mjs` | 生成器：SVG → 逐尺寸独立光栅化 → ICO。**内含哈希校验，两个 SVG 不一致就直接报错退出** |
-| `.dsh-vision-toolkit/verify-icons.mjs` | 校验两枚 ICO 在共同尺寸上**逐像素一致** |
+| `devtools/make-icons.mjs` | 生成器：SVG → 逐尺寸独立光栅化 → ICO。**内含哈希校验，两个 SVG 不一致就直接报错退出** |
+| `devtools/verify-icons.mjs` | 校验两枚 ICO 在共同尺寸上**逐像素一致** |
 
-改图标的流程：改 `icon.svg` → 复制覆盖 `tray-icon.svg` → 跑 `node .dsh-vision-toolkit/make-icons.mjs` → 跑 `verify-icons.mjs` 复核。
+改图标的流程：改 `icon.svg` → 复制覆盖 `tray-icon.svg` → 跑 `node devtools/make-icons.mjs` → 跑 `verify-icons.mjs` 复核。
 
 **形象**：蓝色圆角方块（`#3B7BD5`，圆角 54/256）上叠**三块白色瓷砖**（条宽 48 / 间隙 32 / 高 140 / 圆角 12）。蓝块 = Dock 的玻璃条，三块瓷砖 = 停在上面的一格格快捷方式。
 
@@ -150,7 +150,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 - **判断小尺寸可读性的正确判据：间隙里是否真的还留有底色**，而不是数「浅色连通块个数」——抗锯齿会产生浅蓝像素，按后者会把糊掉的方案误判为通过（这个错已经犯过一次）
 - 光栅化器只认**圆角矩形**（`<rect>` / `<g fill>`）。要加 path / 描边 / 渐变 / 滤镜，必须先把渲染方案换掉（当前刻意不引依赖：没有 sharp/resvg/canvas，也没用 Electron 截图）
 - 生成器解析前会**先剥掉 XML 注释**：SVG 注释里若出现 `<g fill=...>` 这样的标签文本，不剥就会被正则先匹配到（踩过一次）
-- ⚠️ **改 `.dsh-vision-toolkit/*.mjs` 一律用编辑器工具，不要用 PowerShell 的 `Set-Content`/`Get-Content`**——本项目已因此损坏过一次脚本（中文注释全部 mojibake + 行被合并成语法错误）。这就是「注意事项」里那条 PowerShell 编码坑在脚本文件上的又一次实例
+- ⚠️ **改 `devtools/*.mjs` 一律用编辑器工具，不要用 PowerShell 的 `Set-Content`/`Get-Content`**——本项目已因此损坏过一次脚本（中文注释全部 mojibake + 行被合并成语法错误）。这就是「注意事项」里那条 PowerShell 编码坑在脚本文件上的又一次实例
 
 ### 开机自启动
 
@@ -172,7 +172,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     迟到的回调会把第二个应用刚启动的 Dock 又弹出来（这个漏洞是 `visibility-state.cjs` 场景 3 抓出来的）
   - `run-app` 与 `run-as-admin` 都在隐藏时 `let hideSeq = sinkSeq` → `sinkSeq++` → `hideSeq = sinkSeq` 并往下传；
     **新增任何「先隐藏、失败再回滚」的路径都必须照做**
-  - 回归验证：`node .dsh-vision-toolkit/probe/visibility-state.cjs`（5 个场景）+
+  - 回归验证：`node devtools/probe/visibility-state.cjs`（5 个场景）+
     `runapp-timing.cjs` / `runapp-fixed.cjs`（返回值时序）
 - **弹窗/消失的路径清单（2026-09 逐条复核过，改动时对照）**：
   - **显示 4 条**：`ready-to-show`（启动/重建）、`toggleWindow` 显示分支（Alt+Space/托盘左键）、
@@ -215,7 +215,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   - ⚠️ 进程匹配**按全路径、同名兜底**：读 `MainModule.FileName` 对提权 / 受保护进程会抛异常
     （实测 273 个进程里 **148 个**读不到），只按路径匹配会把**正在运行**的程序误判成「没在运行」→ 多开。
     同名进程一律算「在运行」（安全侧），只有全路径命中时才优先用它们的窗口
-  - 回归验证：`node .dsh-vision-toolkit/probe/runapp-four-states.cjs`
+  - 回归验证：`node devtools/probe/runapp-four-states.cjs`
     （真实应用 + CDP 调 `window.api.runApp`，四个用例都核对**进程数**：没在运行必须真的启动、
     已在运行必须不多开）。⚠️ 老的 `activate-3state.cjs` 只测了「路径不存在」的 exe ——
     那条路在 TS 层就被 `existsSync` 短路了、**从没进过探询**，所以这个 bug 从它眼皮底下溜了过去
@@ -238,7 +238,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   - ✅ 真正要守的底线挪到了这两态上：`running`（有窗口 → 置前，**绝不新开**）与
     `tray`（窗口隐藏 → 点托盘图标唤出，**绝不强行 `ShowWindow`**）。
     微信/QQ 收托盘时窗口**是存在的**（只是隐藏）→ 命中 `-1`，所以「多点一下开了个登录窗」不会回来
-  - 回归验证：`node .dsh-vision-toolkit/probe/runapp-open-always.cjs`
+  - 回归验证：`node devtools/probe/runapp-open-always.cjs`
     （重点用例就是 Clash Verge 这种「进程在、窗口为空」的目标：必须返回 `true` 且**窗口真的出现**、进程数不爆炸）
   - 🚫🚫 **不要对隐藏窗口调 `ShowWindow` 强行显示（v1.13.5 的错误做法，已废弃）**：
     把一个本该隐藏的窗口强行显示出来，有概率让它**可见但失去响应**（看起来像卡死）。
@@ -272,7 +272,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   2. **读失败返回 `null`（状态未知），不要返回 `false`**：`false` 的语义是「图标可见」，
      把「读失败」当「可见」会让文案先渲染错值、再翻成对值 —— 这正是用户报的现象。
      renderer 收到 `null` 时保持现状、不翻转；`toggle-desktop-icons` 失败时也返回缓存值而非编一个 `false`。
-   - 回归验证（v1.13.8 起用这个）：`node .dsh-vision-toolkit/probe/flip-e2e.cjs` ——
+   - 回归验证（v1.13.8 起用这个）：`node devtools/probe/flip-e2e.cjs` ——
      真实 main + 真实 preload + 真实 renderer，从外部读注册表当真值，核对菜单文案是否跟着翻；退出码 0/1
      ⚠️ 老的 `flip-test.cjs` 用的是**模拟 IPC**，只能证明「首帧文案正确」，
      **测不出 PowerShell 输出解析类 bug** —— v1.13.8 那个 bug 就从它眼皮底下溜过去了
@@ -395,7 +395,7 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
     1. `margin` / 负 margin **无效** —— `.dock-icon-wrap` 是 `display:flex` + `align-items/justify-content: center`，flex 的居中断言会盖掉 margin（实测负 margin 完全没生效）
     2. 只写 `position:absolute; top:0; left:0` **也无效** —— 绝对定位只把盒子移出文档流，**并不豁免父级的 flex 对齐**：实测 `offsetLeft/offsetTop` 仍是 `9/9`（被居中）。正解是 `position:absolute` + **四向 inset + `margin:auto`** 把盒子钉到指定角落
   - 教训：**在 flex 容器里给绝对子元素定位时，`top/left` 不一定说了算**，必须实测 `offsetLeft/offsetTop` 或 `getBoundingClientRect()` —— 这处我连续推错三次，每次都被探针打回来。另外「1px 余量」在亚像素布局下会退化成实际重叠，**余量要给够，别卡着算**
-  - 回归断言见 `regression.cjs` 第 8 组（`多成员分组的徽标不再盖住缩略图`，容差 8px²）；视觉对比脚本 `.dsh-vision-toolkit/probe/stack-variants.cjs`（一次渲染 6 种候选并输出 1x 截图）
+  - 回归断言见 `regression.cjs` 第 8 组（`多成员分组的徽标不再盖住缩略图`，容差 8px²）；视觉对比脚本 `devtools/probe/stack-variants.cjs`（一次渲染 6 种候选并输出 1x 截图）
   - ⚠️ 探针踩坑：`e(id, name, extra)` 这类 fixture 辅助函数的**第三参才是附加字段**，写成 `e(901,'M1', G)` 会得到 `group: 'M1'` 这种废字段（实测导致徽标显示 1、第 8 组断言永远失败）。改 fixture 后**先确认读回来的数据里字段真的在**，别急着怀疑应用代码
 - **分组面板（迷你 Dock）**：与主 Dock 同构——顶部透明放大区 + 玻璃条，条目**直接复用 `.dock-item` 系列样式**、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听；宽度 `max-content`（有几个图标就多宽，超出窗口宽度才滚动），**高度固定**，因此完全不改变窗口尺寸（这也是透明窗口 resize 白闪的根治手段）。菜单打开期间面板用 `visibility: hidden` 隐藏——两者同处 Dock 栏上方一条带，而窗口只有 300px 高，无法叠放
 - **数组不变量**：分组成员在扁平数组里**紧跟其分组条目之后**（归组时插到该组现有成员末尾）。桌面扫描合并的 `rest` 保持相对顺序，所以成员区不会被扫描打散；任何顶层插入/重排都必须经 `topAnchorId` 换算，否则会插进成员区块中间
@@ -520,7 +520,7 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 - `open-path` 与 `run-app` 的隐藏时机不同：`open-path`（预览卡片点条目 /「打开」）**先打开、成功后才隐藏** Dock；`run-app`（点 Dock 图标）先隐藏再启动，但**启动失败会恢复显示 + 置顶**。两条都不要改成「无条件先隐藏」——目标不存在时用户看到的是「点了没反应、Dock 还消失了」
 - **保存守卫（防清盘）**：保存 effect 在 `loadedRef`（初始加载完成前）为 false 时直接跳过——挂载时 `apps=[]` 不再覆盖 `shortcuts.json`。否则在 **React.StrictMode 双挂载**下，`save([])` 会先清空文件，第二次 `load` 读到空文件返回 `[]`，已保存条目永久丢失（桌面自动扫描的文件夹会靠重新扫描"复活"，手动添加的程序快捷方式则彻底消失）。`main.tsx` 使用了 `<React.StrictMode>`，改动持久化流程时必须保留该守卫
 - **⚠️ 本机 shell 是 Windows PowerShell 5.1（不是 7）**：`Get-Content`/`Set-Content` 默认按 **ANSI/GBK** 读写，用它批量改写 UTF-8 源文件会造成**不可逆的中文丢失**（本项目曾因此损坏 `App.tsx` 150 行 / 319 个字符，靠 git HEAD 匹配 + 逐行修复表才救回）。改文件一律用编辑器工具，或显式 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`；含中文的 `.ps1` 脚本必须先加 UTF-8 BOM 再交给 `powershell -File` 执行
-  - **不只是中文丢失**：`(Get-Content -Raw) -replace ... | Set-Content -NoNewline` 这类「读-改-写」还会**悄悄合并行尾**，把脚本压成一行并抛出 `SyntaxError`（`return outside function`）。v1.13.0 做图标时用这招改 `.dsh-vision-toolkit/make-icons.mjs` 就中了一次，中文注释也全成了 mojibake。**结论：任何源文件（含自己写的生成脚本）都只用编辑器工具改，PowerShell 只用来读和跑命令**——它是本项目第二起同类事故了
+  - **不只是中文丢失**：`(Get-Content -Raw) -replace ... | Set-Content -NoNewline` 这类「读-改-写」还会**悄悄合并行尾**，把脚本压成一行并抛出 `SyntaxError`（`return outside function`）。v1.13.0 做图标时用这招改 `devtools/make-icons.mjs` 就中了一次，中文注释也全成了 mojibake。**结论：任何源文件（含自己写的生成脚本）都只用编辑器工具改，PowerShell 只用来读和跑命令**——它是本项目第二起同类事故了
 - **版本号管理**：git 提交信息用版本号（如 `v1.6.0: ...`），但仓库**无 git tag**；`package.json` 的 `version` 字段需手动同步（当前为 `1.14.0`，每次发布需手动更新；`package-lock.json` 顶部与 `packages[""]` 两处也要一起改）
 - 项目有 [`CHANGELOG.md`](CHANGELOG.md) 按版本记录变更（**当前记录到 v1.14.0**），功能变更后需同步更新，并与提交信息版本对齐
 - 窗口 `resizable: false`，尺寸固定（85% 屏宽 ≤ 1200px × 300px）

@@ -9,5 +9,5 @@ Thumbs.db
 *.lnk
 *.url
 *.pif
-# 视觉调试工具的临时产物目录
-.dsh-vision-toolkit/
+# 开发工具（图标生成 / 回归探针）的产物目录
+devtools/

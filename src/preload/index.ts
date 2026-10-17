@@ -43,6 +43,17 @@ export interface AppEntry {
   isSeparator?: boolean
 }
 
+/** `load-shortcuts` 的返回：条目 + 配置是否损坏 + 是否从 `.bak` 恢复。
+ *  不能只返回数组——解析失败返回空数组会让 renderer 把整份配置当成「用户清空了」
+ *  再保存回磁盘，静默覆盖掉原文件。 */
+export interface LoadShortcutsResult {
+  entries: AppEntry[]
+  /** true = 原文件读不出来（JSON 损坏/读失败）；renderer 必须提示用户 */
+  corrupt: boolean
+  /** true = entries 来自 `shortcuts.json.bak` */
+  recovered: boolean
+}
+
 /** 文件夹子项（悬停预览卡片用） */
 export interface FolderChild {
   name: string
@@ -155,11 +166,11 @@ const api = {
   /** 复制文本到剪贴板（如条目路径）。 */
   copyText: (text: string): Promise<void> =>
     ipcRenderer.invoke('copy-text', text),
-  /** Load persisted shortcuts from disk. */
-  loadShortcuts: (): Promise<AppEntry[]> =>
+  /** Load persisted shortcuts from disk. 损坏时返回 corrupt=true（不 throw）。 */
+  loadShortcuts: (): Promise<LoadShortcutsResult> =>
     ipcRenderer.invoke('load-shortcuts'),
-  /** Save shortcuts to disk for persistence across restarts. */
-  saveShortcuts: (data: AppEntry[]): Promise<void> =>
+  /** Save shortcuts to disk. 返回 false = 写盘失败（磁盘满/无权限），调用方必须提示。 */
+  saveShortcuts: (data: AppEntry[]): Promise<boolean> =>
     ipcRenderer.invoke('save-shortcuts', data),
   /** Select one or more folders, returning each one's path, name, and system icon. */
   selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string }[]> =>

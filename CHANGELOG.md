@@ -204,9 +204,9 @@ npm run package    # 构建并打包为可执行安装包
 **5) 本版回归证据（全绿）**
 | 套件 | 结果 | 覆盖 |
 |---|---|---|
-| `.dsh-vision-toolkit/probe/regression.cjs` | **20/20** | Dock 几何 / 横向滚动可达性 / 拖拽后几何缓存新鲜度 / 分组徽标重叠 / 「+」菜单几何 / 键盘导航层级 |
-| `.dsh-vision-toolkit/probe/flip-e2e.cjs` | **7/7** | 桌面图标文案与系统注册表真值同步翻转、主进程无 `toggle read failed` |
-| `.dsh-vision-toolkit/probe/runapp-open-always.cjs` | **5/5** | Clash Verge（进程在、无窗口）等目标点了**必须能打开**、且不多开 |
+| `devtools/probe/regression.cjs` | **20/20** | Dock 几何 / 横向滚动可达性 / 拖拽后几何缓存新鲜度 / 分组徽标重叠 / 「+」菜单几何 / 键盘导航层级 |
+| `devtools/probe/flip-e2e.cjs` | **7/7** | 桌面图标文案与系统注册表真值同步翻转、主进程无 `toggle read failed` |
+| `devtools/probe/runapp-open-always.cjs` | **5/5** | Clash Verge（进程在、无窗口）等目标点了**必须能打开**、且不多开 |
 | `npm run typecheck` + `npm run build` | 通过 | — |
 
 **6) 已知未修（留到下一版）**：`sandbox: false` 可收紧为 `true`；`ready-to-show` 少了 `sinkSeq++`，
@@ -293,8 +293,8 @@ npm run package    # 构建并打包为可执行安装包
 - **㉒ `electron-builder.yml` 的 `files` 是排除式，把开发脚手架整包打进了 asar**（打包发布时发现）
   - electron-builder 的 `files` 语义是「**没列出来的都会进去**」，原配置只排除了 `src/`、`node_modules/` 和几个配置文件，漏掉两类，实测：
     - `electron-v43.1.0-win32-x64.zip`（**144 MB**，仅用于 `electronDist` 跳过下载）——它就躺在项目根目录，被整包塞进 asar，`app.asar` 因此虚报到 **142 MB**
-    - `.dsh-vision-toolkit/**`（3.7 MB / 224 个文件：图标候选图、探针脚本、截图、提交信息草稿）——asar 的 **250 个条目里有 235 个是它**
-  - **修法**：显式加 `!electron-v*.zip` 与 `!.dsh-vision-toolkit/**`
+    - `devtools/**`（3.7 MB / 224 个文件：图标候选图、探针脚本、截图、提交信息草稿）——asar 的 **250 个条目里有 235 个是它**
+  - **修法**：显式加 `!electron-v*.zip` 与 `!devtools/**`
   - **实测效果**：`app.asar` 条目 **250 → 14**、体积 **142 MB → 0.89 MB**；安装包 **235 MB → 95 MB**（省掉 140 MB）
   - 这两者都不参与运行时（main 只读 `out/**` 与 `resources/`），排除是安全的；打包版已实机启动验证（窗口标题「快捷方式面板」、4 个 Electron 子进程正常）
 
@@ -446,7 +446,7 @@ npm run package    # 构建并打包为可执行安装包
   - **匹配策略**：候选名 = 该程序所有顶层窗口标题 + exe 名兜底；匹配不到就**什么都不点**（列出面板里的
     名字也没关系，绝不乱点别人的托盘图标），退回「提示用户自己点」
   - **收尾**：点击后自动把溢出面板关掉，不留残影（实测残留 0）
-  - 回归验证：`node .dsh-vision-toolkit/probe/tray-bom.cjs`（BOM 文件方案，连跑两次都返回 1）、
+  - 回归验证：`node devtools/probe/tray-bom.cjs`（BOM 文件方案，连跑两次都返回 1）、
     `tray-v2.cjs`（树遍历法）、`uia-diag5.cjs`（证明「遍历 35 个、精确命中 1」）
 - **㉜ 桌面图标开关：文案不再「先显示隐藏、再立马切成显示」（v1.13.7 修，用户反馈）**
   - **现象**：系统里桌面图标**已隐藏**时，打开「+」菜单会先显示「隐藏桌面图标」、随即翻成「显示桌面图标」
@@ -508,7 +508,7 @@ npm run package    # 构建并打包为可执行安装包
        顺带修掉「`FindListView` 拿不到却编一个 `0`（= 可见）」：现在明确输出「未知」，交给上层保持现状
     3. **读不到结果时的兜底**：0x7402 是**翻转**语义，命令确实发出去了（`TOGGLED=1`）时把缓存取反，
        不让它永远停在旧值上
-  - **实测**（`.dsh-vision-toolkit/probe/flip-e2e.cjs`：真实 main + 真实 preload + 真实 renderer，
+  - **实测**（`devtools/probe/flip-e2e.cjs`：真实 main + 真实 preload + 真实 renderer，
     从外部读注册表当真值）：修前 `注册表 0→1` 而文案 `隐藏桌面图标 → 隐藏桌面图标`（复现用户报障）、
     主进程日志 `[desktop-icons] toggle read failed: undefined | stdout: "0\n1"`；
     修后 7/7 通过（文案与系统真值同步翻转、日志干净）
@@ -556,7 +556,7 @@ npm run package    # 构建并打包为可执行安装包
        （实测本机 273 个进程里 **148 个**读不到路径），只按全路径匹配会把**正在运行**的程序
        误判成「没在运行」→ 多开。现在同名进程也算「在运行」（安全侧）；
        只有全路径命中时才优先用它们的窗口
-  - **实测**（`.dsh-vision-toolkit/probe/runapp-four-states.cjs`：真实应用 + CDP 直接调 `window.api.runApp`）
+  - **实测**（`devtools/probe/runapp-four-states.cjs`：真实应用 + CDP 直接调 `window.api.runApp`）
     | 用例 | 修前 | 修后 |
     |---|---|---|
     | 没在运行 + 无参数 | `probe-failed`（2.4s）**进程 0 → 0，什么都没发生** | `true`（878ms）**进程 0 → 1，真的起来了** |
@@ -575,7 +575,7 @@ npm run package    # 构建并打包为可执行安装包
   - **现象**（用户报障原话 + 主进程日志）：
     `[launcher] 无法判定目标是否在运行，为避免多开实例而放弃本次启动: E:\ClashVerge\Clash Verge.exe`
     —— 点几次都不开；而带启动参数 / 文件夹 / URL 的条目一切正常。
-  - **先证伪「是今天新改的那段代码搞坏的」**：在**那个状态下**实测（`.dsh-vision-toolkit/probe/diag-clash-state.cjs`）——
+  - **先证伪「是今天新改的那段代码搞坏的」**：在**那个状态下**实测（`devtools/probe/diag-clash-state.cjs`）——
     该进程的窗口清单里**只有**托盘窗口 / 无标题窗口 / 输入法辅助窗口，今天的 `Probe = 0`、`FindWindow = 0`；
     而**昨天**的 `Activate` 用的就是**同一套「只认有标题窗口」的判定**（路径匹配那一层也正常：WMI 能读到
     `E:\ClashVerge\Clash Verge.exe`、`pids=1`），所以它同样返回 `0` → 同样 retry 3 次 → 同样 `failed`。
@@ -593,7 +593,7 @@ npm run package    # 构建并打包为可执行安装包
   - **修法**：`failed` 不再拦，**直接落到启动流程**（fail-open）。
     `running`（有窗口 → 置前，绝不新开）与 `tray`（窗口隐藏 → 点托盘图标唤出，绝不强行 `ShowWindow`）
     两条保护**原样保留**；同时删掉 `RunAppResult` 的 `'probe-failed'` 与 renderer 的那条提示分支。
-  - **实测**（`.dsh-vision-toolkit/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）：
+  - **实测**（`devtools/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）：
     | 用例 | 结果 |
     |---|---|
     | Clash Verge（进程在、无窗口） | 返回 `true`（2.5s），**进程 1 → 1 不多开**，窗口标题 `""` → `Clash Verge`（真的出来了） |
@@ -616,7 +616,7 @@ npm run package    # 构建并打包为可执行安装包
     `run-app` 里整段探询被这个常量短路；`false` 时打包器会把 `ACTIVATE_CS` / `probeTargetState` /
     `clickTrayIconFor` **整段静态消除**——实测构建产物 `out/main/index.js` 里这三个名字的命中数都是 **0**，
     运行时行为与 v1.13.4 完全一致（`run-app` 第一件事就是收起 Dock 然后 spawn）。
-  - **实测**（`.dsh-vision-toolkit/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）
+  - **实测**（`devtools/probe/runapp-open-always.cjs`：真实应用 + CDP 调 `window.api.runApp`）
     | 用例 | 结果 |
     |---|---|
     | Clash Verge（进程在、无窗口） | `true` **10ms**，窗口真的出现，进程 1 → 1 |
@@ -628,9 +628,9 @@ npm run package    # 构建并打包为可执行安装包
   - 配套：`runapp-four-states.cjs` 会先检查构建产物里有没有探询代码，没有就打印说明并跳过（退出码 0）；
     `flip-e2e.cjs`（桌面图标文案）不受影响，仍然 7/7
 
-#### 本次审计用的探针脚本（都在 `.dsh-vision-toolkit/probe/`，已被 `.gitignore` 忽略）
+#### 本次审计用的探针脚本（都在 `devtools/probe/`，已被 `.gitignore` 忽略）
 
-跑法统一为 `node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/<名字>.cjs`：
+跑法统一为 `node_modules/electron/dist/electron.exe devtools/probe/<名字>.cjs`：
 
 | 脚本 | 作用 |
 |---|---|
@@ -704,14 +704,14 @@ npm run package    # 构建并打包为可执行安装包
   - **`--dock-vw` 必须在探针里也补上**，否则量到的是 `100vw` 兜底值——第一版探针就因此「看起来通过、其实测的是另一条路径」
 - **附带修掉一处不一致**：`.dock` 占满整窗，图标少时条两侧的透明区也在 `.dock` 内 → 原来**在空白处松手也能添加文件，但那里不显示插入线和禁止光标**。现在拖放命中区按 `.dock-bar` 算（`dragover` 用 `elementFromPoint` 判断，`drop` 再用 `dockBarRef` 兜一道）
 - `.dock-bg` / `.dock-edge` 的左右偏移由 `24px` 改为 `0`（原先那 24px 是 `.dock` 的 padding，现在定位基准已是 `.dock-bar`）；`.dock-inner` 去掉冗余的 `max-width: 100%`（限宽只由 `.dock-bar` 负责）
-- **回归验证脚本**：`node_modules/electron/dist/electron.exe .dsh-vision-toolkit/probe/probe-main.cjs`（起本地 HTTP 服务引用真实构建产物 CSS —— **必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽）
+- **回归验证脚本**：`node_modules/electron/dist/electron.exe devtools/probe/probe-main.cjs`（起本地 HTTP 服务引用真实构建产物 CSS —— **必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽）
 
 **统一图标：全项目改用同一枚 SVG 绘制的图标**（用户要求：统一各处图标、重新用 SVG 绘制、必须清晰）
 
 - **形象重新设计**：蓝色圆角方块（`#3B7BD5`，圆角 54/256）上叠**三块白色瓷砖**。蓝块 = Dock 的玻璃条，三块瓷砖 = 停在上面的一格格快捷方式
 - **两枚图标完全一致**：主图标（`icon.ico`）与托盘图标（`tray-icon.ico`）由**同一份 SVG** 生成，并在 6 个共同尺寸上**逐像素相同**（`verify-icons.mjs` 校验）。此前两者是两个不同形象（2×3 六块 / 蓝块+加号），这正是「图标不统一」的来源
 - **SVG 成为唯一真相源**：新增 `resources/icon.svg` 与 `resources/tray-icon.svg`（两者必须逐字节相同，生成器内含哈希校验，不一致直接报错退出）。ICO 全部由脚本生成，不再手改
-- **零依赖的光栅化**：新增 `.dsh-vision-toolkit/make-icons.mjs`——按**圆角矩形的解析覆盖率**逐尺寸独立渲染。不做超采样、也不从 256 缩下来，所以 16px 的边缘是算出来的。刻意**不引入** sharp/resvg/canvas，也不用 Electron 截图（本机没有这些库，且引依赖只为一枚图标不划算）
+- **零依赖的光栅化**：新增 `devtools/make-icons.mjs`——按**圆角矩形的解析覆盖率**逐尺寸独立渲染。不做超采样、也不从 256 缩下来，所以 16px 的边缘是算出来的。刻意**不引入** sharp/resvg/canvas，也不用 Electron 截图（本机没有这些库，且引依赖只为一枚图标不划算）
 - **尺寸是「从像素网格反推」出来的，不是审美数字**：16px 画布只有 16 格，结构极其有限。实测淘汰了三套方案（`final-check.mjs` / `try-icons*.mjs` 可复现）：
   | 方案 | 16px 实测 | 结论 |
   |---|---|---|

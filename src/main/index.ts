@@ -1,11 +1,14 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
-import { join, basename, extname, dirname } from 'path'
-import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, promises as fsp, type FSWatcher, type Dirent } from 'fs'
-import { execFile, execFileSync, exec } from 'child_process'
+import { join, basename, extname, dirname, parse } from 'path'
+import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, openSync, writeSync, fsyncSync, closeSync, renameSync, copyFileSync, unlinkSync, promises as fsp, type FSWatcher, type Dirent } from 'fs'
+import { execFile, execFileSync } from 'child_process'
 
 
 let mainWindow: BrowserWindow | null = null
 let forceQuit = false
+/** second-instance 到达时窗口还没建好（启动中 / 重建窗口的间隙）：记下来，建好窗口后补一次唤回，
+ *  否则用户双击图标启动第二个实例时，这个请求会被静默丢掉（看起来像点了没反应）。 */
+let pendingSecondInstanceShow = false
 let tray: Tray | null = null
 // 系统文件/文件夹对话框打开期间禁止 Dock 沉底：模态对话框跟随父窗口层级，
 // 若此时 blur/mouseleave 触发沉底，对话框会被连带压到其他软件下面
@@ -25,9 +28,14 @@ if (!gotSingleInstanceLock) {
       if (!mainWindow.isVisible()) mainWindow.show()
       dockTrayHidden = false
       sinkSeq++
+      markDockShown() // 与其它显示路径一致：刚唤回时的 blur 是焦点抖动
       recoverDock(mainWindow)
       mainWindow.focus()
+      return
     }
+    // 窗口还没建好（whenReady 之前 / recreateWindowForEdge 的间隙）：先记账，
+    // whenReady 里 createWindow 之后补做显示 + 恢复置顶；否则这次唤回被静默丢弃。
+    pendingSecondInstanceShow = true
   })
 }
 
@@ -86,7 +94,10 @@ let sinkState: { win: BrowserWindow; seq: number } | null = null
  *  Windows 的前台激活锁可能拒绝首次激活（尤其刚从 explorer.exe 交接时），
  *  一次性 moveTop 会被 Explorer 的窗口重排盖掉。 */
 function recoverDock(win: BrowserWindow): void {
-  markDockShown()
+  // ⚠️ 不在这里 markDockShown()：focus / dock-pointer 每次都会走本函数，重置宽限期
+  // 会让「点一下 Dock、再点其他软件」的 blur 被 canSinkNow() 吞掉（2.5s 内不让位）。
+  // 真正需要宽限期的「显示」路径（toggleWindow 显示分支 / ready-to-show / 托盘显示 /
+  // 启动失败恢复）都在调用本函数前显式 markDockShown()。
   win.setAlwaysOnTop(true)
   win.moveTop()
   setTimeout(() => {
@@ -205,6 +216,9 @@ public static class IconExtractor {
 const ICON_SIZE = 64
 /** 文件夹图标（黄色文件夹）尺寸再小一档：卡片行只有 17px，Dock 上也是 44px 缩放显示 */
 const FOLDER_ICON_SIZE = 48
+/** 「更换图标」选 png/jpg 时的最大边：原图直接转 base64 会把整张照片写进
+ *  shortcuts.json（每次保存都重序列化），统一缩到图标尺寸 */
+const PICKED_IMAGE_MAX_EDGE = 256
 
 const PS_ARGS = ['-NoProfile', '-NonInteractive', '-Command'] as const
 type PSResult = { err: Error | null; stdout: string; stderr: string }
@@ -416,21 +430,21 @@ if (-not $displayName -and -not $isUrl -and $targetPath) {
  *     securityScopedBookmarks），写进去是空操作；它能骗过 TS 只是因为它是通过
  *     `...(parent ? { disabled: true } : {})` 展开进去的（多余属性检查对展开不生效）。
  *     真正提供模态的是 parent 参数。 */
-function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
+async function showOpenDialogSafe(options: Electron.OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
   dialogOpen = true
-  mainWindow?.setAlwaysOnTop(true)
-  mainWindow?.moveTop()
-  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
-  // ⚠️ 必须 try/finally 而不能只挂 .finally()：showOpenDialog 若**同步**抛错（父窗口状态
-  // 异常等），`.finally()` 根本注册不上，dialogOpen 会永久停在 true —— 之后 blur 处理里的
-  // `if (dialogOpen) return` 会让 Dock 再也不沉底（直到重启）。
   try {
-    return dialog
-      .showOpenDialog(parent!, options)
-      .finally(() => { dialogOpen = false })
-  } catch (err) {
+    const win = mainWindow
+    if (win && !win.isDestroyed()) {
+      // 模态子窗口：挡住 Dock 输入，Windows 也会把对话框排进父窗口的 z-order 组
+      win.setAlwaysOnTop(true)
+      win.moveTop()
+      return await dialog.showOpenDialog(win, options)
+    }
+    // 窗口还没建好 / 正在重建：退回「无父窗口」重载，不要传 parent!
+    return await dialog.showOpenDialog(options)
+  } finally {
+    // 任何路径（含同步抛错）都必须复位，否则 blur 沉底逻辑会被永久跳过
     dialogOpen = false
-    return Promise.reject(err)
   }
 }
 
@@ -466,6 +480,48 @@ ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
 // ─── IPC: persist shortcuts ─────────────────────────────────────────────────
 
 const shortcutsPath = join(app.getPath('userData'), 'shortcuts.json')
+/** 上一次「可解析」的副本：shortcuts.json 解析失败时先尝试从它恢复 */
+const shortcutsBackupPath = `${shortcutsPath}.bak`
+
+/**
+ * 原子写文件：写 `<path>.tmp-<pid>` → write + fsync → close →（旧文件是合法 JSON 时）
+ * 备份到 `<path>.bak` → rename 覆盖。
+ *
+ * 直接 writeFileSync 在「写了一半」时（崩溃 / 断电 / 杀进程）会留下截断的 JSON，
+ * 而 load 侧解析失败会退化成空数组 —— 用户全部快捷方式一次性消失且不可恢复。
+ * 同卷 rename 是原子替换：读者要么看到旧内容、要么看到新内容，不会看到半截。
+ * 旧文件只有在能解析成合法 JSON 时才备份，避免拿损坏内容盖掉上一次的好备份。
+ *
+ * 失败时清掉临时文件并把异常抛给调用方（save-shortcuts 需要把失败如实返回给 renderer）。
+ */
+function writeFileAtomic(targetPath: string, text: string): void {
+  const tmpPath = `${targetPath}.tmp-${process.pid}`
+  let fd: number | null = null
+  try {
+    fd = openSync(tmpPath, 'w')
+    const buf = Buffer.from(text, 'utf-8')
+    let offset = 0
+    while (offset < buf.length) {
+      offset += writeSync(fd, buf, offset, buf.length - offset)
+    }
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = null
+    try {
+      if (existsSync(targetPath)) {
+        JSON.parse(readFileSync(targetPath, 'utf-8')) // 只为判断旧文件是否值得备份
+        copyFileSync(targetPath, `${targetPath}.bak`)
+      }
+    } catch {
+      // 旧文件本身已损坏（或备份失败）：跳过备份，直接用新内容覆盖
+    }
+    renameSync(tmpPath, targetPath)
+  } catch (err) {
+    if (fd !== null) { try { closeSync(fd) } catch {} }
+    try { if (existsSync(tmpPath)) unlinkSync(tmpPath) } catch {}
+    throw err
+  }
+}
 
 // ─── 窗口停靠位置（下 / 中间 / 上，左/右竖排预留）─────────────────────────
 // Dock **不支持自由拖动**：窗口位置完全由「位置」预设决定（下/上贴边居中、中间居中），
@@ -507,7 +563,11 @@ function readDockEdge(): DockEdge {
 }
 
 function writeDockEdge(edge: DockEdge): void {
-  try { writeFileSync(layoutPath, JSON.stringify({ edge }), 'utf-8') } catch {}
+  try {
+    writeFileAtomic(layoutPath, JSON.stringify({ edge }))
+  } catch (err) {
+    console.error('[dock-edge] failed to persist position:', err instanceof Error ? err.message : String(err))
+  }
 }
 
 /** 停靠位置决定窗口形状：横条是「宽 85% × 高 300」（下/上/中间），竖条（下一阶段）是「宽 300 × 高 85%」 */
@@ -618,27 +678,95 @@ function reapplyDockEdgeOnDisplayChange(): void {
   applyDockEdge(dockEdge)
 }
 
-ipcMain.handle('load-shortcuts', () => {
+interface LoadShortcutsResult {
+  entries: unknown[]
+  corrupt: boolean
+  recovered: boolean
+}
+
+/** 逐条校验持久化条目：只保留形状可用的条目，避免把脏数据喂给 renderer。
+ *  - 必须是普通对象（数组 / null / 基本类型丢弃）
+ *  - `id` 必须是有限数字；`targetPath` 必须是字符串（分组 / 分隔线存的就是空串）
+ *  - `isGroup` / `isSeparator` 只保留 boolean（缺省不补字段）
+ *  - `id` 去重，保留第一个
+ *  另外兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: true。 */
+function sanitizeShortcutEntries(raw: unknown[]): unknown[] {
+  const result: unknown[] = []
+  const seenIds = new Set<number>()
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const obj = entry as Record<string, unknown>
+    let normalized: Record<string, unknown>
+    if (obj.separator) {
+      const { separator: _legacy, ...rest } = obj
+      normalized = { ...rest, isSeparator: true }
+    } else {
+      normalized = { ...obj }
+    }
+    if (typeof normalized.id !== 'number' || !Number.isFinite(normalized.id)) continue
+    if (typeof normalized.targetPath !== 'string') continue
+    if (seenIds.has(normalized.id)) continue
+    seenIds.add(normalized.id)
+    if (typeof normalized.isGroup !== 'boolean') delete normalized.isGroup
+    if (typeof normalized.isSeparator !== 'boolean') delete normalized.isSeparator
+    if (typeof normalized.isFolder !== 'boolean') delete normalized.isFolder
+    if (typeof normalized.groupId !== 'number' || !Number.isFinite(normalized.groupId)) delete normalized.groupId
+    for (const key of ['iconDataUrl', 'description', 'arguments', 'workingDirectory', 'specialType']) {
+      if (typeof normalized[key] !== 'string') delete normalized[key]
+    }
+    // 普通条目必须有目标；分组 / 分隔线本来就是空 targetPath
+    if (!normalized.isGroup && !normalized.isSeparator && normalized.targetPath.trim() === '') continue
+    result.push(normalized)
+  }
+  return result
+}
+
+/** 读取并解析一个持久化文件；顶层不是数组时视为损坏（抛给调用方走恢复流程）。
+ *  返回 dropped：被 sanitize 丢弃的条目数——只要 > 0 就说明磁盘里有一部分
+ *  无法识别的条目，调用方必须把原文件另存一份再让 renderer 写回合法子集。 */
+function readShortcutEntries(filePath: string): { entries: unknown[]; dropped: number } {
+  const raw: unknown = JSON.parse(readFileSync(filePath, 'utf-8'))
+  if (!Array.isArray(raw)) throw new Error('shortcuts.json 顶层不是数组')
+  const entries = sanitizeShortcutEntries(raw)
+  return { entries, dropped: raw.length - entries.length }
+}
+
+/** 把当前 shortcuts.json 另存一份现场（best-effort）。用于「解析失败」与「部分条目
+ *  无法识别」两种场景：前者整个文件保留，后者至少保住被 sanitize 丢掉的原始数据。 */
+function preserveCorruptShortcuts(): void {
   try {
-    if (!existsSync(shortcutsPath)) return []
-    const raw: unknown = JSON.parse(readFileSync(shortcutsPath, 'utf-8'))
-    // 形状校验：文件被外部改坏（合法 JSON 但不是数组）时返回空数组，
-    // 否则 renderer 的 baseline.filter 会抛错并中断整轮加载/桌面扫描
-    if (!Array.isArray(raw)) return []
-    return raw
-      // 元素级校验也不能省：`[1,"x",null]` 是合法 JSON，原样交给 renderer 会得到
-      // 一堆没有 id/targetPath 的"条目"，在 normPath / 去重 / 渲染里到处是隐性地雷
-      .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
-      .map((e) => {
-        // 兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: boolean
-        if (e.separator) {
-          const { separator: _legacy, ...rest } = e
-          return { ...rest, isSeparator: true }
-        }
-        return e
-      })
-  } catch {
-    return []
+    copyFileSync(shortcutsPath, `${shortcutsPath}.corrupt-${Date.now()}`)
+  } catch (copyErr) {
+    console.error('[persist] failed to preserve corrupt shortcuts.json:', copyErr instanceof Error ? copyErr.message : String(copyErr))
+  }
+}
+
+ipcMain.handle('load-shortcuts', (): LoadShortcutsResult => {
+  if (!existsSync(shortcutsPath)) return { entries: [], corrupt: false, recovered: false }
+  try {
+    const { entries, dropped } = readShortcutEntries(shortcutsPath)
+    if (dropped > 0) {
+      // 文件能 parse，但有部分条目形状不可用：保留现场，并让 renderer 提示用户。
+      // 否则下次保存会用合法子集覆盖磁盘，被丢掉的原始条目就永久消失了。
+      preserveCorruptShortcuts()
+      console.warn('[persist] shortcuts.json 有', dropped, '条无法识别，已保留现场；有效条目', entries.length, '条')
+      return { entries, corrupt: true, recovered: false }
+    }
+    return { entries, corrupt: false, recovered: false }
+  } catch (err) {
+    console.error('[persist] shortcuts.json 读取/解析失败:', err instanceof Error ? err.message : String(err))
+    // 无论能否从 .bak 恢复，都先把坏掉的原文件留一份现场：否则恢复成功后下一次
+    // 保存会直接覆盖它，原始数据就再也拿不回来了。
+    preserveCorruptShortcuts()
+    // 先尝试上一次成功保存的副本：它最可能是用户真实数据的完整版本
+    try {
+      const { entries, dropped } = readShortcutEntries(shortcutsBackupPath)
+      console.warn('[persist] 已从 shortcuts.json.bak 恢复', entries.length, '条（丢弃', dropped, '条）')
+      return { entries, corrupt: true, recovered: true }
+    } catch {
+      // 备份也不可用：返回空列表交给 renderer 决定（原文件已另存现场）
+      return { entries: [], corrupt: true, recovered: false }
+    }
   }
 })
 
@@ -646,12 +774,19 @@ ipcMain.handle('load-shortcuts', () => {
  *  （v1.12.0/v1.12.1 曾在这里把哨兵串换成「最近见过的文件夹图标」，那个值为空时
  *   会把空串写进磁盘，是「文件夹图标永久空白」事故的最后一环。） */
 function writeShortcuts(data: unknown[]): void {
-  writeFileSync(shortcutsPath, JSON.stringify(data), 'utf-8')
+  writeFileAtomic(shortcutsPath, JSON.stringify(data))
 }
 
-ipcMain.handle('save-shortcuts', (_event, data: unknown) => {
-  if (!Array.isArray(data)) return
-  try { writeShortcuts(data) } catch {}
+ipcMain.handle('save-shortcuts', (_event, data: unknown): boolean => {
+  if (!Array.isArray(data)) return false
+  try {
+    writeShortcuts(data)
+    return true
+  } catch (err) {
+    // 不能静默吞掉：renderer 据此提示「保存失败」，否则用户以为已经写盘
+    console.error('[persist] save-shortcuts failed:', err instanceof Error ? err.message : String(err))
+    return false
+  }
 })
 
 // ─── IPC: select a folder ───────────────────────────────────────────────────
@@ -685,6 +820,13 @@ ipcMain.handle('select-folder', async () => {
 // 3) 解析「此电脑」「回收站」注册表 CLSID 图标（失败逐级回退：黄色文件夹图标 → 通用文档图标）
 // 返回 { path, name, iconBase64, specialType? }[]。去重由 renderer 完成。
 
+/** 系统位置的显示名留在 TS 侧：PowerShell 命令行按系统 ANSI 代码页解码，
+ *  C#/PS 里出现非 ASCII 会让脚本静默编译失败（详见 ACTIVATE_CS 上方说明）。 */
+const SPECIAL_LOCATION_NAMES = {
+  'this-pc': '此电脑',
+  'recycle-bin': '回收站'
+} as const
+
 ipcMain.handle('scan-desktop-folders', async () => {
   const desktop = desktopPath()
   return new Promise((resolve) => {
@@ -695,7 +837,7 @@ ${ICON_EXTRACTOR_CS}
 $desktop = '${desktop.replace(/'/g, "''")}'
 $results = @()
 
-# 1) 桌面文件夹 + 指向文件夹的 .lnk 快捷方式
+# 1) Desktop folders plus .lnk shortcuts that point at folders
 if (Test-Path -LiteralPath $desktop) {
   Get-ChildItem -LiteralPath $desktop -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     $results += @{ path = $_.FullName; name = $_.Name; specialType = $null }
@@ -712,16 +854,18 @@ if (Test-Path -LiteralPath $desktop) {
   }
 }
 
-# 2) 文件夹共享图标：黄色文件夹 → 通用文档兜底（只提取一次）
+# 2) Shared folder icon: yellow folder, fallback to the generic document icon (extracted once)
 $folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 4, ${FOLDER_ICON_SIZE})
 if (-not $folderIcon) {
   $folderIcon = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, ${FOLDER_ICON_SIZE})
 }
 
-# 3) 系统位置：此电脑 / 回收站（注册表 CLSID 图标，失败逐级回退）
+# 3) System locations: This PC / Recycle Bin (CLSID icons from the registry, with fallbacks)
+# Display names live on the TypeScript side: the command line is decoded with the
+# system ANSI code page, so non-ASCII text must never appear in this script.
 $specials = @(
-  @{ type = 'this-pc'; clsid = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'; name = '此电脑'; shell = 'shell:MyComputerFolder' },
-  @{ type = 'recycle-bin'; clsid = '{645FF040-5081-101B-9F08-00AA002F954E}'; name = '回收站'; shell = 'shell:RecycleBinFolder' }
+  @{ type = 'this-pc'; clsid = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'; shell = 'shell:MyComputerFolder' },
+  @{ type = 'recycle-bin'; clsid = '{645FF040-5081-101B-9F08-00AA002F954E}'; shell = 'shell:RecycleBinFolder' }
 )
 foreach ($sp in $specials) {
   $iconPath = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\\CLSID\\$($sp.clsid)\\DefaultIcon" -Name '(Default)' -ErrorAction SilentlyContinue).'(Default)'
@@ -740,10 +884,10 @@ foreach ($sp in $specials) {
   }
   $iconB64 = [IconExtractor]::GetIconBase64($iconFile, $iconIdx, ${FOLDER_ICON_SIZE})
   if (-not $iconB64) { $iconB64 = $folderIcon }
-  $results += @{ path = $sp.shell; name = $sp.name; specialType = $sp.type; iconBase64 = $iconB64 }
+  $results += @{ path = $sp.shell; specialType = $sp.type; iconBase64 = $iconB64 }
 }
 
-# 4) 文件夹条目统一附共享图标
+# 4) Attach the shared icon to entries that have none
 foreach ($r in $results) {
   if (-not $r.iconBase64) { $r.iconBase64 = $folderIcon }
 }
@@ -754,14 +898,21 @@ if ($results.Count -gt 0) {
     runPowerShell(psScript, 20000, ({ err, stdout }) => {
       if (err || !stdout.trim()) { resolve([]); return }
       try {
-        const items: { path: string; name: string; iconBase64?: string; specialType?: 'this-pc' | 'recycle-bin' }[] =
-          JSON.parse(stdout.trim())
-        resolve(items.map((it) => ({
-          path: it.path,
-          name: it.name,
-          iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : '',
-          ...(it.specialType ? { specialType: it.specialType } : {})
-        })))
+        const items: {
+          path: string
+          name?: string
+          iconBase64?: string
+          specialType?: 'this-pc' | 'recycle-bin'
+        }[] = JSON.parse(stdout.trim())
+        resolve(items.map((it) => {
+          const specialName = it.specialType ? SPECIAL_LOCATION_NAMES[it.specialType] : undefined
+          return {
+            path: it.path,
+            name: specialName ?? it.name ?? '',
+            iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : '',
+            ...(it.specialType ? { specialType: it.specialType } : {})
+          }
+        }))
       } catch { resolve([]) }
     })
   })
@@ -770,9 +921,31 @@ if ($results.Count -gt 0) {
 // ─── IPC: 文件夹条目存在性检查（实时清理被删除的桌面文件夹） ─────────────
 // 纯 fs 检查（无 PowerShell）；返回传入路径中已不存在（被删除/移动/磁盘未挂载）的子集
 
-ipcMain.handle('check-folders-missing', (_e, paths: unknown) => {
+ipcMain.handle('check-folders-missing', async (_e, paths: unknown) => {
   if (!Array.isArray(paths)) return []
-  return paths.filter((p): p is string => typeof p === 'string' && !!p && !existsSync(p))
+  const list = paths.filter((p): p is string => typeof p === 'string' && !!p)
+  const missing = new Set<string>()
+  // 并发上限 16：这些路径最多也就几十条，但逐个 await 会在网络盘上串成一条长队
+  await forEachLimited(list, 16, async (p) => {
+    try {
+      await fsp.access(p)
+      return
+    } catch {
+      // 路径不存在：可能真的被删了，也可能整个卷 / 共享当前不可用（U 盘拔出、
+      // 网络盘离线）。后者报「缺失」会让 renderer 把用户手动添加的文件夹条目
+      // 永久删掉并落盘，所以先确认根（卷 / 共享）还在。
+      const root = parse(p).root
+      if (!root) return
+      try {
+        await fsp.access(root)
+      } catch {
+        return // 卷 / 共享不可用：不当作「已删除」
+      }
+      missing.add(p)
+    }
+  })
+  // 按入参顺序返回，行为对 renderer 稳定（内部是并发完成的）
+  return list.filter((p) => missing.has(p))
 })
 
 // ─── 桌面目录实时监听（fs.watch + debounce）─────────────────────────────
@@ -783,8 +956,11 @@ ipcMain.handle('check-folders-missing', (_e, paths: unknown) => {
 
 let desktopWatcher: FSWatcher | null = null
 let desktopWatchTimer: ReturnType<typeof setTimeout> | null = null
+/** watcher 出错后延迟重建的定时器（桌面监听失效不能永久停更） */
+let desktopWatchRetryTimer: ReturnType<typeof setTimeout> | null = null
 
 function startDesktopWatch(): void {
+  if (desktopWatchRetryTimer) { clearTimeout(desktopWatchRetryTimer); desktopWatchRetryTimer = null }
   try {
     desktopWatcher = watch(desktopPath(), { persistent: true }, () => {
       if (desktopWatchTimer) clearTimeout(desktopWatchTimer)
@@ -795,7 +971,19 @@ function startDesktopWatch(): void {
         }
       }, 1000)
     })
-    desktopWatcher.on('error', (err) => console.error('[desktop-watch] error:', err))
+    desktopWatcher.on('error', (err) => {
+      console.error('[desktop-watch] error, will retry in 3s:', err)
+      // 监听器出错后不会自愈：关掉旧的、3s 后重建，否则桌面增删会永久停更
+      try { desktopWatcher?.close() } catch {}
+      desktopWatcher = null
+      if (desktopWatchTimer) { clearTimeout(desktopWatchTimer); desktopWatchTimer = null }
+      if (!desktopWatchRetryTimer) {
+        desktopWatchRetryTimer = setTimeout(() => {
+          desktopWatchRetryTimer = null
+          startDesktopWatch()
+        }, 3000)
+      }
+    })
   } catch (err) {
     console.error('[desktop-watch] failed to start:', err)
   }
@@ -804,6 +992,7 @@ function startDesktopWatch(): void {
 /** 收掉桌面监听与在途的 debounce 定时器。非持久化时留着 FSWatcher 只会在退出阶段
  *  多触发一次 flush 前的回调（此时窗口可能已经销毁），显式关闭更干净。 */
 function stopDesktopWatch(): void {
+  if (desktopWatchRetryTimer) { clearTimeout(desktopWatchRetryTimer); desktopWatchRetryTimer = null }
   if (desktopWatchTimer) { clearTimeout(desktopWatchTimer); desktopWatchTimer = null }
   try { desktopWatcher?.close() } catch {}
   desktopWatcher = null
@@ -1045,24 +1234,54 @@ const startHiddenAtLogin = process.argv.includes('--autostart')
 
 // ─── IPC: launch an executable, URL, shell location, or open a folder ───────
 
-// 拆分启动参数：逐字符解析（引号内空格不算分隔，引号本身剥离）——行为贴近
-// CommandLineToArgvW。.lnk 的 Arguments 常常带引号（如 "E:\DSH\start-dsh.vbs"），
-// 原样的 split(' ') 会把字面引号传给目标（wscript 收到 "\"路径\"" 导致
-// "Windows Script Host 执行失败"）；同时支持含空格的带引号参数。
+// 拆分启动参数：按 CommandLineToArgvW 的规则解析——引号内空格不算分隔、引号本身剥离，
+// 并处理「反斜杠 + 引号」的奇偶规则（`\\"` 是字面反斜杠 + 引号，`\"` 是转义引号）。
+// .lnk 的 Arguments 常常带引号（如 "E:\DSH\start-dsh.vbs"），原样的 split(' ')
+// 会把字面引号传给目标（wscript 收到 "\"路径\"" 导致 "Windows Script Host 执行失败"）；
+// 同时支持含空格的带引号参数、以及路径末尾的反斜杠（如 "C:\Program Files\"）。
 function splitArgs(input: string): string[] {
   const result: string[] = []
   let cur = ''
   let inQuotes = false
+  let hasToken = false
+  const pushToken = (): void => {
+    if (!hasToken) return
+    result.push(cur)
+    cur = ''
+    hasToken = false
+  }
   for (let i = 0; i < input.length; i++) {
     const ch = input[i]
-    if (ch === '"') { inQuotes = !inQuotes; continue }
-    if (ch === ' ' && !inQuotes) {
-      if (cur) { result.push(cur); cur = '' }
+    if (ch === '\\') {
+      // 连续 n 个反斜杠后跟引号：前 n/2 个是字面量；n 为奇数时后面的引号是字面引号，
+      // 偶数时引号用于开/闭引号段（这里不消费，交给下一轮按引号处理）
+      let n = 0
+      while (i < input.length && input[i] === '\\') { n++; i++ }
+      if (i < input.length && input[i] === '"') {
+        cur += '\\'.repeat(n >> 1)
+        hasToken = true
+        if (n % 2 === 1) { cur += '"'; i++ }
+      } else {
+        cur += '\\'.repeat(n)
+        hasToken = true
+      }
+      continue
+    }
+    if (ch === '"') {
+      // 引号段内的 "" 是转义的字面量引号
+      if (inQuotes && input[i + 1] === '"') { cur += '"'; hasToken = true; i++; continue }
+      inQuotes = !inQuotes
+      hasToken = true
+      continue
+    }
+    if (!inQuotes && (ch === ' ' || ch === '\t')) {
+      pushToken()
       continue
     }
     cur += ch
+    hasToken = true
   }
-  if (cur) result.push(cur)
+  pushToken()
   return result
 }
 
@@ -1159,18 +1378,45 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
 
   // Windows shell: / CLSID → open via explorer (This PC, Recycle Bin, etc.)
   if (targetPath.startsWith('shell:') || targetPath.startsWith('::')) {
-    // 必须给回调：execFile 不带回调就没人消费 'error' 事件，spawn 失败（PATH 里没有
-    // explorer / EPERM）会在主进程抛未捕获异常
-    execFile('explorer', [targetPath], (err) => {
-      if (err && typeof err.code === 'string') console.error('[launcher] explorer failed:', err.message)
+    const opened = await new Promise<boolean>((resolve) => {
+      let settled = false
+      const finish = (ok: boolean): void => {
+        if (settled) return
+        settled = true
+        resolve(ok)
+      }
+      try {
+        // 必须给回调：execFile 不带回调就没人消费 'error' 事件，spawn 失败（PATH 里
+        // 没有 explorer / EPERM）会在主进程抛未捕获异常
+        execFile('explorer', [targetPath], (err) => {
+          // explorer 成功交接给已运行实例后也常以非零码退出；只有 spawn 级失败
+          // （err.code 为字符串）才算「没打开」。1.5s 内已按成功返回时，这里只记日志。
+          if (err && typeof err.code === 'string') {
+            console.error('[launcher] explorer failed:', err.message)
+            finish(false)
+          }
+        })
+      } catch (err) {
+        console.error('[launcher] explorer failed to start:', err instanceof Error ? err.message : String(err))
+        finish(false)
+        return
+      }
+      // explorer 往往把请求转交出去后自身长时间不退出，不能等它退出才返回
+      setTimeout(() => finish(true), 1500)
     })
+    if (!opened) {
+      restoreDockAfterFailedLaunch(hideSeq)
+      return false
+    }
     return true
   }
 
-  // Open folder in Explorer：与 open-path 一致，await 之后才知道有没有打开成功
-  // （原来直接 fire-and-forget，目标被删掉时用户看到的是「Dock 消失、什么都没打开」）
+  // Open folder / ordinary file via ShellExecuteEx：与 open-path 一致，await 之后
+  // 才知道有没有打开成功（原来直接 fire-and-forget，目标被删掉时用户看到的是
+  // 「Dock 消失、什么都没打开」）。
   try {
-    if (statSync(targetPath).isDirectory()) {
+    const stat = statSync(targetPath)
+    if (stat.isDirectory()) {
       const msg = await shell.openPath(targetPath)
       if (msg) {
         console.error('[launcher] openPath (folder) failed:', msg)
@@ -1179,19 +1425,38 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       }
       return true
     }
+    // 已存在但不是 exe/com 的文件：execFile 只对 PE 有效（.bat/.cmd 甚至无法直接
+    // CreateProcess），交给系统按文件关联打开 —— .lnk/.url/.pif、文档、脚本、msi
+    // 都走这里，与资源管理器双击一致。
+    if (stat.isFile()) {
+      const ext = extname(targetPath).toLowerCase()
+      if (ext !== '.exe' && ext !== '.com') {
+        const msg = await shell.openPath(targetPath)
+        if (msg) {
+          console.error('[launcher] openPath (file) failed:', msg)
+          restoreDockAfterFailedLaunch(hideSeq)
+          return false
+        }
+        return true
+      }
+    }
   } catch {
     // not a filesystem path, continue
   }
 
   // URL
   if (/^(https?|ftp|steam):\/\/|^mailto:/i.test(targetPath)) {
-    // openExternal 返回 Promise：没有注册的协议处理器（如未装客户端的 mailto:/steam:）会
-    // reject，不接就是未处理 rejection
-    void shell.openExternal(targetPath).catch((err) => {
+    // openExternal 返回 Promise：没有注册的协议处理器（如未装客户端的 mailto:/steam:）
+    // 会 reject。必须 await 并把失败如实回报，否则 renderer 先收到 true、Dock 却
+    // 在之后偷偷弹回来，用户看不到任何提示。
+    try {
+      await shell.openExternal(targetPath)
+      return true
+    } catch (err) {
       console.error('[launcher] openExternal failed:', err instanceof Error ? err.message : String(err))
       restoreDockAfterFailedLaunch(hideSeq)
-    })
-    return true
+      return false
+    }
   }
 
   // Executable
@@ -1208,26 +1473,39 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   //      挂在它上面会让这个 IPC 挂到用户关掉应用为止。
   const spawnOutcome = await new Promise<'ok' | 'spawn-failed'>((resolve) => {
     let settled = false
-    const child = execFile(
-      targetPath,
-      args ? splitArgs(args) : [],
-      { cwd: workingDir || undefined },
-      // 完成回调只用于「起来了但退出码非零」的日志；成功/失败已由下面的事件定夺
-      (err) => {
-        if (!err) return
-        if (typeof err.code === 'string') return // spawn 级失败已由 'error' 处理
-        console.log(`[launcher] 目标已启动但退出码非零 (${err.code}): ${targetPath}`)
-      }
-    )
-    child.once('spawn', () => {
+    let child: ReturnType<typeof execFile> | null = null
+    try {
+      child = execFile(
+        targetPath,
+        args ? splitArgs(args) : [],
+        { cwd: workingDir || undefined },
+        // 完成回调只用于「起来了但退出码非零」的日志；成功/失败已由下面的事件定夺
+        (err) => {
+          if (!err) return
+          if (typeof err.code === 'string') return // spawn 级失败已由 'error' 处理
+          console.log(`[launcher] 目标已启动但退出码非零 (${err.code}): ${targetPath}`)
+        }
+      )
+    } catch (err) {
+      // execFile 对非法参数等会同步抛错，不是所有失败都会走 'error' 事件
+      console.error('[launcher] execFile threw:', err instanceof Error ? err.message : String(err))
+      resolve('spawn-failed')
+      return
+    }
+    if (!child) {
+      resolve('spawn-failed')
+      return
+    }
+    const proc = child
+    proc.once('spawn', () => {
       if (settled) return
       settled = true
       // 与子进程解绑：主进程不再关心它的生死（GUI 程序可能跑几小时），
       // 否则父进程会一直持有句柄、退出时还要等它
-      child.unref?.()
+      proc.unref?.()
       resolve('ok')
     })
-    child.once('error', (err: NodeJS.ErrnoException) => {
+    proc.once('error', (err: NodeJS.ErrnoException) => {
       if (settled) return
       settled = true
       const code = err.code
@@ -1236,12 +1514,23 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       // 行为一致，会自动弹 UAC 提权。代价是丢弃启动参数。这是已处理的流程，不再打堆栈。
       if (code === 'EACCES' || code === 'EPERM') {
         console.log(`[launcher] Direct spawn blocked (likely admin required); falling back to Shell: ${targetPath}`)
-        shell.openPath(targetPath)
-          .then((msg) => { if (msg) console.error('[launcher] Shell fallback also failed:', msg) })
-          .catch((e) => console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e)))
-        // 回退成功与否由 shell 侧日志兜底；对 renderer 报成功（Dock 保持隐藏，
-        // 因为确实已经交给系统去启动了）
-        resolve('ok')
+        // ⚠️ 回退结果必须如实回报：openPath 返回非空错误串说明 UAC 被拒 / 没有关联
+        // 程序，此时 Dock 要弹回来并提示失败（旧实现无条件 resolve('ok')，用户只看到
+        // 「点了没反应 + Dock 消失」）。
+        void (async () => {
+          try {
+            const msg = await shell.openPath(targetPath)
+            if (msg) {
+              console.error('[launcher] Shell fallback also failed:', msg)
+              resolve('spawn-failed')
+              return
+            }
+            resolve('ok')
+          } catch (e) {
+            console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e))
+            resolve('spawn-failed')
+          }
+        })()
         return
       }
       console.error('[launcher] Failed to launch:', err.message)
@@ -1292,9 +1581,18 @@ ipcMain.handle('pick-icon', async () => {
   if (!file) return null
   if (/\.(png|jpe?g)$/i.test(file)) {
     try {
-      const b64 = readFileSync(file).toString('base64')
-      const mime = /\.png$/i.test(file) ? 'image/png' : 'image/jpeg'
-      return { path: file, iconDataUrl: `data:${mime};base64,${b64}` }
+      // 不直接 readFileSync + base64：原图可能几 MB，会把整张照片塞进
+      // shortcuts.json（每次保存都跨进程克隆 + 重序列化）。走 nativeImage 统一缩到图标尺寸。
+      const img = nativeImage.createFromPath(file)
+      if (img.isEmpty()) return null
+      const { width, height } = img.getSize()
+      const maxEdge = Math.max(width, height)
+      const icon = maxEdge > PICKED_IMAGE_MAX_EDGE
+        ? (width >= height
+            ? img.resize({ width: PICKED_IMAGE_MAX_EDGE })
+            : img.resize({ height: PICKED_IMAGE_MAX_EDGE }))
+        : img
+      return { path: file, iconDataUrl: icon.toDataURL() }
     } catch { return null }
   }
   const iconDataUrl = await extractIcon(file, 0, ICON_SIZE)
@@ -1334,7 +1632,7 @@ foreach ($p in @(${psList})) {
   try { $name = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($p).FileDescription } catch {}
   if (-not $name) { $name = [System.IO.Path]::GetFileNameWithoutExtension($p) }
   $b64 = [IconExtractor]::GetIconBase64($p, 0, ${ICON_SIZE})
-  # 提取不到图标时回退通用文档图标（shell32 index 1），避免 <img src=""> 出现破图
+# Fallback to the generic document icon (shell32 index 1) when extraction fails
   if (-not $b64) { $b64 = [IconExtractor]::GetIconBase64('C:\\Windows\\System32\\shell32.dll', 1, ${ICON_SIZE}) }
   $out += @{ path = $p; name = $name; iconBase64 = $b64 }
 }
@@ -1820,26 +2118,19 @@ Start-Process @p`
 })
 
 // 在资源管理器中定位目标（文件夹在父目录中选中该文件夹；文件直接选中）
-ipcMain.handle('open-file-location', (_e, targetPath: string) => {
-  if (!targetPath || targetPath.startsWith('shell:') || targetPath.startsWith('::')) return
-  // 这条走的是 exec（拼接命令行，见下方原因），因此必须先挡掉 cmd 元字符：
-  // 真实路径不含这些字符，但 shortcuts.json 可手改、IPC 也能传任意串
-  if (/["&|^<>%\r\n]/.test(targetPath)) {
-    console.error('[launcher] open-file-location: refused path with cmd metacharacters')
-    return
-  }
+ipcMain.handle('open-file-location', (_e, targetPath: unknown) => {
+  if (typeof targetPath !== 'string' || !targetPath) return
+  if (targetPath.startsWith('shell:') || targetPath.startsWith('::')) return
+  // URL 没有「文件位置」可定位（菜单里也不显示这一项）
+  if (/^(https?|ftp|steam):\/\/|^mailto:/i.test(targetPath)) return
+  // Shell API 不拼命令行：路径里的 & | ^ % 等字符不再有注入面，也不用再维护黑名单。
+  // 目标不存在时 showItemInFolder 会静默失败，这里先挡掉，避免打开一个空的资源管理器。
   try {
-    // explorer 的参数解析很挑剔：execFile 自动转义内嵌引号（\"）后 /select 会被
-    // Explorer 忽略并回退到默认位置（文档）。必须用 exec 传原始命令行
-    // （cmd 原样透传双引号）——与资源管理器地址栏手动输入完全一致。
-    exec(`explorer.exe /select,"${targetPath}"`, (err) => {
-      // explorer 成功打开窗口后也常以非零退出码结束（交接给已运行的实例），
-      // 只有 spawn 类失败（err.code 为字符串）才值得记录
-      if (err && typeof err.code === 'string') {
-        console.error('[launcher] open-file-location failed:', err.message)
-      }
-    })
-  } catch {}
+    if (!existsSync(targetPath)) return
+    shell.showItemInFolder(targetPath)
+  } catch (err) {
+    console.error('[launcher] open-file-location failed:', err instanceof Error ? err.message : String(err))
+  }
 })
 
 // 复制文本到剪贴板（复制路径）
@@ -2129,7 +2420,7 @@ Write-Output "STATE=$r"`],
 //   ① 纯 ASCII —— powershell.exe -Command 按系统 ANSI 代码页解码命令行，UTF-8 的中文注释
 //      会把源码解坏 → Add-Type 编译失败 → 功能静默失效。
 //   ② 无反斜杠 —— 这段 C# 嵌在 TS 的模板字符串里，写 "\n" 会被 JS 解成真换行、
-//      把 C# 字符串常量截断（踩过两次）。检查脚本见 .dsh-vision-toolkit/probe/cs-escapes.cjs。
+//      把 C# 字符串常量截断（踩过两次）。检查脚本见 devtools/probe/cs-escapes.cjs。
 //   所有中文（按钮名、面板名、目标名）都由 TS 侧以**参数**传进来。
 const TRAY_CLICK_CS = `
 using System;
@@ -2430,6 +2721,10 @@ public static class WinZ {
     if (sinkState?.win === win) sinkState = null
     if (err) {
       console.error('[dock] sendToBottom failed:', err.message)
+      // 失败时 blur 已经把窗口从置顶层降级（setAlwaysOnTop(false)），却没能真正沉底：
+      // 窗口会停在「非置顶、又盖在普通窗口上面」的半吊子状态，且不会再自己回来。
+      // 显式恢复置顶，把下一次让位交给下一次 blur 重新尝试。
+      if (!win.isDestroyed() && win.isVisible() && !dockTrayHidden) recoverDock(win)
       return
     }
     // 这次沉底仍然有效（期间没有任何更晚的「拉回/隐藏」意图，窗口也还在原位）→ 什么都不做
@@ -2589,6 +2884,25 @@ app.whenReady().then(async () => {
 
   // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
   createWindow(readDockEdge(), startHiddenAtLogin)
+  // 启动过程中收到过 second-instance（窗口还不存在时只能记账）：建好窗口后补一次唤回
+  if (pendingSecondInstanceShow) {
+    pendingSecondInstanceShow = false
+    const win = mainWindow
+    if (win && !win.isDestroyed()) {
+      const reveal = (): void => {
+        if (win.isDestroyed()) return
+        dockTrayHidden = false
+        sinkSeq++
+        markDockShown()
+        win.show()
+        recoverDock(win)
+        win.focus()
+      }
+      // 页面还没画好时 show() 会露出未绘制的窗口，等 ready-to-show 再显示
+      if (win.isVisible()) reveal()
+      else win.once('ready-to-show', reveal)
+    }
+  }
   // 显示器参数变化后重新归位（screen 模块必须等 ready，所以在这里注册）
   screen.on('display-metrics-changed', reapplyDockEdgeOnDisplayChange)
   screen.on('display-added', reapplyDockEdgeOnDisplayChange)
@@ -2662,7 +2976,9 @@ app.whenReady().then(async () => {
 // 让 renderer 的 save-shortcuts 回来 —— 只延迟一次，quit 重入直接放行。
 let quitFlushed = false
 app.on('before-quit', (event) => {
-  if (quitFlushed || !forceQuit) return
+  // 不能要求 forceQuit：只有托盘「退出」会置它，其它退出路径（window-all-closed、
+  // 系统注销/关机等）也需要把 renderer 400ms 防抖窗口里的改动落盘。
+  if (quitFlushed) return
   if (!mainWindow || mainWindow.isDestroyed()) return
   quitFlushed = true
   event.preventDefault()
