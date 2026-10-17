@@ -1507,7 +1507,23 @@ function App(): React.ReactElement {
 
   const handleDelete = (id: number) => {
     setContextMenu(null)
-    setApps((prev) => prev.filter((a) => a.id !== id))
+    // 删除分组时把成员放回顶层：否则 groupId 指向已不存在的分组，成员在当前
+    // 会话里既不在顶层、也不在面板里（要等下次启动的孤儿归一化才回来）。
+    setApps((prev) => {
+      const target = prev.find((a) => a.id === id)
+      const next = prev.filter((a) => a.id !== id)
+      if (target?.isGroup) {
+        return next.map((a) => {
+          if (a.groupId !== id) return a
+          const promoted = { ...a }
+          delete promoted.groupId
+          return promoted
+        })
+      }
+      return next
+    })
+    setOpenGroupId((cur) => (cur === id ? null : cur))
+    setNavId((cur) => (cur === id ? null : cur))
   }
 
   // ─── 分组（Stack）：新建 / 解散 / 面板尺寸 ─────────────────────────────
