@@ -1228,18 +1228,18 @@ html[data-glass-fx='off'] .dock-bg::after {
   background: transparent;
 }
 
-/* 分组图标预览：组内前 3 个成员的缩略图 + 右下角数量徽标，做成**层叠卡片**。
+/* 分组图标预览：组内前 3 个成员的缩略图 + 右下角数量徽标，组成 2×2 网格。
    设计意图与几何约束（改这块必看）：
-   ① 徽标 `.dock-badge` 现在占 2×2 拼图的右下格（20×20，right/bottom 4px），
-      所以**只渲染 3 张缩略图**：4 张图 + 徽标挤在 60px 图标里，右下角必然
-      重叠/发糊（旧版实测盖住 25%，用户反馈「挤到左上」）。
-   ② 卡片走**向右下阶梯**：1 左上、2 右上、3 左下，右下留给徽标；
-      既保留「一叠东西」的厚叠观感，又让 3 张都能辨认。
-   ③ 成员不足 4 个时只渲染有的那几张，位置固定（不重排），所以 2 个成员时是
-      「左上 + 右上」，3 个成员时是「上排两个 + 左下」，看起来仍然是同一叠。
-   ④ 单成员仍走 `.single` 大图；此时徽标隐藏（数量 1 没有信息量）。
+   ① 60×60 图标框里放 4 个 22×22 单元、单元间 2px：总宽 46，四边各留 7px。
+      徽标 `.dock-badge` 就占右下那个 22×22 单元，与三张缩略图严格同网格、同尺寸。
+      旧版把徽标锚在 right/bottom 4px，和缩略图网格差 10px，用户反馈
+      「3 个文件夹上下左右没对齐、离 4 很远、中间有大缝」。
+   ② 缩略图只渲染前 3 个成员：1 左上、2 右上、3 左下，右下固定留给徽标。
+   ③ 成员不足 3 个时只渲染有的那几张，位置固定（不重排），所以 2 个成员时是
+      「左上 + 右上」，看起来仍然整齐。
+   ④ 单成员仍走 `.single` 大图并居中；此时徽标隐藏（数量 1 没有信息量）。
    ⚠️ 卡片用**绝对定位**，不能用 flex 排（`.dock-icon-wrap` 是 flex + center，
-      会把它们居中；而且阶梯 offsets 本身也不适合流式布局）。 */
+      会把它们居中；而且网格 offsets 本身也不适合流式布局）。 */
 .dock-group-preview {
   position: absolute;
   top: 0;
@@ -1248,10 +1248,11 @@ html[data-glass-fx='off'] .dock-bg::after {
   left: 0;
   /* ⚠️ 只写 position:absolute + top/left **不够**：绝对定位只把盒子移出文档流，
      并不豁免父级 flex 的对齐 —— 实测 offsetLeft/Top 仍被居中成 9/9。
-     必须配四向 inset + `margin:auto` 才能钉死到指定角落（这里 = 左上，偏移 4px）。 */
-  margin: 4px auto auto 4px;
-  width: 42px;
-  height: 42px;
+     必须配四向 inset + `margin:auto` 才能钉死到指定位置：
+     46×46 的网格在 60×60 框里四边各留 7px，严格居中。 */
+  margin: 7px auto auto 7px;
+  width: 46px;
+  height: 46px;
   align-self: flex-start;
   justify-self: flex-start;
 }
@@ -1267,42 +1268,40 @@ html[data-glass-fx='off'] .dock-bg::after {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
-/* 阶梯：1 左上 → 2 右上(略微上提) → 3 左下。
-   第 4 个格子留给右下角的数量徽标（见 .dock-badge）：不再塞第 4 张缩略图，
-   否则 4 张 22px 图 + 16px 徽标会把右下角挤成一团。 */
-.dock-group-preview img:nth-child(1) { left: 2px; top: 2px; }
-.dock-group-preview img:nth-child(2) { left: 22px; top: 0; }
-.dock-group-preview img:nth-child(3) { left: 0; top: 22px; }
+/* 2×2 网格：单元 22px、间隙 2px（22+2+22=46）。
+   1 左上 → 2 右上 → 3 左下；右下第 4 格是徽标，不再放缩略图。 */
+.dock-group-preview img:nth-child(1) { left: 0; top: 0; }
+.dock-group-preview img:nth-child(2) { left: 24px; top: 0; }
+.dock-group-preview img:nth-child(3) { left: 0; top: 24px; }
 
-/* 单成员：一张大图。40px 居中会与徽标相切（实测重叠 25~36px²），
-   所以同样避让到徽标左上沿 (44,44) 之内：36px 放在 (2,2) → 占 2..38，留足余量 */
+/* 单成员：一张大图，在 60×60 框里真正居中（inset 全 0 + margin:auto）。 */
 .dock-group-preview.single {
-  align-content: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-}
-
-.dock-group-preview.single img {
+  margin: auto;
   width: 36px;
   height: 36px;
 }
 
-/* 成员数量徽标：占据 2×2 拼图的右下格。
-   4/4 起不再把第 4 张缩略图塞在徽标下面，徽标因此有独立的 20×20 空间；
-   两/三位数时宽度自然撑开，但右下锚点不变。 */
+.dock-group-preview.single img {
+  left: 0;
+  top: 0;
+  width: 36px;
+  height: 36px;
+}
+
+/* 成员数量徽标：与缩略图共用同一套 2×2 网格，占右下 22×22 单元。
+   right/bottom 7px 正是网格的外边距，不再用手感数字。 */
 .dock-badge {
   position: absolute;
-  right: 4px;
-  bottom: 4px;
-  min-width: 20px;
-  height: 20px;
+  right: 7px;
+  bottom: 7px;
+  min-width: 22px;
+  height: 22px;
   padding: 0 5px;
   border-radius: 999px;
   background: #3a7bd5;
   color: #fff;
-  font-size: 10.5px;
-  line-height: 20px;
+  font-size: 11px;
+  line-height: 22px;
   font-weight: 600;
   text-align: center;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 1.5px var(--label-pill-bg);
