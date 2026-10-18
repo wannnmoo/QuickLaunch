@@ -399,6 +399,8 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
   - ⚠️ 探针踩坑：`e(id, name, extra)` 这类 fixture 辅助函数的**第三参才是附加字段**，写成 `e(901,'M1', G)` 会得到 `group: 'M1'` 这种废字段（实测导致徽标显示 1、第 8 组断言永远失败）。改 fixture 后**先确认读回来的数据里字段真的在**，别急着怀疑应用代码
 - **分组面板（迷你 Dock）**：与主 Dock 同构——顶部透明放大区 + 玻璃条，条目**直接复用 `.dock-item` 系列样式**、悬停放大走同一个 `magnify()`、滚轮横向滚动用原生非被动监听；宽度 `max-content`（有几个图标就多宽，超出窗口宽度才滚动），**高度固定**，因此完全不改变窗口尺寸（这也是透明窗口 resize 白闪的根治手段）。菜单打开期间面板用 `visibility: hidden` 隐藏——两者同处 Dock 栏上方一条带，而窗口只有 300px 高，无法叠放
 - **数组不变量**：分组成员在扁平数组里**紧跟其分组条目之后**（归组时插到该组现有成员末尾）。桌面扫描合并的 `rest` 保持相对顺序，所以成员区不会被扫描打散；任何顶层插入/重排都必须经 `topAnchorId` 换算，否则会插进成员区块中间
+- **面板内拖拽排序（v1.15.1）**：面板成员复用主 Dock 的拖拽状态机，但落点是**另一套下标空间**——`panelCenters` 只含 `.dock-item`（分隔线不测量），`calcPanelDropIndex()` 按面板内容坐标（减 rect.left 加 scrollLeft）计算「可显示成员」下标。mouseup 分支顺序必须是：① 顶层重排 → **①.5 组内重排（`item.groupId !== undefined && overPanel`）** → ② 组内成员拖到 Dock 玻璃条上移出分组。组内重排用 `members[panelTarget].id` 作锚点，`panelTarget >= members.length` 时插到该组最后一个成员之后（**不是整份 apps 末尾**）；插入线按 `viewGroupMembers` 中「分隔线之前的非分隔成员数」渲染，否则分隔线会让指示线偏一格
+- **面板文件夹预览卡片可点击（v1.15.1）**：卡片的 `onClick` 走 `openFolderChild → window.api.openPath`。两个必须保留的守卫：① 全局 `mousedown` 的「点击别处收面板」必须放行 `folderCardRef.current.contains(target)`，否则按下瞬间收面板；② 面板 180ms 自动收起定时器发现 `folderCardRef.current` 还在时**不能直接 `return` 后不再调度**，否则卡片关闭后无人再收面板。当前实现以卡片 DOM 为准先保持面板；核心是保证 `mousedown → mouseup → click` 期间卡片不横移（`cardOverlayAnchor` 从面板侧边退回窗口居中会移动约 290px，click 目标会变成 `.app`）
 
 ### 透明风格文字可读性（v1.11.0）
 

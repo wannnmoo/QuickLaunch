@@ -167,6 +167,23 @@ npm run package    # 构建并打包为可执行安装包
 
 ## 更新日志
 
+### v1.15.1 (2026-10-18) —— 子 Dock 拖拽排序 + 文件夹预览点击
+
+**1) 子 Dock 组内拖拽排序**
+- 面板成员复用主 Dock 的拖拽状态机；新增 `panelDropIdx` 与 `calcPanelDropIndex()`，在面板内容坐标里计算落点，支持组内成员拖动重排。
+- 面板成员在 Dock 玻璃条上松手才算「移出分组」；在面板内松手走组内重排，不再被旧逻辑当成无效落点。
+- 插入指示线按「可显示成员」下标渲染，分隔线不占槽位；重排结果随 `shortcuts.json` 持久化。
+
+**2) 文件夹预览卡片点击**
+- 全局 `mousedown` 关闭面板时放行卡片内部节点（`folderCardRef.contains`），避免按下瞬间收面板。
+- 面板自动收起定时器检测到预览卡片仍打开时保持面板，防止卡片在 `mousedown` 与 `mouseup` 之间横移，导致 `click` 落到 `.app` 上。
+- 卡片内文件/文件夹现在会正常调用 `open-path`，失败时提示。
+
+**3) 回归与版本**
+- `devtools/probe/regression.cjs` 扩到 **31 项，31/31 通过**（新增子 Dock 拖拽顺序/持久化/指示线与卡片点击断言）。
+- `npm run typecheck`、`npm run build` 通过；安装包 `dist/QuickLaunch Setup 1.15.1.exe`。
+- 版本号 `1.15.0 → 1.15.1`（`package.json` + `package-lock.json`）。
+
 ### v1.15.0 (2026-10-17) —— 今日改动审查：持久化/分组/透明主题收口
 
 **1) 持久化与异常路径**

@@ -304,11 +304,14 @@ function App(): React.ReactElement {
   const lastRunAtRef = useRef<Map<string, number>>(new Map())
   const [dragId, setDragId] = useState<number | null>(null)
   const [dropIdx, setDropIdx] = useState<number | null>(null)
+  // 分组面板内的落点（只对「组内成员之间重排」生效；与主 Dock 的 dropIdx 是两套下标空间）
+  const [panelDropIdx, setPanelDropIdx] = useState<number | null>(null)
   // 拖拽中命中的分组图标（高亮提示「松手即归入该组」）
   const [dragOverGroupId, setDragOverGroupId] = useState<number | null>(null)
   // mouseup 需要最新值：放 ref 里，避免把 dropIdx/dragOverGroupId 塞进 effect 依赖
   // 导致拖拽中每个 mousemove 都重挂 window 监听器
   const dropIdxRef = useRef<number | null>(null)
+  const panelDropIdxRef = useRef<number | null>(null)
   const dragOverGroupRef = useRef<number | null>(null)
 
   // ─── 分组（Stack）─────────────────────────────────────────────────────
@@ -673,6 +676,19 @@ function App(): React.ReactElement {
     return centers.length
   }, [])
 
+  // 面板内的落点：与 calcDropIndex 同一套「内容坐标」换算，但中心点取自 panelCenters。
+  // 返回的是**面板里可显示成员**（不含分隔线）的下标空间，与 topAnchorId 的顶层空间同构。
+  const calcPanelDropIndex = useCallback((clientX: number): number => {
+    const centers = panelCenters.current
+    const el = panelInnerRef.current
+    if (!el) return centers.length
+    const mx = clientX - el.getBoundingClientRect().left + el.scrollLeft
+    for (let i = 0; i < centers.length; i++) {
+      if (mx < centers[i].cx) return i
+    }
+    return centers.length
+  }, [])
+
   // 横向滚动边界状态（两端渐隐提示）：拖拽自动滚动与键盘导航都会用到，故声明在此处
   // ⚠️ 状态没变必须**原样返回 prev**：拖拽自动滚动时 rAF 每帧都调这里，
   //    每帧新建一个 {left, right} 会让整个 App（全部图标 + 面板成员 + 分组拼图）
@@ -766,6 +782,7 @@ function App(): React.ReactElement {
       const draggedId = drag.id
       const overGroup = dragOverGroupRef.current
       const target = dropIdxRef.current
+      const panelTarget = panelDropIdxRef.current
       // 「从面板拖出」必须在 Dock 玻璃条上松手才算数。
       // ⚠️ 两个 rect 都要，不能只看 `.dock`（它占满整窗，y 覆盖窗口下沿 174px）：
       //    分组面板是浮在 Dock 上方的卡片，它的图标行与玻璃条**在纵向上是重叠的**，
@@ -781,8 +798,10 @@ function App(): React.ReactElement {
 
       setDragId(null)
       setDropIdx(null)
+      setPanelDropIdx(null)
       setDragOverGroupId(null)
       dropIdxRef.current = null
+      panelDropIdxRef.current = null
       dragOverGroupRef.current = null
       stopEdgeScroll() // 拖拽结束：停掉边缘自动滚动
       if (!wasDrag) return
@@ -812,6 +831,35 @@ function App(): React.ReactElement {
           const member: AppEntry = { ...item, groupId: overGroup }
           delete member.specialType
           return [...without.slice(0, at), member, ...without.slice(at)]
+        }
+
+        // 1.5) 组内成员在面板内拖动 → 在同一分组内重排。
+        //      这是用户最容易期待的行为：面板就是该分组的迷你 Dock，图标应该能像主 Dock
+        //      一样拖动排序。panelTarget 是「面板里可显示成员」下标（跳过 sep），
+        //      锚点换算方式和顶层 topAnchorId 一致，避免分隔线把插入位置带偏。
+        if (item.groupId !== undefined && overPanel) {
+          if (panelTarget === null) return prev
+          const gid = item.groupId
+          const members = prev.filter((a) => a.groupId === gid && !a.isSeparator)
+          const current = members.findIndex((a) => a.id === draggedId)
+          if (current === -1) return prev
+          // 落在自己原位 / 紧邻自己右侧 → 顺序不变，直接返回
+          if (panelTarget === current || panelTarget === current + 1) return prev
+          const anchor = panelTarget >= members.length ? null : members[panelTarget].id
+          if (anchor === draggedId) return prev
+          const without = prev.filter((a) => a.id !== draggedId)
+          let at: number
+          if (anchor === null) {
+            // 追加到分组末尾：插在该组最后一个成员之后（不是整份 apps 的末尾）
+            const last = without.filter((a) => a.groupId === gid).pop()
+            at = last
+              ? without.findIndex((a) => a.id === last.id) + 1
+              : without.findIndex((a) => a.id === gid) + 1
+          } else {
+            at = without.findIndex((a) => a.id === anchor)
+          }
+          if (at < 0) return prev
+          return [...without.slice(0, at), item, ...without.slice(at)]
         }
 
         // 2) 组内成员拖到 Dock 上 → 移出分组并落到落点（面板内松手则取消）
@@ -848,8 +896,27 @@ function App(): React.ReactElement {
         dragStartedRef.current = true
         setDragId(drag.id)
       }
-      // 悬停在分组图标上 → 高亮该组并隐藏插入线（松手即归组）
       const dragged = appsRef.current.find((a) => a.id === drag.id)
+      const panelRect = panelRef.current?.getBoundingClientRect()
+      // 只有「组内成员 + 光标在面板矩形内」才算面板内重排；
+      // 顶层图标拖到面板上不在这里处理（那属于「拖进分组」，另走 hitTestGroup）
+      const overPanel = !!panelRect && !!dragged && dragged.groupId !== undefined &&
+        e.clientX >= panelRect.left && e.clientX <= panelRect.right &&
+        e.clientY >= panelRect.top && e.clientY <= panelRect.bottom
+      if (overPanel) {
+        const pidx = calcPanelDropIndex(e.clientX)
+        panelDropIdxRef.current = pidx
+        setPanelDropIdx(pidx)
+        dragOverGroupRef.current = null
+        setDragOverGroupId(null)
+        dropIdxRef.current = null
+        setDropIdx(null)
+        stopEdgeScroll()
+        return
+      }
+      panelDropIdxRef.current = null
+      setPanelDropIdx(null)
+      // 悬停在分组图标上 → 高亮该组并隐藏插入线（松手即归组）
       const over = dragged && !dragged.isGroup ? hitTestGroup(e.clientX, e.clientY, drag.id) : null
       dragOverGroupRef.current = over
       setDragOverGroupId(over)
@@ -869,7 +936,7 @@ function App(): React.ReactElement {
       window.removeEventListener('mousemove', handleMouseMove)
       window.removeEventListener('mouseleave', stopEdgeScroll)
     }
-  }, [calcDropIndex, hitTestGroup, pumpEdgeScroll, stopEdgeScroll])
+  }, [calcDropIndex, calcPanelDropIndex, hitTestGroup, pumpEdgeScroll, stopEdgeScroll])
 
   const handleIconMouseDown = useCallback((e: React.MouseEvent, id: number) => {
     if (e.button !== 0) return // left-click only
@@ -1396,6 +1463,14 @@ function App(): React.ReactElement {
     cancelPanelAutoClose()
     panelAutoCloseTimerRef.current = window.setTimeout(() => {
       panelAutoCloseTimerRef.current = null
+      // ⚠️ 文件夹预览卡片还开着时不能收面板：面板里的文件夹成员弹出卡片后，
+      // 卡片锚在面板**旁边**，鼠标从面板移进卡片会先触发面板 mouseleave。
+      // 卡片虽然会 onMouseEnter 取消一次定时器，但真实鼠标在两块浮层之间移动时
+      // 事件顺序并不保证（实测卡片还在、面板先被 180ms 定时器收掉）——面板一收，
+      // cardOverlayAnchor 从「面板侧边」退回「窗口居中」，卡片会在 mousedown 与
+      // mouseup 之间整个横移 ~290px，mouseup 落到 .dock 上，click 目标变成 .app，
+      // 行上的 onClick 永远不触发。这里以「卡片 DOM 还在」为准，面板保持到卡片关闭。
+      if (folderCardRef.current) { schedulePanelAutoClose(); return }
       if (!panelHoverRef.current && !groupHoverRef.current) closeGroupPanel()
     }, 180)
   }, [cancelPanelAutoClose, closeGroupPanel])
@@ -1608,6 +1683,11 @@ function App(): React.ReactElement {
     const onMouseDown = (e: MouseEvent) => {
       const t = e.target as Node
       if (panelRef.current?.contains(t)) return
+      // 面板里文件夹成员弹出的预览卡片是**面板的附属浮层**，不属于「点击别处」。
+      // 少了这行，mousedown 会先收面板 → cardOverlayAnchor 从面板侧边退回窗口居中，
+      // 卡片在按下与松开之间整个横移，mouseup 落到 .dock、click 落到 .app，
+      // 行上的 onClick 永远不触发（表现就是「预览里点文件/文件夹没反应」）。
+      if (folderCardRef.current?.contains(t)) return
       // 分组图标自身的点击由 handleRun 切换，不算「点击别处」
       if (iconRefs.current.get(openGroupId)?.contains(t)) return
       closeGroupPanel()
@@ -2567,53 +2647,63 @@ function App(): React.ReactElement {
               schedulePanelAutoClose()
             }}
           >
-            {viewGroupMembers.map((m) => (
-              m.isSeparator ? (
-                <div
-                  key={m.id}
-                  className={'dock-sep' + (dragId === m.id ? ' dragging' : '')}
-                  data-sep="1"
-                  ref={(el) => {
-                    if (el) panelIconRefs.current.set(m.id, el)
-                    else panelIconRefs.current.delete(m.id)
-                  }}
-                  onMouseDown={(e) => handleIconMouseDown(e, m.id)}
-                  onContextMenu={(e) => handleContextMenu(e, m.id)}
-                />
-              ) : (
-              <div
-                key={m.id}
-                className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')}
-                ref={(el) => {
-                  if (el) panelIconRefs.current.set(m.id, el)
-                  else panelIconRefs.current.delete(m.id)
-                }}
-                onMouseDown={(e) => handleIconMouseDown(e, m.id)}
-                onClick={() => handleRun(m)}
-                onContextMenu={(e) => handleContextMenu(e, m.id)}
-                // 与主 Dock 同一套悬停能力：文件夹 → 子项预览卡片；「此电脑」→ 盘符卡片。
-                // 入口一致（都在 mouseenter 里按图标中心算锚点），只是锚点取面板图标的 rect
-                onMouseEnter={(e) => {
-                  clampDockLabel(e.currentTarget as HTMLElement)
-                  if (m.specialType === 'this-pc') {
-                    openDrivesCard()
-                  } else if (m.isFolder && m.targetPath) {
-                    const r = e.currentTarget.getBoundingClientRect()
-                    openFolderCard(m, r.left + r.width / 2)
-                  }
-                }}
-                onMouseLeave={m.specialType === 'this-pc'
-                  ? scheduleCloseDrivesCard
-                  : m.isFolder && m.targetPath ? scheduleCloseFolderCard : undefined}
-                // 同主 Dock：不设 title，避免系统原生 tooltip 与胶囊标签重复
-              >
-                <div className="dock-icon-wrap">
-                  <img className="dock-icon" src={m.iconDataUrl} alt="" draggable={false} />
+            {viewGroupMembers.map((m, index) => {
+              // 面板插入线使用「可显示成员」下标空间（分隔线不占槽位），
+              // 与 calcPanelDropIndex / 重排锚点保持同一套编号
+              const slot = viewGroupMembers.slice(0, index).filter((x) => !x.isSeparator).length
+              if (m.isSeparator) {
+                return (
+                  <div key={m.id} style={{ display: 'contents' }}>
+                    {panelDropIdx === slot && <div className="drop-indicator" />}
+                    <div
+                      className={'dock-sep' + (dragId === m.id ? ' dragging' : '')}
+                      data-sep="1"
+                      ref={(el) => {
+                        if (el) panelIconRefs.current.set(m.id, el)
+                        else panelIconRefs.current.delete(m.id)
+                      }}
+                      onMouseDown={(e) => handleIconMouseDown(e, m.id)}
+                      onContextMenu={(e) => handleContextMenu(e, m.id)}
+                    />
+                  </div>
+                )
+              }
+              return (
+                <div key={m.id} style={{ display: 'contents' }}>
+                  {panelDropIdx === slot && <div className="drop-indicator" />}
+                  <div
+                    className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')}
+                    ref={(el) => {
+                      if (el) panelIconRefs.current.set(m.id, el)
+                      else panelIconRefs.current.delete(m.id)
+                    }}
+                    onMouseDown={(e) => handleIconMouseDown(e, m.id)}
+                    onClick={() => handleRun(m)}
+                    onContextMenu={(e) => handleContextMenu(e, m.id)}
+                    // 与主 Dock 同一套悬停能力：文件夹 → 子项预览卡片；「此电脑」→ 盘符卡片。
+                    // 入口一致（都在 mouseenter 里按图标中心算锚点），只是锚点取面板图标的 rect
+                    onMouseEnter={(e) => {
+                      clampDockLabel(e.currentTarget as HTMLElement)
+                      if (m.specialType === 'this-pc') {
+                        openDrivesCard()
+                      } else if (m.isFolder && m.targetPath) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openFolderCard(m, r.left + r.width / 2)
+                      }
+                    }}
+                    onMouseLeave={m.specialType === 'this-pc'
+                      ? scheduleCloseDrivesCard
+                      : m.isFolder && m.targetPath ? scheduleCloseFolderCard : undefined}
+                    // 同主 Dock：不设 title，避免系统原生 tooltip 与胶囊标签重复
+                  >
+                    <div className="dock-icon-wrap">
+                      <img className="dock-icon" src={m.iconDataUrl} alt="" draggable={false} />
+                    </div>
+                    <span className="dock-label">{m.description || '未命名'}</span>
+                  </div>
                 </div>
-                <span className="dock-label">{m.description || '未命名'}</span>
-              </div>
               )
-            ))}
+            })}
             {viewGroupMembers.length === 0 && (
               <div className="group-panel-empty">
                 {/* 线性图标与整体风格（细描边、圆头）一致；直接内联，不引图标库 */}
