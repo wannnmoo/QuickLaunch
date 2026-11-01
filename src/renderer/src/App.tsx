@@ -655,6 +655,76 @@ function App(): React.ReactElement {
     setGeometryTick(geoSeq.current)
   }, [appsOrderKey, theme, edge, openGroupId])
 
+  // ─── 透明窗口命中区（主进程 setShape 用）──────────────────────────────────
+  // 背景：Windows 上透明窗口没有 per-pixel 命中测试（窗口是 WS_EX_NOREDIRECTIONBITMAP，
+  // 不是 WS_EX_LAYERED），`transparent: true` 只影响绘制 —— 整块 1200×302 矩形照样吃
+  // 鼠标，玻璃条上方 134px 的透明区与左右两侧留白全在挡下面的桌面。实测四种方案见
+  // devtools/probe/hit-test-analysis.md；结论是主进程 `win.setShape()` 静态矩形最准
+  // （零轮询、不丢首击），所以这里只需把 `.dock-bar` 的**实测矩形**报上去。
+  // ⚠️ 浮层必须整体放开 region：菜单 / 右键菜单 / 盘符卡片 / 文件夹卡片 / 分组面板全是
+  //    position: fixed 向上弹出、画在玻璃条上方的透明区里，region 不含它们就会被裁掉 ——
+  //    表现是「点了 + 什么都不显示」。关掉浮层立刻收回。
+  // ⚠️ `.drop-hint` 也算浮层（v1.15.2 修）：它是 `position: fixed; bottom: 168px`
+  //    （App.css: `.drop-hint`），窗口 300 高时 rect 顶边约 102 —— 整个落在玻璃条上方
+  //    那条透明带里。不放开 region 的话「启动失败：目标不存在或无法运行」「已添加 N 个」
+  //    这类提示会被 `SetWindowRgn` 连绘制一起裁掉，用户只看到「点了没反应」。
+  //    `dropHint` 自带 2.5s 定时器，`fileDragOver` 只在拖拽期间为真，放开都是短暂的。
+  const overlayOpen = !!(
+    menuPos ||
+    contextMenu ||
+    folderCard ||
+    showDrivesCard ||
+    openGroupId !== null ||
+    fileDragOver ||
+    dropHint
+  )
+  // 用 ref 传当前浮层状态：上报函数本身保持稳定引用，ResizeObserver 不用跟着重挂
+  const overlayOpenRef = useRef(false)
+  overlayOpenRef.current = overlayOpen
+
+  // 上报去重：三条触发通道（浮层开合 / ResizeObserver / window.resize）会重复报同一个
+  // 矩形，主进程侧虽然也去重，但那边去重之前已经付过一次 IPC 序列化 + 一轮事件循环的账。
+  // 拖窗口、改 DPI、连续增删图标时这些重复上报是成串的，所以在这边先挡一道。
+  // 取整后再比：subpixel 抖动（0.0001px 级的布局差异）不该算「变化」。
+  const lastHitRegionRef = useRef('')
+
+  const reportHitRegion = useCallback(() => {
+    const bar = dockBarRef.current
+    if (!bar) return
+    const r = bar.getBoundingClientRect()
+    const x = Math.round(r.left)
+    const y = Math.round(r.top)
+    const width = Math.round(r.width)
+    const height = Math.round(r.height)
+    const overlay = overlayOpenRef.current
+    const key = `${x},${y},${width},${height},${overlay}`
+    if (key === lastHitRegionRef.current) return
+    lastHitRegionRef.current = key
+    window.api.setDockHitRegion({ x, y, width, height, overlay })
+  }, [])
+
+  // 触发通道 ①：浮层开合（该放开还是该收窄）、停靠档（几何整体镜像）、条目签名
+  // （图标增删改玻璃条宽度）。用 layout effect：要在 paint 之前把 region 定下来，
+  // 否则浮层会先被裁掉一帧再出现（看着像闪一下）。
+  useLayoutEffect(() => {
+    reportHitRegion()
+  }, [overlayOpen, edge, appsOrderKey, reportHitRegion])
+
+  // 触发通道 ②：ResizeObserver 挂在 `.dock-bar` 上 —— 它才是随图标数量伸缩的那一层
+  // （`.dock` 恒为整窗宽，观察它永远不回调）。观察者**没有初始回调**，所以首测靠 ①。
+  // 另配 window.resize 兜住 DPI 缩放 / 显示器参数变化。
+  useEffect(() => {
+    const bar = dockBarRef.current
+    if (!bar) return
+    const ro = new ResizeObserver(() => reportHitRegion())
+    ro.observe(bar)
+    window.addEventListener('resize', reportHitRegion)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', reportHitRegion)
+    }
+  }, [reportHitRegion])
+
   // Calculate which insertion index the cursor is closest to
   // 返回的是「位置」（在渲染出来的顶层图标中排序后的下标），不是数组下标
   // 组内成员不在 Dock 里渲染，所以这里与 topAnchorId 的下标空间一致

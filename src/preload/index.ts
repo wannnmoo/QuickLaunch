@@ -225,7 +225,24 @@ const api = {
   /** 通知主进程鼠标进入 Dock 窗口（inside=true）恢复置顶。
    *  沉底仅由点击其他软件（blur）触发——鼠标移出或在其他软件上滚动都不让位。 */
   dockPointer: (inside: boolean): void =>
-    ipcRenderer.send('dock-pointer', inside)
+    ipcRenderer.send('dock-pointer', inside),
+  /** 上报玻璃条（`.dock-bar`）当前矩形与「有没有浮层开着」，主进程据此调用
+   *  `win.setShape()` 把窗口的**命中区**裁成只有玻璃条那一条（+ 8px 阴影余量），
+   *  上方 134px 透明区与玻璃条左右两侧的留白彻底交给桌面。
+   *  ⚠️ 透明窗口在 Windows 上没有 per-pixel 命中测试（窗口是 WS_EX_NOREDIRECTIONBITMAP，
+   *     不是 WS_EX_LAYERED）：`transparent: true` 只影响绘制，整块矩形照样吃鼠标。
+   *  ⚠️ 浮层（「+」菜单 / 右键菜单 / 盘符卡片 / 文件夹卡片 / 分组面板）全是
+   *     `position: fixed` 向上弹出、画在玻璃条**上方**的透明区里，`overlay: true`
+   *     期间主进程会把 region 放开成整窗，否则它们会被 region 裁掉、根本看不见。 */
+  setDockHitRegion: (rect: {
+    /** 窗口坐标（= CSS px = DIP），相对视口左上角 */
+    x: number
+    y: number
+    width: number
+    height: number
+    /** true = 有浮层开着，命中区临时放开成整个窗口 */
+    overlay: boolean
+  }): void => ipcRenderer.send('dock-hit-region', rect)
 }
 
 if (process.contextIsolated) {

@@ -676,6 +676,13 @@ ipcMain.handle('get-dock-edge', () => dockEdge)
 function reapplyDockEdgeOnDisplayChange(): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
   applyDockEdge(dockEdge)
+  // DPI / 缩放变化后必须**强制**重设一次命中区：`setShape` 收的是 DIP，Electron 内部再
+  // 按当前 scale factor 换算成物理像素交给 `SetWindowRgn`。缩放一变，同一份 DIP 矩形对应
+  // 的物理 region 就变了，而这时 renderer 未必收到 resize（窗口 DIP 尺寸没变）、去重 key
+  // 也没变 —— 不主动清空 key，region 就会一直停在按旧缩放算出来的物理尺寸上，
+  // 表现是「改了显示缩放后，玻璃条边缘能点到透明区 / 边缘一段点不到」。
+  dockShapeApplied = ''
+  applyDockHitRegion()
 }
 
 interface LoadShortcutsResult {
@@ -2158,6 +2165,119 @@ ipcMain.on('dock-pointer', (_e, inside: boolean) => {
   mainWindow.focus()
 })
 
+// ─── 透明窗口命中区（方案 B：setShape 静态矩形）─────────────────────────────
+// 背景（实测过，别再用别的思路覆盖）：Windows 上透明窗口拿的是
+// WS_EX_NOREDIRECTIONBITMAP（不是 WS_EX_LAYERED），系统因此**不做 per-pixel 命中测试** ——
+// `transparent: true` 只让窗口画得透明，整个矩形（1200×302）照样吃鼠标。
+// 于是玻璃条上方 134px 的纯透明区、玻璃条左右两侧的留白全都挡住下面的桌面/资源管理器。
+// 探针实测（devtools/probe/hittest-*）：
+//   * setIgnoreMouseEvents(true) 是**整窗开关**，无法按区域；且 { forward: true } 在
+//     Electron 43 + Windows 上**不向 renderer 转发 mousemove** → 靠 DOM hover 判断光标
+//     回来的路走不通；改成主进程轮询则实测**丢首击**（瞬移后立即点击失败，15ms 后才成功）。
+//   * setShape([rect]) 精确生效：region 外穿透到桌面、region 内正常命中，零轮询、零首击丢失。
+// ⚠️ region 是**绘制与命中共用**的裁剪：region 外的内容不会被画出来。所以浮层（全部
+//    position: fixed 向上弹出、画在玻璃条上方的透明区里）必须有 overlay 放开这一档，
+//    否则菜单/卡片/面板会整块消失。
+
+/** 总开关：置 false 即回到「整窗吃鼠标」的老行为（完全不调 setShape）。
+ *  万一 setShape 在某台机器上有兼容问题，改这一行 + 重新构建即可回退，不必回滚其它改动。 */
+const DOCK_HIT_SHAPE = true
+
+/** region 相对 `.dock-bar` 实测矩形的外扩量。玻璃条的 box-shadow 与 24px 圆角
+ *  会画到元素盒子外，不外扩就会被 region 硬切出直边。8px 与 `.dock` 的 padding 一致，
+ *  加上后也不会越过窗口边界（下面有 clamp）。 */
+const DOCK_HIT_PAD = 8
+
+/** 玻璃条**靠内容那侧的透明区**要内缩多少（单位 DIP）。
+ *  `.dock-bar` 高 158，其中 82px 是「放大 + 悬浮标签」的透明 padding —— 这 82px 里
+ *  真正有内容的只有靠上的一段，剩下的空白不该继续挡下面的窗口。
+ *  实测（middle 档 `barTop=137.2`，窗口高 303）：悬浮标签 rect 顶边 `161.8`（= barTop+24.6）、
+ *  放大 1.4× 后的图标顶边 `192`（= barTop+54.8）。取 20 给标签留 4.6px 余量，两点都裁不到。
+ *  ⚠️ 不要调到 ≥24：`SetWindowRgn` 连绘制一起裁，会把悬浮标签的顶边切掉一截。 */
+const DOCK_HIT_INSET = 20
+
+/** 排查用：置 true 后每次真正生效的 region 都打一行日志（默认关，别在发布版打开）。 */
+const DOCK_HIT_DEBUG = false
+
+/** renderer 上报的 `.dock-bar` 矩形（窗口坐标 / DIP，与 CSS px 1:1，无需按 DPI 换算）。 */
+let dockBarRect: { x: number; y: number; width: number; height: number } | null = null
+/** 是否有浮层开着（「+」菜单 / 右键菜单 / 盘符卡片 / 文件夹卡片 / 分组面板）。 */
+let dockOverlayOpen = false
+/** 上一次真正生效的 region（"x,y,w,h"）。上报是高频通道、React 也会重复报同值，
+ *  相同的 region 不再调 setShape——避免无意义的 SetWindowRgn 引起重绘闪烁。 */
+let dockShapeApplied = ''
+
+/** setShape 抛错只记一次日志（避免每次上报都刷屏）。 */
+let dockShapeErrorLogged = false
+
+/** 按当前状态重设窗口命中区。窗口重建、浮层开合、图标增删（玻璃条宽度变化）后都要调。 */
+function applyDockHitRegion(win: BrowserWindow | null = mainWindow): void {
+  if (!DOCK_HIT_SHAPE) return
+  if (!win || win.isDestroyed()) return
+  const { width: cw, height: ch } = win.getContentBounds()
+  if (cw <= 0 || ch <= 0) return
+  const apply = (x: number, y: number, width: number, height: number): void => {
+    // 空 region = 窗口彻底不可见且不可点：宁可保持原样也不要传进去
+    if (width <= 0 || height <= 0) return
+    const key = `${x},${y},${width},${height}`
+    if (key === dockShapeApplied) return
+    dockShapeApplied = key
+    try {
+      win.setShape([{ x, y, width, height }])
+      if (DOCK_HIT_DEBUG) console.log('[dock-hit-region] applied', key)
+    } catch (err) {
+      // setShape 是实验性 API（`@experimental`，仅 win32/linux）。它一旦抛错，
+      // 后续每次上报都会重试并重复刷屏，所以这里把 key 回滚、让下一次上报还能再试，
+      // 同时只记一次错误。**绝不能让它把主进程打崩**：region 只是个优化，
+      // 失败的正确降级就是「整窗吃鼠标」（= 这个特性上线前的行为）。
+      dockShapeApplied = ''
+      if (!dockShapeErrorLogged) {
+        dockShapeErrorLogged = true
+        console.error('[dock-hit-region] setShape failed, falling back to full-window:', err)
+      }
+    }
+  }
+  // 浮层期间 / 还没拿到第一次上报：放开整窗。
+  // 「还没上报」也放开是刻意的——宁可启动后那几十毫秒不穿透，也不能让首帧的玻璃条
+  // 因为 region 算错而整块不可见（用户会以为 Dock 挂了）。
+  if (dockOverlayOpen || !dockBarRect) {
+    apply(0, 0, cw, ch)
+    return
+  }
+  const x = Math.max(0, Math.floor(dockBarRect.x - DOCK_HIT_PAD))
+  const right = Math.min(cw, Math.ceil(dockBarRect.x + dockBarRect.width + DOCK_HIT_PAD))
+  const barTop = dockBarRect.y
+  const barBottom = dockBarRect.y + dockBarRect.height
+  // 放大区与悬浮标签永远在玻璃条**背离窗口贴边侧**的那一边：bottom/middle 档在 bar 上方，
+  // top 档整套几何垂直镜像、在 bar 下方。所以只内缩那一侧，贴边侧照旧外扩 8px。
+  const growUp = dockEdge !== 'top'
+  const y = growUp
+    ? Math.max(0, Math.floor(barTop + DOCK_HIT_INSET))
+    : Math.max(0, Math.floor(barTop - DOCK_HIT_PAD))
+  const bottom = growUp
+    ? Math.min(ch, Math.ceil(barBottom + DOCK_HIT_PAD))
+    : Math.min(ch, Math.ceil(barBottom - DOCK_HIT_INSET))
+  apply(x, y, right - x, bottom - y)
+}
+
+// renderer 上报玻璃条几何 + 浮层状态（高频通道，用 send 不用 invoke：
+// ResizeObserver 在拖入/滚动时会连着来几发，不该让 renderer 等 Promise）
+ipcMain.on('dock-hit-region', (_e, payload: unknown) => {
+  if (!payload || typeof payload !== 'object') return
+  const p = payload as Record<string, unknown>
+  const overlay = p.overlay === true
+  const x = Number(p.x)
+  const y = Number(p.y)
+  const width = Number(p.width)
+  const height = Number(p.height)
+  const shaped = [x, y, width, height].every((n) => Number.isFinite(n)) && width > 0 && height > 0
+  if (shaped) dockBarRect = { x, y, width, height }
+  // 形状不可用（元素还没布局 / 窗口刚重建）时只更新 overlay —— 保留上一次可用矩形，
+  // 不要用 NaN/0 覆盖成「整窗放开」，否则一次瞬时上报就会让穿透失效好一会儿
+  dockOverlayOpen = overlay
+  applyDockHitRegion()
+})
+
 // ─── 「已在运行的目标 = 激活它的窗口」而不是再开一个（v1.13.5）────────────────
 // 背景：点 Dock 图标是 execFile → CreateProcess，对**单实例/托盘型**应用（微信、
 // QQ、各类 IM）不会去激活已有实例，而是**又开一个进程**。实测（本机微信 4.1）：
@@ -2748,6 +2868,12 @@ public static class WinZ {
 function createWindow(edge: DockEdge, startHidden: boolean): void {
   const iconPath = resolveResource('icon.ico')
   dockEdge = edge
+  // 🚫 换新 HWND 时必须清掉 region 去重 key，否则「重建窗口」这条路上 region 永久丢失：
+  // ready-to-show 与 renderer 首帧上报算出来的 key 与上一扇窗口完全相同（尺寸不变、浮层
+  // 关着），`apply()` 里 `key === dockShapeApplied` 直接 return → 新窗口从来没调过
+  // setShape → 整窗恢复吃鼠标（用户报障就是「改进之后又不穿透了」）。
+  // 去重只能用来挡「同一扇窗口的重复上报」，不能跨窗口继承。
+  dockShapeApplied = ''
   const { w: winW, h: winH } = windowSizeFor(edge)
   const pos = positionForEdge(edge, { w: winW, h: winH })
 
@@ -2780,6 +2906,10 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
   // 窗口位置只由「位置」预设决定（见 positionForEdge / applyDockEdge）。
 
   mainWindow.on('ready-to-show', () => {
+    // 命中区兜底重设：窗口重建（切竖排档位 / activate）后新 HWND 没有 region，
+    // 而 renderer 的首帧上报要等 page 加载完。这里先用上一扇窗口记下的矩形顶一下，
+    // 尺寸没变所以通常是对的；renderer 挂载后会上报真实值覆盖它。
+    applyDockHitRegion(mainWindow)
     // 是否显示只看 startHidden（调用方给出的「原本显示 / 原本收在托盘里」）。
     // 曾经这里还判断 startedAtLogin，那是整进程常量：开机自启会话里永远为真，
     // 于是切位置重建出来的窗口一律不显示——Dock 会直接消失进托盘。

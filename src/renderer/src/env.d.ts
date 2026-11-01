@@ -117,5 +117,13 @@ interface Window {
     getAutoStart: () => Promise<boolean>
     setAutoStart: (enabled: boolean) => Promise<boolean>
     dockPointer: (inside: boolean) => void
+    /** 上报 `.dock-bar` 矩形 + 浮层状态，主进程用它算 `setShape()` 的命中区 */
+    setDockHitRegion: (rect: {
+      x: number
+      y: number
+      width: number
+      height: number
+      overlay: boolean
+    }) => void
   }
 }
