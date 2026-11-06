@@ -12,8 +12,8 @@
  *   读 electron-builder 发布时自动生成的 `latest.yml`（只需一个静态文件），
  *   比对版本号，有新版就提示并打开下载页。用户自己决定什么时候升级。
  *
- * ⚠️ 发布前必改：把 UPDATE_FEED_URL 换成自己的托管地址（GitHub Releases / 自建静态站均可）。
- *    现在这个是占位地址，请求必然 404 —— 表现为「检查更新失败：HTTP 404」，不是 bug。
+ * feed 指向本仓库的 GitHub Release：`releases/latest/download/latest.yml` 永远解析到
+ * 最新一版的清单（electron-builder 打包时会把 latest.yml 一并产出，发 Release 时一起上传即可）。
  */
 
 import { net, shell, app } from 'electron'
@@ -28,7 +28,7 @@ import { logInfo, logWarn } from './logger'
  *  path: QuickLaunch-Setup-1.16.0.exe
  *  releaseDate: '2026-11-07T00:00:00.000Z'
  */
-const UPDATE_FEED_URL = 'https://example.invalid/quicklaunch/latest.yml'
+const UPDATE_FEED_URL = 'https://github.com/wannnmoo/QuickLaunch/releases/latest/download/latest.yml'
 
 export type UpdateStatus = 'dev' | 'latest' | 'available' | 'error'
 
