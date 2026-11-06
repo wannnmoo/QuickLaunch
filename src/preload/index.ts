@@ -1,90 +1,28 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type {
+  AppEntry,
+  AppSettings,
+  DockEdge,
+  FolderIconsPayload,
+  FolderListing,
+  LnkInfo,
+  LoadShortcutsResult,
+  RunAppResult
+} from '../shared/types'
 
-/** `run-app` 的返回值。
- *  - `true`          已启动，或「已在运行且窗口已激活/置前」
- *  - `false`         启动失败（目标不存在 / 无法运行 / UAC 被取消）
- *  - `'in-tray'`     目标**已在运行**、窗口收在系统托盘里，并且**没能**用 UI Automation
- *                    点开它的托盘图标。主进程既不再开进程（那会多开一个实例），
- *                    也不强行显示它的窗口（有概率让它失去响应），
- *                    所以由 renderer 提示用户去点托盘图标。
- *  ⚠️ 不要简化回 boolean：这个状态必须能和「成功/失败」区分开，
- *     否则用户看到的就是「点了没反应」。
- *  ⚠️ 原来的 `'probe-failed'`（探询给不出结论时故意不启动）已在 v1.13.8 删掉 ——
- *     它会把「进程在、但连窗口都没有」的目标（Clash Verge 这类 Tauri 托盘应用）
- *     永久挡在门外。现在这种情况一律 fail-open：直接启动。 */
-export type RunAppResult = true | false | 'in-tray'
-
-export interface LnkInfo {
-  targetPath: string
-  arguments: string
-  workingDirectory: string
-  windowStyle: number
-  hotkey: string
-  iconLocation: string
-  description: string
-  iconDataUrl: string
-}
-
-export interface AppEntry {
-  id: number
-  iconDataUrl: string
-  targetPath: string
-  arguments: string
-  workingDirectory: string
-  description: string
-  isFolder?: boolean
-  specialType?: 'this-pc' | 'recycle-bin'
-  /** 分组（Stack）：点击展开面板而不启动；targetPath 为空 */
-  isGroup?: boolean
-  /** 所属分组的 id（无此字段 = Dock 顶层图标） */
-  groupId?: number
-  /** 分隔线：不启动、不参与统计与桌面扫描；靠右键图标「在此之前插入分隔线」创建 */
-  isSeparator?: boolean
-}
-
-/** `load-shortcuts` 的返回：条目 + 配置是否损坏 + 是否从 `.bak` 恢复。
- *  不能只返回数组——解析失败返回空数组会让 renderer 把整份配置当成「用户清空了」
- *  再保存回磁盘，静默覆盖掉原文件。 */
-export interface LoadShortcutsResult {
-  entries: AppEntry[]
-  /** true = 原文件读不出来（JSON 损坏/读失败）；renderer 必须提示用户 */
-  corrupt: boolean
-  /** true = entries 来自 `shortcuts.json.bak` */
-  recovered: boolean
-}
-
-/** 文件夹子项（悬停预览卡片用） */
-export interface FolderChild {
-  name: string
-  path: string
-  isDir: boolean
-  /** 文件字节数；目录恒为 -1（不递归统计） */
-  size: number
-  iconDataUrl: string
-}
-
-export interface FolderListing {
-  path: string
-  name: string
-  folders: number
-  files: number
-  items: FolderChild[]
-  /** 超出列举上限（400）未列出的条目数 */
-  truncated: number
-  error?: 'missing' | 'denied' | 'notdir'
-}
-
-/** 图标分批补齐事件负载：列表先返回，图标分批提取完后就地替换（只含本批取到的路径） */
-export interface FolderIconsPayload {
-  path: string
-  /** 路径 → data:image/png;base64,… */
-  icons: Record<string, string>
-}
-
-/** 停靠位置：bottom = 底部横条；top = 顶部横条；middle = 悬浮屏幕中央；
- *  left / right = 侧边竖排（下一阶段） */
-export type DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'
+// 类型的唯一真相源在 src/shared/types.ts（renderer / preload / main 三边共享）。
+// 这里只 re-export，保持 `import type { AppEntry } from '../preload'` 这类既有写法不断。
+export type {
+  AppEntry,
+  DockEdge,
+  FolderChild,
+  FolderIconsPayload,
+  FolderListing,
+  LnkInfo,
+  LoadShortcutsResult,
+  RunAppResult
+} from '../shared/types'
 
 // 停靠位置（主进程通过 additionalArguments 传进来，首帧即可用）。
 // 兜底值必须与主进程的 DEFAULT_EDGE 一致（中间），否则参数缺失时会出现
@@ -172,6 +110,10 @@ const api = {
   /** Save shortcuts to disk. 返回 false = 写盘失败（磁盘满/无权限），调用方必须提示。 */
   saveShortcuts: (data: AppEntry[]): Promise<boolean> =>
     ipcRenderer.invoke('save-shortcuts', data),
+  /** A1：把条目上的内联 base64 图标外置成 `iconFile`（落盘到 userData/icons/）。
+   *  返回新数组，`changed = false` 时 entries 与入参等价（可以直接沿用旧 state）。 */
+  externalizeIcons: (data: AppEntry[]): Promise<{ entries: AppEntry[]; changed: boolean }> =>
+    ipcRenderer.invoke('externalize-icons', data),
   /** Select one or more folders, returning each one's path, name, and system icon. */
   selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string }[]> =>
     ipcRenderer.invoke('select-folder'),
@@ -194,6 +136,9 @@ const api = {
     ipcRenderer.on('flush-pending-save', listener)
     return () => { ipcRenderer.removeListener('flush-pending-save', listener) }
   },
+  /** 退出前落盘完成的回执（B5）：主进程收到后才真正退出，最多等 800ms。
+   *  renderer 必须在 save-shortcuts 的 Promise 落定之后才调它 —— 提前调等于没等。 */
+  flushSaveDone: (): void => ipcRenderer.send('flush-save-done'),
   /** 订阅「进入键盘导航」事件（Alt+Space 唤出 Dock 时由主进程推送），返回取消订阅函数。 */
   onNavEnter: (callback: () => void): (() => void) => {
     const listener = (): void => callback()
@@ -216,6 +161,17 @@ const api = {
   /** 应用版本号（显示在「+」菜单底部）。 */
   getAppVersion: (): Promise<string> =>
     ipcRenderer.invoke('get-app-version'),
+  /** 检查更新（F1）：读 latest.yml 比对版本。永不 reject，失败以 status:'error' 返回。 */
+  checkUpdate: (): Promise<{
+    status: 'dev' | 'latest' | 'available' | 'error'
+    current: string
+    latest?: string
+    url?: string
+    reason?: string
+  }> => ipcRenderer.invoke('check-update'),
+  /** 打开更新下载页（只接受 http/https）。 */
+  openUpdatePage: (url: string): Promise<boolean> =>
+    ipcRenderer.invoke('open-update-page', url),
   /** 开机自启动当前是否开启（注册表 Run 登录项）。 */
   getAutoStart: (): Promise<boolean> =>
     ipcRenderer.invoke('get-auto-start'),
@@ -242,7 +198,47 @@ const api = {
     height: number
     /** true = 有浮层开着，命中区临时放开成整个窗口 */
     overlay: boolean
-  }): void => ipcRenderer.send('dock-hit-region', rect)
+    /** 朝窗口内侧内缩多少 px（E1：随图标尺寸缩放，60px 档 = 20）。
+     *  不传则主进程用默认 20 —— 老版本 renderer 上报的 payload 里没有这个字段。 */
+    inset?: number
+  }): void => ipcRenderer.send('dock-hit-region', rect),
+  /** 渲染端未捕获错误上报（落进 userData/logs/main.log）。打包版里没有终端，
+   *  这是 renderer 唯一能被事后看到的通道。 */
+  reportError: (payload: { message: string; stack?: string; source?: string }): void =>
+    ipcRenderer.send('report-renderer-error', payload),
+  /** 在资源管理器里打开日志目录 */
+  openLogDir: (): Promise<boolean> =>
+    ipcRenderer.invoke('open-log-dir'),
+  /** 导出诊断包（日志 + 配置 + 环境信息）到桌面，返回 zip 路径；false = 失败 */
+  exportDiagnostics: (): Promise<string | false> =>
+    ipcRenderer.invoke('export-diagnostics'),
+  /** 用户设置：**同步**首读（sendSync）。renderer 把它当 useState 初始值，
+   *  这样首帧的主题/图标尺寸/玻璃强度就是对的，不会「先画默认、再翻成用户值」。 */
+  settingsInitial: (): AppSettings =>
+    ipcRenderer.sendSync('get-settings-sync') as AppSettings,
+  /** 用户设置（异步读取，用于窗口重建后重新同步）。 */
+  getSettings: (): Promise<AppSettings> =>
+    ipcRenderer.invoke('get-settings'),
+  /** 改设置：只传要改的字段（partial patch），返回合并后的完整设置。 */
+  setSettings: (patch: Partial<AppSettings>): Promise<AppSettings> =>
+    ipcRenderer.invoke('set-settings', patch),
+  /** 订阅设置变更（主进程写盘后广播给所有窗口），返回取消订阅函数。 */
+  onSettingsChanged: (callback: (settings: AppSettings) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, s: AppSettings): void => callback(s)
+    ipcRenderer.on('settings-changed', listener)
+    return () => { ipcRenderer.removeListener('settings-changed', listener) }
+  },
+  /** 打开设置中心（独立窗口 760×560）。Dock 只有 300px 高、透明窗不能 resize，
+   *  所以设置表单不在菜单里，而是在自己的窗口里。 */
+  openSettings: (): Promise<boolean> =>
+    ipcRenderer.invoke('open-settings'),
+  /** 关闭当前窗口（设置中心的标题栏 × 与 Esc 都走这条）。 */
+  closeSettings: (): void => ipcRenderer.send('settings-close'),
+  /** 最小化当前窗口（设置中心标题栏 –）。 */
+  minimizeSettings: (): void => ipcRenderer.send('settings-minimize'),
+  /** 打开数据目录（shortcuts.json / icons / logs 所在的 userData）。 */
+  openDataDir: (): Promise<boolean> =>
+    ipcRenderer.invoke('settings-data-dir')
 }
 
 if (process.contextIsolated) {
@@ -250,7 +246,9 @@ if (process.contextIsolated) {
     contextBridge.exposeInMainWorld('electron', electronAPI)
     contextBridge.exposeInMainWorld('api', api)
   } catch (error) {
-    console.error(error)
+    // contextBridge 失败意味着 window.api 根本没挂上，renderer 会立刻在调用处报错；
+    // 主进程侧由 render-process-gone / 看门狗兜底，这里只需保证异常不外泄打断 preload 执行。
+    void error
   }
 } else {
   // @ts-ignore (define in dts)

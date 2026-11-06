@@ -1,0 +1,96 @@
+/**
+ * 设计 token（D4）——「新代码从这里取色，不要写字面量」。
+ *
+ * 为什么单独一个文件、而不是继续往 App.css 的主题块里加：
+ *   ① App.css 已经 2100+ 行，三套主题的变量散在 `.app` / `.app.theme-light` /
+ *      `.app.theme-transparent` 三个块里，新加一条就得翻三处确认「另外两个主题会不会难看」；
+ *   ② 本轮新增的浮层（撤销条、滚动条、崩溃屏、偏好设置行）都不属于 Dock 玻璃体系，
+ *      它们的用色是**通用 UI 语义**（危险/成功/中性表面），继续挤在玻璃变量里会混淆；
+ *   ③ 这张表可以整体按主题覆盖一次，新增一处浮层只需引用 var()。
+ *
+ * 约定：
+ *   - 所有 token 以 `--ui-` 前缀开头，与玻璃体系的 `--dock-*` / `--glass-*` 分开；
+ *   - 每个 token 都在 `.app`（= 默认黑夜）给值，在 `.app.theme-light` 里覆盖；
+ *     `.theme-transparent` 复用夜晚那套（透明主题本身就是「无底玻璃」，浮层用深色卡）；
+ *   - **不允许**在 token 值里引用其它 token（会导致主题覆盖时循环或失效），只写字面量。
+ */
+
+.app {
+  /* 浮层表面（撤销条、诊断卡、菜单外的临时卡片） */
+  --ui-surface: rgba(24, 28, 38, 0.94);
+  --ui-surface-solid: #181c26;
+  --ui-surface-border: rgba(255, 255, 255, 0.12);
+
+  /* 主/次文字 */
+  --ui-text: rgba(255, 255, 255, 0.92);
+  --ui-text-dim: rgba(255, 255, 255, 0.62);
+  --ui-text-faint: rgba(255, 255, 255, 0.42);
+
+  /* 强调色（与图标主色 #3B7BD5 同族） */
+  --ui-accent: #3b7bd5;
+  --ui-accent-strong: rgba(58, 123, 213, 0.92);
+  --ui-accent-glow: rgba(58, 123, 213, 0.7);
+  --ui-accent-soft: rgba(96, 165, 238, 0.9);
+
+  /* 语义色：危险（删除/失败）、成功（已恢复/已保存） */
+  --ui-danger: #e2685f;
+  --ui-success: #4fb477;
+
+  /* 滚动条拇指（Dock 底部 2px 指示条与菜单滚动条共用） */
+  --ui-thumb: rgba(255, 255, 255, 0.28);
+  --ui-thumb-strong: rgba(255, 255, 255, 0.44);
+
+  /* 阴影梯度：浮层用 lg，提示条用 sm */
+  --ui-shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.28);
+  --ui-shadow-lg: 0 14px 34px rgba(0, 0, 0, 0.42);
+}
+
+.app.theme-light {
+  --ui-surface: rgba(252, 253, 255, 0.96);
+  --ui-surface-solid: #f7f9fc;
+  --ui-surface-border: rgba(16, 22, 36, 0.12);
+
+  --ui-text: rgba(22, 27, 38, 0.92);
+  --ui-text-dim: rgba(22, 27, 38, 0.6);
+  --ui-text-faint: rgba(22, 27, 38, 0.4);
+
+  --ui-accent: #2f6ec4;
+  --ui-accent-strong: rgba(47, 110, 196, 0.9);
+  --ui-accent-glow: rgba(47, 110, 196, 0.45);
+  --ui-accent-soft: rgba(47, 110, 196, 0.85);
+
+  --ui-danger: #c9483e;
+  --ui-success: #2f8f57;
+
+  --ui-thumb: rgba(16, 22, 36, 0.22);
+  --ui-thumb-strong: rgba(16, 22, 36, 0.38);
+
+  --ui-shadow-sm: 0 4px 14px rgba(20, 30, 50, 0.14);
+  --ui-shadow-lg: 0 14px 34px rgba(20, 30, 50, 0.22);
+}
+
+/* 透明主题：桌面壁纸直接透上来，浮层必须用深色卡才有可读性（与夜晚同一套）。
+   这里显式写明而不是「什么都不写」—— 万一以后有人给 .app 换默认色，透明主题不会跟着飘。 */
+.app.theme-transparent {
+  --ui-surface: rgba(18, 22, 32, 0.9);
+  --ui-surface-solid: #12161f;
+  --ui-surface-border: rgba(255, 255, 255, 0.14);
+
+  --ui-text: rgba(255, 255, 255, 0.94);
+  --ui-text-dim: rgba(255, 255, 255, 0.66);
+  --ui-text-faint: rgba(255, 255, 255, 0.46);
+
+  --ui-accent: #4f8ce0;
+  --ui-accent-strong: rgba(79, 140, 224, 0.92);
+  --ui-accent-glow: rgba(79, 140, 224, 0.72);
+  --ui-accent-soft: rgba(120, 180, 240, 0.9);
+
+  --ui-danger: #e8766c;
+  --ui-success: #58bd82;
+
+  --ui-thumb: rgba(255, 255, 255, 0.32);
+  --ui-thumb-strong: rgba(255, 255, 255, 0.5);
+
+  --ui-shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.34);
+  --ui-shadow-lg: 0 14px 34px rgba(0, 0, 0, 0.5);
+}

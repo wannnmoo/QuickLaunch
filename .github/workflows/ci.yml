@@ -1,0 +1,41 @@
+name: CI
+
+# 只跑「能在无桌面环境里跑完」的检查：
+#   lint（自建规则）→ typecheck → 单测 → 构建
+# ⚠️ 刻意不跑回归探针（devtools/probe/*.cjs）：它们要起真实 Electron 窗口、
+#    读真实窗口 region（SetWindowRgn）、点真实托盘图标，GitHub 的 runner 没有交互桌面，
+#    跑出来只会是环境噪声。探针留给本地 `npm run verify` 手动执行。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # 必须是 windows：项目里有大量 Windows 专有路径/注册表/ICO 断言，
+    # 换 linux 跑 typecheck 也可能通过，但那就等于没验证真实目标平台。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build

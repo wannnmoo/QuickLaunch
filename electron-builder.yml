@@ -1,7 +1,13 @@
 appId: com.quicklaunch.app
 productName: QuickLaunch
-# 使用本地手动下载的 Electron zip，跳过网络下载（需与项目根目录的 electron-v*.zip 版本一致）
-electronDist: ./electron-v43.1.0-win32-x64.zip
+# 直接复用 node_modules/electron/dist（npm install 时已经解包好的运行时），
+# 不再在仓库根目录放一份 137 MB 的 electron-v*.zip。
+#   ① 那份 zip 从来没有被 git 跟踪（.gitignore 的 electron-v*.zip），
+#      所以它只是「本地磁盘上的临时物料」，删掉不影响任何克隆；
+#   ② electronDist 接受 zip 或**已解包目录**，指到 node_modules 就省了复制一份；
+#   ③ 新环境只要 `npm install` 过，这个目录必然存在，无需额外下载。
+# ⚠️ 不要改回 ./electron-v*.zip：文件不在仓库里，package 会直接报找不到。
+electronDist: ./node_modules/electron/dist
 directories:
   buildResources: resources
 files:

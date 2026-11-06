@@ -1,3 +1,7 @@
+/* 设计 token（D4）：通用 UI 语义色/阴影，按主题各一张表。
+   必须在最前面 import —— 下面所有规则都可能引用 --ui-* 变量。 */
+@import './styles/tokens.css';
+
 * {
   margin: 0;
   padding: 0;
@@ -9,7 +13,7 @@
 :focus-visible {
   /* 可访问焦点：原来全站 outline:none，键盘 Tab 完全看不到焦点。
      2px 亮蓝 + 2px offset 在深/浅/透明三种主题与毛玻璃上都有足够对比度。 */
-  outline: 2px solid rgba(96, 165, 238, 0.9);
+  outline: 2px solid var(--ui-accent-soft, rgba(96, 165, 238, 0.9));
   outline-offset: 2px;
 }
 
@@ -22,8 +26,7 @@
    （类 + 伪类）补回。菜单项位于 .dropdown-scroll / .context-menu-scroll（overflow:auto）
    里，正 offset 在滚动区上下边缘会被裁掉，所以改用负 offset 把焦点框画在胶囊内侧。 */
 .dropdown-item:focus-visible,
-.context-menu-item:focus-visible,
-.theme-seg-btn:focus-visible {
+.context-menu-item:focus-visible {
   outline: 2px solid rgba(96, 165, 238, 0.9);
   outline-offset: -2px;
 }
@@ -47,8 +50,8 @@ html, body {
 /* ⚠️ 表单控件必须显式继承字体（v1.13.3 修，这条是「两种字体不匹配」的根因）：
    Chromium 的 UA 样式表给 button/input 设了自己的 font（不是 inherit），所以
    `.dropdown-item`（<button>）**拿不到** body 的字体栈 —— 实测它的 computed font-family
-   就是 `Arial`；而同在菜单里的 `.theme-seg-btn` 因为显式写了 `font: inherit`，
-   用的是应用字体栈。于是同一个浮层里两种中文字形并排：菜单项细而虚、分段按钮粗而实。
+   就是 `Arial`；而任何自己写了 `font: inherit` 的按钮控件（早先那个分段控件就是）
+   用的是应用字体栈。于是同一个浮层里两种中文字形并排：菜单项细而虚、按钮粗而实。
    统一在这里收口，别在各自的类里零散补 font: inherit。 */
 button, input, select, textarea {
   font: inherit;
@@ -125,11 +128,6 @@ button, input, select, textarea {
      仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层 */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(255, 255, 255, 0.12);
-  /* 主题嵌套选择器配色（黑夜） */
-  --nt-ink: rgba(255, 255, 255, 0.9);
-  --nt-ink-on: #1f2430;
-  --nt-shell: rgba(255, 255, 255, 0.08);
-  --nt-sub-bg: rgba(30, 36, 52, 0.85);
   --menu-text: #c0c0d0;
   --menu-hover-bg: rgba(58, 123, 213, 0.35);
   --menu-hover-text: #fff;
@@ -199,11 +197,6 @@ button, input, select, textarea {
   /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(0, 0, 0, 0.12);
-  /* 主题嵌套选择器配色（白天） */
-  --nt-ink: #1f2430;
-  --nt-ink-on: #fff;
-  --nt-shell: rgba(0, 0, 0, 0.07);
-  --nt-sub-bg: #fff;
   --menu-text: #333;
   --menu-hover-bg: rgba(58, 123, 213, 0.22);
   --menu-hover-text: #1659b0;
@@ -249,7 +242,7 @@ button, input, select, textarea {
      标签高出衬底的那 2px（标签 `bottom: calc(100% + 4px)`、高 20px → 顶边在衬底上方
      24px），这样悬浮标签的顶边正好落在玻璃条上沿，既不会被玻璃压住也不会被容器的
      overflow 裁掉。改这个值时把这三项一起算一遍。 */
-  height: 158px;
+  height: calc(var(--dock-pad, 82px) + var(--dock-icon, 60px) + 16px);
   /* 上限 = 视口宽度 − .dock 的左右 padding（各 24px）。
      用 JS 写入的 `--dock-vw`（= window.innerWidth）而不是 `100vw`：实测在本窗口里
      `100vw` 比 `window.innerWidth` **大 2px**（1202 vs 1200），玻璃条会多出 2px 溢出
@@ -270,7 +263,7 @@ button, input, select, textarea {
      82（透明放大区）+ 8（衬底在玻璃内再留 8px）− 60（衬底高）= 图标衬底上方 8px。
      v1.13.1 修过一次：原来是 top:70px 而衬底贴玻璃下沿，于是玻璃条「上留 16px、下留 0px」，
      用户一眼就看出「图标上面间距比下面大」。 */
-  top: 82px;
+  top: var(--dock-pad, 82px);
   bottom: 0; /* 玻璃条高 76 = 8 + 衬底 60 + 8（衬底上下各 8px，居中） */
   z-index: 0;
   /* 三层背景，自下而上（多重背景的第一层画在最上面）：
@@ -284,8 +277,8 @@ button, input, select, textarea {
     linear-gradient(180deg, var(--dock-border-grad-a) 0%, var(--dock-border-grad-b) 100%) border-box,
     radial-gradient(120% 180% at 50% -40%, var(--dock-sheen), transparent 60%) padding-box,
     linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%) padding-box;
-  backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
-  -webkit-backdrop-filter: blur(36px) saturate(var(--dock-sat, 1.7));
+  backdrop-filter: blur(var(--dock-blur, 36px)) saturate(var(--dock-sat, 1.7));
+  -webkit-backdrop-filter: blur(var(--dock-blur, 36px)) saturate(var(--dock-sat, 1.7));
   /* 描边颜色交给上面的渐变层渲染，但这个透明边框**必须有宽度和样式**：
      没有 border-width 时 border 盒等于 padding 盒，① 的渐变会铺满整个玻璃面
      （暗色被 50% 白→12% 白洗淡、亮色上白下灰），②③ 也被垫在下面。
@@ -382,7 +375,7 @@ html[data-glass-fx='off'] .dock-bg::after {
      158 − 82 − padding-bottom。给 8px 会把内容盒压到 68，衬底 60 居中后整体上移 4px
      （实测上 4 / 下 12）。留 0 时内容盒 76，衬底居中正好落在玻璃条 76 里、上下各 8px。
      改这个值必须连着 .dock-bg 的 top 与 .dock-bar 的 height 一起改。 */
-  padding: 82px 16px 0;
+  padding: var(--dock-pad, 82px) 16px 0;
   /* 宽度上限**只由 .dock-bar 的 max-width 决定**，这里不再写 max-width: 100%。
      原因：.dock-bar 是 `width: max-content`（收缩包裹），其内部的百分比 max-width
      解析基准是不确定的容器宽度，规范上要按「先忽略该约束再回代」处理——留着它既是
@@ -427,7 +420,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .dock-edge {
   position: absolute;
-  top: 82px; /* 对齐 .dock-bg 背景区（改 .dock-bg 的 top 时这里要同步） */
+  top: var(--dock-pad, 82px); /* 对齐 .dock-bg 背景区（改 .dock-bg 的 top 时这里要同步） */
   bottom: 0;
   width: 48px;
   pointer-events: none;
@@ -478,8 +471,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 .dock-icon-wrap {
-  width: 60px;
-  height: 60px;
+  width: var(--dock-icon, 60px);
+  height: var(--dock-icon, 60px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -535,8 +528,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 .dock-icon {
-  width: 44px;
-  height: 44px;
+  width: calc(var(--dock-icon, 60px) - 16px);
+  height: calc(var(--dock-icon, 60px) - 16px);
   border-radius: 12px;
   pointer-events: none;
   image-rendering: auto;
@@ -597,8 +590,39 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* ─── Drag & drop ──────────────────────────────────────────────────── */
 
 .dock-item.dragging {
-  opacity: 0.25;
-  transform: scale(0.95) !important;
+  opacity: 0.55;
+}
+
+/* E5：被拿起的那一项微微放大并抬起阴影 —— 原来只有 opacity 0.25 + scale(0.95)，
+   看起来像「被删掉了」而不是「被我拿在手上」 */
+.dock-item.dragging .dock-icon-wrap {
+  transform: scale(1.06);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.45);
+}
+
+/* C2：拖文件悬停在此图标上 = 松手用它打开。用「外扩光环 + 微放大」表达"目标"，
+   与选中框（左右两条渐变竖框）和归组提示（.drop-target）都区分开。
+   outline 不参与布局，不会让 Dock 里其他图标位移。 */
+.dock-item.drop-open .dock-icon-wrap {
+  border-radius: 16px;
+  box-shadow:
+    0 0 0 2px rgba(96, 165, 238, 0.9),
+    0 0 18px rgba(58, 123, 213, 0.6);
+  transform: scale(1.06);
+}
+
+.dock-item.drop-open .dock-icon-wrap::after {
+  /* 图标下方一个小三角，指向"接住文件"的动作 */
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -6px;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid rgba(96, 165, 238, 0.9);
 }
 
 /* ─── 数字与路径的排印基线 ──────────────────────────────────────────────
@@ -623,8 +647,9 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* 拖拽插入指示线：与选中框（❲❳ 渐变竖框）统一成「两端淡出 + 柔和光晕」，
    原来是一条纯蓝硬边竖条，两套指示语言不一致 */
 .drop-indicator {
+  position: relative;
   width: 3px;
-  height: 60px;
+  height: calc(var(--dock-icon, 60px) * 0.72);
   align-self: center;
   border-radius: 999px;
   background: linear-gradient(
@@ -637,6 +662,29 @@ html[data-glass-fx='off'] .dock-bg::after {
   box-shadow: 0 0 10px rgba(58, 123, 213, 0.55);
   margin: 0 4px;
   flex-shrink: 0;
+}
+
+/* E5：两端各一颗圆头 —— 渐变淡出的线在纯色背景上端点太虚，看不出「插进这里」，
+   两个小圆点把落点钉住，又不会像硬边竖条那样抢戏 */
+.drop-indicator::before,
+.drop-indicator::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(96, 165, 238, 1);
+  transform: translateX(-50%);
+  box-shadow: 0 0 8px rgba(58, 123, 213, 0.7);
+}
+
+.drop-indicator::before {
+  top: -4px;
+}
+
+.drop-indicator::after {
+  bottom: -4px;
 }
 
 /* ─── Add button ────────────────────────────────────────────────────── */
@@ -677,8 +725,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   transform: translateX(-50%);
   min-width: 155px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
   border-radius: 16px;
   padding: 6px 0;
@@ -738,9 +786,15 @@ html[data-glass-fx='off'] .dock-bg::after {
   color: var(--menu-hover-text);
 }
 
+/* 「设置…」项右侧的小箭头：表示它会打开另一扇窗口（而非在当前菜单里就地切换） */
+.item-chevron {
+  flex: 0 0 auto;
+  opacity: 0.5;
+}
+
 /* 开机自启动开关指示器：靠菜单项右侧显示（space-between 推右）。
-   配色与主题分段选择器统一（--switch-on-bg = --nt-ink 同源强调色，
-   各主题定义自己的开/关配色），关=弱轨道+白球在左，开=强调底+对比球在右 */
+   各主题定义自己的开/关配色（`--switch-on-bg` / `--switch-on-knob` / `--switch-off-bg`），
+   关=弱轨道+白球在左，开=强调底+对比球在右 */
 .item-switch {
   position: relative;
   width: 30px;
@@ -793,81 +847,11 @@ html[data-glass-fx='off'] .dock-bg::after {
   color: var(--menu-meta, rgba(255, 255, 255, 0.42));
 }
 
-/* ─── 主题分段选择器（纯 flex，无绝对定位，不可能错位）─────────────────
-   主行：透明 | 毛玻璃（激活项自带滑块底色高亮）；
-   毛玻璃激活时下方展开子行：黑夜 | 白天。
-   配色：--nt-ink 激活项底色、--nt-ink-on 激活项文字、--nt-shell 轨道底 */
-.theme-seg {
-  display: flex;
-  width: calc(100% - 16px);
-  margin: 0 8px 6px;
-  height: 34px;
-  padding: 3px;
-  background: var(--nt-shell);
-  border-radius: 999px;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
-  user-select: none;
-  -webkit-tap-highlight-color: transparent;
-}
-
-.theme-seg-btn {
-  flex: 1;
-  display: grid;
-  place-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 999px;
-  /* font: inherit 在这里本来是必需的（button 不继承字体），v1.13.3 起
-     `button, input, select, textarea { font: inherit }` 已全局收口，这里保留无害。
-     字号/字重与 .dropdown-item 对齐，见那边的注释 */
-  font: inherit;
-  font-size: 0.84rem;
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  color: var(--menu-text);
-  opacity: 0.5;
-  cursor: pointer;
-  transition: background 0.2s, color 0.2s, opacity 0.2s;
-  -webkit-tap-highlight-color: transparent;
-}
-
-.theme-seg-btn:hover {
-  opacity: 0.8;
-}
-
-.theme-seg-btn.active {
-  opacity: 1;
-  color: var(--nt-ink-on);
-  background: var(--nt-ink);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
-}
-
-/* 子行：毛玻璃激活时展开（黑夜 | 白天），透明态隐藏 */
-.theme-seg-sub {
-  display: flex;
-  width: calc(100% - 16px);
-  margin: 0 8px 6px;
-  height: 26px;
-  padding: 2px;
-  background: var(--nt-shell);
-  border-radius: 999px;
-  user-select: none;
-}
-
-.theme-seg-sub.hidden {
-  display: none;
-}
-
-.theme-seg-sub .theme-seg-btn {
-  height: auto;
-  /* 子行只缩字号、不缩字重：字重不一致在并排时最显「两种字体」（v1.13.3） */
-  font-size: 0.78rem;
-}
-
-.theme-seg-sub .theme-seg-btn.active {
-  color: var(--nt-ink);
-  background: var(--nt-sub-bg);
-}
+/* ─── 分段控件：已随「+」菜单瘦身迁走 ──────────────────────────────────
+   v1.17 起主题材质 / 停靠位置 / 图标尺寸 / 放大 / 玻璃强度 / 悬停延迟 / 点击后行为
+   全部搬进设置中心（`src/renderer/src/settings/settings.css` 的 `.st-seg`），
+   Dock 菜单只留动作项，所以这一整组 `.theme-seg*` 规则已删除。
+   ⚠️ 不要再把它加回 App.css —— 菜单可用高度只有约 200px，塞配置必然要滚。 */
 
 /* ─── 菜单滚动条：隐藏 ──────────────────────────────────────────────────── */
 /* 滚动条滑块是接近满高的竖条，其方角会盖住菜单右上/右下角的圆角，右边缘看起来
@@ -896,8 +880,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   /* 宽度上限：超长名称也不至于顶出窗口；菜单项 nowrap，正常文案都占一行不折行 */
   max-width: 280px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
   border-radius: 16px;
   padding: 6px 0;
@@ -1094,11 +1078,6 @@ html[data-glass-fx='off'] .dock-bg::after {
   /* 透明风格不做噪点、也不做扫光：图标直接悬浮桌面，玻璃层不存在，
      纹理与光带都没有可附着的底。变量仍定义（列表项保持一致） */
   --glass-sat: 1;
-  /* 主题嵌套选择器配色（透明，浅色壁纸） */
-  --nt-ink: #1f2430;
-  --nt-ink-on: #fff;
-  --nt-shell: rgba(0, 0, 0, 0.12);
-  --nt-sub-bg: rgba(255, 255, 255, 0.6);
   /* 两端渐隐遮罩在透明背景上没有可渐隐的底，直接隐藏（滚动仍可用） */
   --dock-edge: transparent;
   /* 分隔符竖线（透明风格）：中性灰，浅/深壁纸上都看得见 */
@@ -1181,22 +1160,11 @@ html[data-glass-fx='off'] .dock-bg::after {
 .app.theme-transparent .dropdown-item,
 .app.theme-transparent .dropdown-version,
 .app.theme-transparent .context-menu-item,
-.app.theme-transparent .theme-seg-btn,
 .app.theme-transparent .edit-label {
   /* 0.65px 是实测的平衡点：0.5 以下笔画开始缺、0.8 以上字形被描边吃掉显虚发粗
      （描边是骑在字形轮廓上画的，越粗笔画越细） */
   -webkit-text-stroke: 0.65px rgba(255, 255, 255, 0.92);
   paint-order: stroke fill;
-}
-
-/* 未选中段位在透明主题里没有玻璃底托着，基础 .5 太淡；提高一档，
-   active（1）与 hover（.86）不受影响。 */
-.app.theme-transparent .theme-seg-btn:not(.active) {
-  opacity: 0.72;
-}
-
-.app.theme-transparent .theme-seg-btn:not(.active):hover {
-  opacity: 0.86;
 }
 
 /* 透明模式下白色文字不再使用白描边，改由深色投影托底：
@@ -1389,8 +1357,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   z-index: 0;
   border-radius: 24px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--dock-border);
   box-shadow: var(--dock-shadow);
 }
@@ -1414,7 +1382,9 @@ html[data-glass-fx='off'] .dock-bg::after {
   display: none;
 }
 
-/* 空状态：图标 + 主文案 + 副文案（原来是光秃秃一行小灰字） */
+/* 空状态（E6）：图标 + 主文案 + 副文案，三处（盘符卡片 / 文件夹卡片 / 分组面板）
+   共用这一套。`.drives-empty` 保留为历史类名（体积小、语义旧但仍在用的地方不动）。 */
+.es-block,
 .drives-empty {
   display: flex;
   align-items: center;
@@ -1426,31 +1396,29 @@ html[data-glass-fx='off'] .dock-bg::after {
   opacity: 0.85;
 }
 
+.es-block svg,
 .drives-empty svg {
   flex: 0 0 auto;
   opacity: 0.55;
 }
 
-.drives-empty .es-main {
+.es-main {
   white-space: nowrap;
 }
 
-.drives-empty .es-sub {
+.es-sub {
   font-size: 0.7rem;
   opacity: 0.7;
   white-space: nowrap;
 }
 
-/* 分组面板里的空态（唯一 flex 项，面板宽度随之收缩） */
+/* 分组面板里的空态（唯一 flex 项，面板宽度随之收缩）。
+   ⚠️ 这段要写在 `.es-block` 之后：两条选择器同权重，靠顺序覆盖 padding/justify */
 .group-panel-empty {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+  justify-content: flex-start;
   padding: 0 8px 14px;
   font-size: 12px;
-  color: var(--label-color);
   opacity: 0.78;
-  white-space: nowrap;
 }
 
 .group-panel-empty svg {
@@ -1597,8 +1565,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   padding: 10px 14px;
   border-radius: 18px;
   background: var(--menu-bg);
-  backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat, 1));
+  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
+  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--dock-border);
   box-shadow: var(--dock-shadow);
   overflow-y: auto;
@@ -1670,8 +1638,8 @@ html[data-glass-fx='off'] .dock-bg::after {
    这是可读性兜底，不是把透明主题变回毛玻璃——只在悬停卡片这种「必须读字」的浮层上使用。 */
 .app.theme-transparent .drives-card {
   background: rgba(16, 20, 28, 0.78);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  backdrop-filter: blur(var(--glass-blur-sm, 18px)) saturate(var(--glass-sat-sm, 1.2));
+  -webkit-backdrop-filter: blur(var(--glass-blur-sm, 18px)) saturate(var(--glass-sat-sm, 1.2));
   border-color: rgba(255, 255, 255, 0.16);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
@@ -1850,6 +1818,70 @@ html[data-glass-fx='off'] .dock-bg::after {
   box-shadow: 0 0 0 3px rgba(58, 123, 213, 0.25), 0 6px 18px rgba(0, 0, 0, 0.2);
 }
 
+/* C2：压在图标上（松手 = 用该程序打开）时换成实心蓝，和「松开即添加」区分开 */
+.drop-hint.drop-hint-open {
+  background: rgba(58, 123, 213, 0.92);
+  border-color: rgba(150, 200, 255, 0.9);
+  color: #fff;
+  box-shadow: 0 0 0 3px rgba(58, 123, 213, 0.28), 0 8px 22px rgba(0, 0, 0, 0.28);
+}
+
+/* ─── 删除撤销条（C3）─────────────────────────────────────────────────
+   位置在拖放提示条（bottom: 168px）上方一档，两者同时出现也不会互相盖住。
+   ⚠️ 它落在玻璃条上方的透明带里，主进程的命中区必须随之放开整窗
+      （App.tsx 的 overlayOpen 里已含 undoDelete），否则按钮点不动。 */
+.undo-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 206px;
+  transform: translateX(-50%);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 14px;
+  border-radius: 12px;
+  background: var(--ui-surface, rgba(24, 28, 38, 0.94));
+  border: 1px solid var(--ui-surface-border, rgba(255, 255, 255, 0.1));
+  color: var(--ui-text, #fff);
+  font-size: 0.8rem;
+  white-space: nowrap;
+  box-shadow: var(--ui-shadow-lg, 0 10px 26px rgba(0, 0, 0, 0.4));
+  animation: undo-toast-in 0.16s ease-out;
+}
+
+@keyframes undo-toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(4px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+.undo-toast-text {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.undo-toast-btn {
+  all: unset;
+  cursor: pointer;
+  padding: 3px 10px;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #fff;
+  background: var(--ui-accent-strong, rgba(58, 123, 213, 0.95));
+  transition: background 0.15s;
+}
+
+.undo-toast-btn:hover {
+  background: rgba(96, 165, 238, 1);
+}
+
+.undo-toast-btn:focus-visible {
+  outline: 2px solid rgba(150, 200, 255, 0.9);
+  outline-offset: 2px;
+}
+
 /* ─── 顶部 Dock（data-edge="top"）───────────────────────────────────────── */
 /* 窗口形状与底部 Dock 完全相同（宽 85% × 高 300），整套几何垂直镜像：
    玻璃条贴窗口上沿、82px 透明放大区让到下方，图标下沉、悬浮标签挂在图标下方，
@@ -1864,11 +1896,11 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .app[data-edge='top'] .dock-bg {
   top: 0; /* 玻璃条贴窗口上沿 */
-  bottom: 82px; /* 下方让出 82px 透明区（放大图标与标签往下顶出）→ 玻璃条仍高 76px */
+  bottom: var(--dock-pad, 82px); /* 下方让出透明放大区（放大图标与标签往下顶出）→ 玻璃条高度由 var 决定 */
 }
 
 .app[data-edge='top'] .dock-inner {
-  padding: 0 16px 82px; /* 透明放大区从上改到下（镜像 padding-top: 82px） */
+  padding: 0 16px var(--dock-pad, 82px); /* 透明放大区从上改到下（镜像 padding-top） */
   /* 纵向居中由基础规则的 align-items:center（row 的交叉轴）负责；这里只镜像 padding。
      绝对不能写 justify-content（基础规则 347-352 已说明它会破坏横向滚动的左侧可滚区） */
   align-items: center;
@@ -1876,7 +1908,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .app[data-edge='top'] .dock-edge {
   top: 0;
-  bottom: 82px; /* 两端渐隐跟随玻璃条的位置 */
+  bottom: var(--dock-pad, 82px); /* 两端渐隐跟随玻璃条的位置 */
 }
 
 /* 放大以「图标顶边」为原点：顶部时增长全部朝下（朝桌面方向顶出）。
@@ -1904,6 +1936,12 @@ html[data-glass-fx='off'] .dock-bg::after {
 .app[data-edge='top'] .drop-hint {
   bottom: auto;
   top: 168px; /* 镜像：Dock 高 158 + 10px 间隙 */
+}
+
+/* 删除撤销条同样镜像：让到底部，位置比提示条更靠窗口下沿（与底部布局的 206px 对称） */
+.app[data-edge='top'] .undo-toast {
+  bottom: auto;
+  top: 206px;
 }
 
 /* 分组面板（迷你 Dock）同样镜像：玻璃在上、透明放大区在下。
@@ -1935,3 +1973,83 @@ html[data-glass-fx='off'] .dock-bg::after {
 .app[data-edge='top'] .dropdown-menu {
   animation-name: dropdown-in-top;
 }
+
+/* ─── 渲染错误兜底屏（ErrorBoundary）─────────────────────────────────────────
+   整窗 300px 高、透明无边框：这张卡不能居中到屏幕，只能贴窗口内可用的那条带。
+   它出现时 Dock 已经渲染不出来，所以这里不看 data-edge，直接贴底并允许滚动。 */
+.crash-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 8px 24px;
+  font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  -webkit-app-region: no-drag;
+}
+
+.crash-card {
+  width: min(720px, 100%);
+  max-height: 284px;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: var(--ui-surface, rgba(24, 28, 38, 0.94));
+  border: 1px solid var(--ui-surface-border, rgba(255, 255, 255, 0.12));
+  box-shadow: var(--ui-shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.42));
+  color: var(--ui-text, #e8ecf4);
+}
+
+.crash-card h2 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.crash-msg {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--ui-danger, #ff9b8a);
+  word-break: break-all;
+}
+
+.crash-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.crash-actions button {
+  padding: 5px 12px;
+  font-size: 12px;
+  color: #e8ecf4;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.crash-actions button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.crash-card details summary {
+  font-size: 11px;
+  color: #9aa6bd;
+  cursor: pointer;
+}
+
+.crash-card pre {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: #9aa6bd;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ─── 「+」菜单的偏好设置行（E1/E2/C5/C6）已迁走 ─────────────────────
+   `.prefs-row` / `.prefs-label` / `.prefs-row .theme-seg*` 全部删除：那些配置项
+   现在在设置中心（`src/renderer/src/settings/settings.css` 的 `.st-row`）。
+   菜单只放动作，不再需要把分段控件塞进 200px 高的浮层里。 */

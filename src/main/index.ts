@@ -1,7 +1,40 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename, extname, dirname, parse } from 'path'
-import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, openSync, writeSync, fsyncSync, closeSync, renameSync, copyFileSync, unlinkSync, promises as fsp, type FSWatcher, type Dirent } from 'fs'
+import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, copyFileSync, promises as fsp, type FSWatcher, type Dirent } from 'fs'
 import { execFile, execFileSync } from 'child_process'
+import type {
+  AppEntry,
+  AppSettings,
+  DockEdge,
+  FolderChild,
+  FolderIconsPayload,
+  FolderListing
+} from '../shared/types'
+import { initLogger, logError, logInfo, logWarn, getLogDir, readRecentLog } from './logger'
+import { writeFileAtomic } from './persist'
+import { initSettings, registerSettingsIpc, getSettingsCache } from './settings'
+import { externalizeIcons, pruneIcons, registerIconProtocol, registerIconScheme } from './iconStore'
+// PowerShell 层（D2 拆分）：所有 C# 常量和统一调用入口都在 ps.ts —— 那里的注释说明了
+// 「C# 必须纯 ASCII」的原因，改脚本前先读。
+import {
+  ACTIVATE_CS,
+  DESKTOP_ICONS_CS,
+  FOLDER_ICON_SIZE,
+  ICON_EXTRACTOR_CS,
+  ICON_SIZE,
+  PICKED_IMAGE_MAX_EDGE,
+  runPowerShell,
+  TRAY_CLICK_CS
+} from './ps'
+// shortcuts.json 持久化层（D2 拆分）：读写/校验/迁移 + load/save/externalize-icons 三个 IPC
+// 都在那里，这里只需要在启动时注册一次。
+import { registerShortcutsIpc } from './shortcutsStore'
+import { registerSettingsWindowIpc } from './settingsWindow'
+import { checkForUpdates, openUpdatePage, scheduleSilentUpdateCheck } from './updater'
+
+// ⚠️ 必须在 app ready **之前**执行：自定义 scheme 的特权只能在 ready 前注册，
+//    ready 之后调用会直接抛错（而且这行是模块导入期副作用，import 位置别乱动）。
+registerIconScheme()
 
 
 let mainWindow: BrowserWindow | null = null
@@ -23,6 +56,10 @@ if (!gotSingleInstanceLock) {
   console.log('[app] 已有实例在运行，本次启动退出')
   app.quit()
 } else {
+  // 日志必须尽早就绪：后面所有「偶发、只在用户机器上出现」的问题都靠它留痕。
+  // 放在单实例锁之后（拿不到锁的进程立刻退出，没必要建日志目录）
+  initLogger()
+  logInfo('app', `启动 v${app.getVersion()} | electron ${process.versions.electron} | ${process.platform} ${process.arch} | packaged=${app.isPackaged}`)
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show()
@@ -98,6 +135,7 @@ function recoverDock(win: BrowserWindow): void {
   // 会让「点一下 Dock、再点其他软件」的 blur 被 canSinkNow() 吞掉（2.5s 内不让位）。
   // 真正需要宽限期的「显示」路径（toggleWindow 显示分支 / ready-to-show / 托盘显示 /
   // 启动失败恢复）都在调用本函数前显式 markDockShown()。
+  logInfo('dock', `recoverDock seq=${sinkSeq} visible=${win.isVisible()} top=${win.isAlwaysOnTop()}`)
   win.setAlwaysOnTop(true)
   win.moveTop()
   setTimeout(() => {
@@ -160,85 +198,6 @@ function toggleWindow(fromKeyboard = false): void {
 
 // ─── Shared C# icon extractor (PowerShell + P/Invoke) ───────────────────────
 
-const ICON_EXTRACTOR_CS = `
-Add-Type -AssemblyName System.Drawing
-Add-Type -ReferencedAssemblies 'System.Drawing' -TypeDefinition @'
-using System;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Runtime.InteropServices;
-
-public static class IconExtractor {
-    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
-    static extern int SHDefExtractIcon(string pszIconFile, int iIndex, uint uFlags,
-        out IntPtr phiconLarge, out IntPtr phiconSmall, uint nIconSize);
-
-    [DllImport("user32.dll")]
-    static extern bool DestroyIcon(IntPtr hIcon);
-
-    public static string GetIconBase64(string filePath, int iconIndex, uint size) {
-        IntPtr hLarge, hSmall;
-        int hr = SHDefExtractIcon(filePath, iconIndex, 0, out hLarge, out hSmall, size);
-        if (hr != 0 || hLarge == IntPtr.Zero)
-            return "";
-        try {
-            using (Icon icon = Icon.FromHandle(hLarge)) {
-                int s = icon.Width > 0 ? icon.Width : (int)size;
-                using (Bitmap bmp = new Bitmap(s, s)) {
-                    bmp.MakeTransparent();
-                    using (Graphics g = Graphics.FromImage(bmp)) {
-                        g.Clear(Color.Transparent);
-                        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                        g.DrawIcon(icon, new Rectangle(0, 0, s, s));
-                    }
-                    using (MemoryStream ms = new MemoryStream()) {
-                        bmp.Save(ms, ImageFormat.Png);
-                        return Convert.ToBase64String(ms.ToArray());
-                    }
-                }
-            }
-        } catch {
-            return "";
-        } finally {
-            if (hLarge != IntPtr.Zero) DestroyIcon(hLarge);
-            if (hSmall != IntPtr.Zero) DestroyIcon(hSmall);
-        }
-    }
-}
-'@`
-
-
-/** 抽取尺寸：Dock 图标 CSS 里只有 44px（分组拼图 26px、预览卡片 17px），
- *  256px 的 PNG 每个 2~10KB，而 64px 只有 1/4 左右。base64 数据要同时活在
- *  主进程状态、IPC 消息、renderer state 与 shortcuts.json 四处字符串里，
- *  每次保存还要重序列化一遍——尺寸降一档是这里性价比最高的省内存手段。 */
-const ICON_SIZE = 64
-/** 文件夹图标（黄色文件夹）尺寸再小一档：卡片行只有 17px，Dock 上也是 44px 缩放显示 */
-const FOLDER_ICON_SIZE = 48
-/** 「更换图标」选 png/jpg 时的最大边：原图直接转 base64 会把整张照片写进
- *  shortcuts.json（每次保存都重序列化），统一缩到图标尺寸 */
-const PICKED_IMAGE_MAX_EDGE = 256
-
-const PS_ARGS = ['-NoProfile', '-NonInteractive', '-Command'] as const
-type PSResult = { err: Error | null; stdout: string; stderr: string }
-/** PowerShell stdout 上限（见 runPowerShell 注释：默认 1 MiB 会让批量图标提取静默失败） */
-const PS_MAX_BUFFER = 8 * 1024 * 1024
-
-/** 统一的 PowerShell 调用入口：一次把参数拼装收口，避免每处手写（漏掉
- *  `-NonInteractive` 时脚本遇到任何交互式提示都会挂到超时，白占一个进程）。
- *
- *  ⚠️ `maxBuffer` 必须显式给：Node 默认 1 MiB，而 stdout 超限时子进程会被杀掉、
- *  err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' —— 所有调用点都把 err 当成
- *  「没有结果」并返回空数组，于是失败是**完全静默**的。实测 `describe-paths` 那条
- *  批量路径每个 exe 带一枚 256px 图标（约 80 KB base64），**拖入 13 个 exe 就超 1 MiB**，
- *  整批被丢弃且只提示「已跳过 N 个（重复或格式不支持）」。给到 8 MiB 后同样的 20 个
- *  没问题（实测输出 1.6 MB）。 */
-function runPowerShell(psScript: string, timeout: number, done: (r: PSResult) => void): void {
-  execFile('powershell', [...PS_ARGS, psScript], { timeout, maxBuffer: PS_MAX_BUFFER }, (err, stdout, stderr) => {
-    done({ err, stdout, stderr })
-  })
-}
 
 /** Run PowerShell to extract an icon from a DLL/EXE and return a data: URL. */function extractIcon(iconFile: string, iconIndex: number, size = ICON_SIZE): Promise<string> {
   return new Promise((resolve) => {
@@ -477,52 +436,6 @@ ipcMain.handle('parse-lnk', async (_event, filePath?: string) => {
   }
 })
 
-// ─── IPC: persist shortcuts ─────────────────────────────────────────────────
-
-const shortcutsPath = join(app.getPath('userData'), 'shortcuts.json')
-/** 上一次「可解析」的副本：shortcuts.json 解析失败时先尝试从它恢复 */
-const shortcutsBackupPath = `${shortcutsPath}.bak`
-
-/**
- * 原子写文件：写 `<path>.tmp-<pid>` → write + fsync → close →（旧文件是合法 JSON 时）
- * 备份到 `<path>.bak` → rename 覆盖。
- *
- * 直接 writeFileSync 在「写了一半」时（崩溃 / 断电 / 杀进程）会留下截断的 JSON，
- * 而 load 侧解析失败会退化成空数组 —— 用户全部快捷方式一次性消失且不可恢复。
- * 同卷 rename 是原子替换：读者要么看到旧内容、要么看到新内容，不会看到半截。
- * 旧文件只有在能解析成合法 JSON 时才备份，避免拿损坏内容盖掉上一次的好备份。
- *
- * 失败时清掉临时文件并把异常抛给调用方（save-shortcuts 需要把失败如实返回给 renderer）。
- */
-function writeFileAtomic(targetPath: string, text: string): void {
-  const tmpPath = `${targetPath}.tmp-${process.pid}`
-  let fd: number | null = null
-  try {
-    fd = openSync(tmpPath, 'w')
-    const buf = Buffer.from(text, 'utf-8')
-    let offset = 0
-    while (offset < buf.length) {
-      offset += writeSync(fd, buf, offset, buf.length - offset)
-    }
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = null
-    try {
-      if (existsSync(targetPath)) {
-        JSON.parse(readFileSync(targetPath, 'utf-8')) // 只为判断旧文件是否值得备份
-        copyFileSync(targetPath, `${targetPath}.bak`)
-      }
-    } catch {
-      // 旧文件本身已损坏（或备份失败）：跳过备份，直接用新内容覆盖
-    }
-    renameSync(tmpPath, targetPath)
-  } catch (err) {
-    if (fd !== null) { try { closeSync(fd) } catch {} }
-    try { if (existsSync(tmpPath)) unlinkSync(tmpPath) } catch {}
-    throw err
-  }
-}
-
 // ─── 窗口停靠位置（下 / 中间 / 上，左/右竖排预留）─────────────────────────
 // Dock **不支持自由拖动**：窗口位置完全由「位置」预设决定（下/上贴边居中、中间居中），
 // 没有 app-region 拖动区、没有位置记忆。要挪位置就点菜单里的「位置」。
@@ -532,7 +445,7 @@ function writeFileAtomic(targetPath: string, text: string): void {
 
 /** 已经实现的停靠位置（左/右竖排还没做：类型里保留，但不接受写入也不需要重建窗口） */
 const DOCK_EDGES = ['bottom', 'top', 'left', 'right', 'middle'] as const
-type DockEdge = (typeof DOCK_EDGES)[number]
+// DockEdge 的真相源在 src/shared/types.ts（renderer 的 env.d.ts 也从那里取）
 const IMPLEMENTED_EDGES: readonly DockEdge[] = ['bottom', 'top', 'middle']
 const isImplementedEdge = (v: unknown): v is DockEdge =>
   typeof v === 'string' && IMPLEMENTED_EDGES.includes(v as DockEdge)
@@ -566,7 +479,7 @@ function writeDockEdge(edge: DockEdge): void {
   try {
     writeFileAtomic(layoutPath, JSON.stringify({ edge }))
   } catch (err) {
-    console.error('[dock-edge] failed to persist position:', err instanceof Error ? err.message : String(err))
+    logError('dock-edge', `持久化停靠位置失败: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -611,8 +524,8 @@ function recreateWindowForEdge(next: DockEdge, hidden: boolean): void {
   try {
     createWindow(next, hidden)
   } catch (err) {
-    console.error('[window] 重建窗口失败，重试一次:', err)
-    try { createWindow(next, hidden) } catch (err2) { console.error('[window] 重建窗口再次失败:', err2) }
+    logError('window', '重建窗口失败，重试一次', err)
+    try { createWindow(next, hidden) } catch (err2) { logError('window', '重建窗口再次失败', err2) }
   } finally {
     // try/finally：万一 createWindow 抛异常，标志位也必须复位，
     // 否则之后真正的「关掉最后一个窗口」会被吞掉，应用退不出去
@@ -685,117 +598,12 @@ function reapplyDockEdgeOnDisplayChange(): void {
   applyDockHitRegion()
 }
 
-interface LoadShortcutsResult {
-  entries: unknown[]
-  corrupt: boolean
-  recovered: boolean
-}
-
 /** 逐条校验持久化条目：只保留形状可用的条目，避免把脏数据喂给 renderer。
  *  - 必须是普通对象（数组 / null / 基本类型丢弃）
  *  - `id` 必须是有限数字；`targetPath` 必须是字符串（分组 / 分隔线存的就是空串）
  *  - `isGroup` / `isSeparator` 只保留 boolean（缺省不补字段）
  *  - `id` 去重，保留第一个
  *  另外兼容早期开发版的字段：separator: 'line' | 'gap' → isSeparator: true。 */
-function sanitizeShortcutEntries(raw: unknown[]): unknown[] {
-  const result: unknown[] = []
-  const seenIds = new Set<number>()
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
-    const obj = entry as Record<string, unknown>
-    let normalized: Record<string, unknown>
-    if (obj.separator) {
-      const { separator: _legacy, ...rest } = obj
-      normalized = { ...rest, isSeparator: true }
-    } else {
-      normalized = { ...obj }
-    }
-    if (typeof normalized.id !== 'number' || !Number.isFinite(normalized.id)) continue
-    if (typeof normalized.targetPath !== 'string') continue
-    if (seenIds.has(normalized.id)) continue
-    seenIds.add(normalized.id)
-    if (typeof normalized.isGroup !== 'boolean') delete normalized.isGroup
-    if (typeof normalized.isSeparator !== 'boolean') delete normalized.isSeparator
-    if (typeof normalized.isFolder !== 'boolean') delete normalized.isFolder
-    if (typeof normalized.groupId !== 'number' || !Number.isFinite(normalized.groupId)) delete normalized.groupId
-    for (const key of ['iconDataUrl', 'description', 'arguments', 'workingDirectory', 'specialType']) {
-      if (typeof normalized[key] !== 'string') delete normalized[key]
-    }
-    // 普通条目必须有目标；分组 / 分隔线本来就是空 targetPath
-    if (!normalized.isGroup && !normalized.isSeparator && normalized.targetPath.trim() === '') continue
-    result.push(normalized)
-  }
-  return result
-}
-
-/** 读取并解析一个持久化文件；顶层不是数组时视为损坏（抛给调用方走恢复流程）。
- *  返回 dropped：被 sanitize 丢弃的条目数——只要 > 0 就说明磁盘里有一部分
- *  无法识别的条目，调用方必须把原文件另存一份再让 renderer 写回合法子集。 */
-function readShortcutEntries(filePath: string): { entries: unknown[]; dropped: number } {
-  const raw: unknown = JSON.parse(readFileSync(filePath, 'utf-8'))
-  if (!Array.isArray(raw)) throw new Error('shortcuts.json 顶层不是数组')
-  const entries = sanitizeShortcutEntries(raw)
-  return { entries, dropped: raw.length - entries.length }
-}
-
-/** 把当前 shortcuts.json 另存一份现场（best-effort）。用于「解析失败」与「部分条目
- *  无法识别」两种场景：前者整个文件保留，后者至少保住被 sanitize 丢掉的原始数据。 */
-function preserveCorruptShortcuts(): void {
-  try {
-    copyFileSync(shortcutsPath, `${shortcutsPath}.corrupt-${Date.now()}`)
-  } catch (copyErr) {
-    console.error('[persist] failed to preserve corrupt shortcuts.json:', copyErr instanceof Error ? copyErr.message : String(copyErr))
-  }
-}
-
-ipcMain.handle('load-shortcuts', (): LoadShortcutsResult => {
-  if (!existsSync(shortcutsPath)) return { entries: [], corrupt: false, recovered: false }
-  try {
-    const { entries, dropped } = readShortcutEntries(shortcutsPath)
-    if (dropped > 0) {
-      // 文件能 parse，但有部分条目形状不可用：保留现场，并让 renderer 提示用户。
-      // 否则下次保存会用合法子集覆盖磁盘，被丢掉的原始条目就永久消失了。
-      preserveCorruptShortcuts()
-      console.warn('[persist] shortcuts.json 有', dropped, '条无法识别，已保留现场；有效条目', entries.length, '条')
-      return { entries, corrupt: true, recovered: false }
-    }
-    return { entries, corrupt: false, recovered: false }
-  } catch (err) {
-    console.error('[persist] shortcuts.json 读取/解析失败:', err instanceof Error ? err.message : String(err))
-    // 无论能否从 .bak 恢复，都先把坏掉的原文件留一份现场：否则恢复成功后下一次
-    // 保存会直接覆盖它，原始数据就再也拿不回来了。
-    preserveCorruptShortcuts()
-    // 先尝试上一次成功保存的副本：它最可能是用户真实数据的完整版本
-    try {
-      const { entries, dropped } = readShortcutEntries(shortcutsBackupPath)
-      console.warn('[persist] 已从 shortcuts.json.bak 恢复', entries.length, '条（丢弃', dropped, '条）')
-      return { entries, corrupt: true, recovered: true }
-    } catch {
-      // 备份也不可用：返回空列表交给 renderer 决定（原文件已另存现场）
-      return { entries: [], corrupt: true, recovered: false }
-    }
-  }
-})
-
-/** 写盘。v1.12.2 起 renderer 状态里存的就是真实 data URL，这里不再做任何换算。
- *  （v1.12.0/v1.12.1 曾在这里把哨兵串换成「最近见过的文件夹图标」，那个值为空时
- *   会把空串写进磁盘，是「文件夹图标永久空白」事故的最后一环。） */
-function writeShortcuts(data: unknown[]): void {
-  writeFileAtomic(shortcutsPath, JSON.stringify(data))
-}
-
-ipcMain.handle('save-shortcuts', (_event, data: unknown): boolean => {
-  if (!Array.isArray(data)) return false
-  try {
-    writeShortcuts(data)
-    return true
-  } catch (err) {
-    // 不能静默吞掉：renderer 据此提示「保存失败」，否则用户以为已经写盘
-    console.error('[persist] save-shortcuts failed:', err instanceof Error ? err.message : String(err))
-    return false
-  }
-})
-
 // ─── IPC: select a folder ───────────────────────────────────────────────────
 
 ipcMain.handle('select-folder', async () => {
@@ -979,7 +787,7 @@ function startDesktopWatch(): void {
       }, 1000)
     })
     desktopWatcher.on('error', (err) => {
-      console.error('[desktop-watch] error, will retry in 3s:', err)
+      logError('desktop-watch', '监听出错，3s 后重试', err)
       // 监听器出错后不会自愈：关掉旧的、3s 后重建，否则桌面增删会永久停更
       try { desktopWatcher?.close() } catch {}
       desktopWatcher = null
@@ -992,7 +800,7 @@ function startDesktopWatch(): void {
       }
     })
   } catch (err) {
-    console.error('[desktop-watch] failed to start:', err)
+    logError('desktop-watch', '桌面目录监听启动失败', err)
   }
 }
 
@@ -1011,43 +819,6 @@ function stopDesktopWatch(): void {
 // （该刷新在部分 Win11 系统上不生效）。0x7402 切换后 Explorer 会自动同步
 // 注册表 HideIcons，状态由系统持久化。状态读取用 IsWindowVisible(ListView)，
 // 比读注册表更贴近真实视觉状态。
-
-const DESKTOP_ICONS_CS = `
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class DesktopIcons {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-    public static IntPtr FindDefView() {
-        IntPtr progman = FindWindow("Progman", null);
-        IntPtr defView = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
-        if (defView == IntPtr.Zero) {
-            IntPtr worker = IntPtr.Zero;
-            while ((worker = FindWindowEx(IntPtr.Zero, worker, "WorkerW", null)) != IntPtr.Zero) {
-                defView = FindWindowEx(worker, IntPtr.Zero, "SHELLDLL_DefView", null);
-                if (defView != IntPtr.Zero) break;
-            }
-        }
-        return defView;
-    }
-
-    public static IntPtr FindListView() {
-        IntPtr dv = FindDefView();
-        if (dv == IntPtr.Zero) return IntPtr.Zero;
-        return FindWindowEx(dv, IntPtr.Zero, "SysListView32", "FolderView");
-    }
-}
-'@
-[Console]::OutputEncoding = [Text.Encoding]::UTF8`
 
 /** 读「桌面图标是否隐藏」的 PowerShell 片段（probe 与 toggle 共用）。
  *
@@ -1163,6 +934,13 @@ ipcMain.on('get-desktop-icons-hidden-sync', (event) => {
 // 开发模式读的也是同一个字段，两处一致。
 ipcMain.handle('get-app-version', () => app.getVersion())
 
+// ── 更新检查（F1）────────────────────────────────────────────────────────
+// 手动检查：菜单「检查更新」→ renderer 拿到结果自己提示（这里不弹窗，避免遮住 Dock）。
+ipcMain.handle('check-update', () => checkForUpdates())
+ipcMain.handle('open-update-page', (_e, url: unknown) =>
+  typeof url === 'string' && /^https?:\/\//i.test(url) ? openUpdatePage(url) : Promise.resolve(false)
+)
+
 
 ipcMain.handle('toggle-desktop-icons', async () => {
   return new Promise<boolean | null>((resolve) => {
@@ -1188,7 +966,7 @@ if ($dv -eq [IntPtr]::Zero) {
         resolve(next)
         return
       }
-      console.error('[desktop-icons] toggle read failed:', err?.message, '| stdout:', JSON.stringify(raw.trim()), '| stderr:', stderr?.slice(0, 200))
+      logError('desktop-icons', `toggle 读回失败: ${err?.message ?? ''} | stdout=${JSON.stringify(raw.trim())} | stderr=${String(stderr ?? '').slice(0, 200)}`)
       // 读不到结果时的兜底：0x7402 是**翻转**语义，只要命令真的发出去了
       // （TOGGLED=1），新状态必然是旧状态的反面。用它更新缓存，至少不会让缓存
       // 永远停在旧值上（那正是「文案卡住」的成因）。
@@ -1311,6 +1089,7 @@ const PROBE_BEFORE_LAUNCH = false
 
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
+  logInfo('launcher', `run-app target=${targetPath}${args ? ` args=${args}` : ''}${workingDir ? ` cwd=${workingDir}` : ''}`)
 
   // 先判断「目标是不是已经在运行」——是的话激活它的窗口，**绝不再开一个进程**。
   // 必须在隐藏 Dock 之前做：这一路是同步的（PowerShell 约 0.8s），若先隐藏、
@@ -1321,13 +1100,8 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   if (PROBE_BEFORE_LAUNCH && !args) {
     const state = await probeTargetState(targetPath)
     if (state === 'running') {
-      // 已经是用户想要的那个窗口在前台了。仍然把 Dock 收起来——
-      // 与「启动成功」一致：用户是点图标切过去的，Dock 让出桌面。
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        dockTrayHidden = true
-        sinkSeq++
-        mainWindow.hide()
-      }
+      // 已经是用户想要的那个窗口在前台了。按「启动后行为」让出桌面（默认与启动成功一致）
+      hideDockAfterLaunch()
       return true
     }
     if (state === 'tray') {
@@ -1338,11 +1112,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       // （见 clickTrayIconFor；等价于用户自己点托盘图标，不碰它的窗口、不动鼠标）。
       const clicked = await clickTrayIconFor(targetPath)
       if (clicked) {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          dockTrayHidden = true
-          sinkSeq++
-          mainWindow.hide()
-        }
+        hideDockAfterLaunch()
         return true // 已唤出，等同于启动成功
       }
       // UIA 不可用 / 没找到它的托盘图标：退回「提示用户自己点托盘图标」，
@@ -1372,16 +1142,10 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     // 'absent' = 确认没在运行（或探询给不出结论）→ 继续走下面的启动流程
   }
 
-  // 启动目标后自动隐藏到托盘：用户点开图标后 Dock 彻底让出桌面（不再遮挡目标程序）。
+  // 启动目标后按设置里的「启动后行为」让出桌面（默认：隐藏到托盘）：
   // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 dockTrayHidden
   // 意图状态判断，隐藏状态下任何唤回路径都会显示并恢复置顶。
-  let hideSeq = sinkSeq
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    dockTrayHidden = true
-    sinkSeq++ // 隐藏即作废在途沉底（hide() 引发的 blur 不该再起 PowerShell）
-    hideSeq = sinkSeq // 记下这次隐藏的代际：失败回滚只认这一代（见 restoreDockAfterFailedLaunch）
-    mainWindow.hide()
-  }
+  const hideState = hideDockAfterLaunch()
 
   // Windows shell: / CLSID → open via explorer (This PC, Recycle Bin, etc.)
   if (targetPath.startsWith('shell:') || targetPath.startsWith('::')) {
@@ -1399,12 +1163,12 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
           // explorer 成功交接给已运行实例后也常以非零码退出；只有 spawn 级失败
           // （err.code 为字符串）才算「没打开」。1.5s 内已按成功返回时，这里只记日志。
           if (err && typeof err.code === 'string') {
-            console.error('[launcher] explorer failed:', err.message)
+            logError('launcher', 'explorer /select 失败', err)
             finish(false)
           }
         })
       } catch (err) {
-        console.error('[launcher] explorer failed to start:', err instanceof Error ? err.message : String(err))
+        logError('launcher', 'explorer 无法启动', err)
         finish(false)
         return
       }
@@ -1412,7 +1176,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       setTimeout(() => finish(true), 1500)
     })
     if (!opened) {
-      restoreDockAfterFailedLaunch(hideSeq)
+      restoreDockAfterFailedLaunch(hideState)
       return false
     }
     return true
@@ -1426,8 +1190,8 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     if (stat.isDirectory()) {
       const msg = await shell.openPath(targetPath)
       if (msg) {
-        console.error('[launcher] openPath (folder) failed:', msg)
-        restoreDockAfterFailedLaunch(hideSeq)
+        logError('launcher', '打开文件夹失败（shell.openPath 返回错误）', msg)
+        restoreDockAfterFailedLaunch(hideState)
         return false
       }
       return true
@@ -1440,8 +1204,8 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       if (ext !== '.exe' && ext !== '.com') {
         const msg = await shell.openPath(targetPath)
         if (msg) {
-          console.error('[launcher] openPath (file) failed:', msg)
-          restoreDockAfterFailedLaunch(hideSeq)
+          logError('launcher', '打开文件失败（shell.openPath 返回错误）', msg)
+          restoreDockAfterFailedLaunch(hideState)
           return false
         }
         return true
@@ -1460,8 +1224,8 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       await shell.openExternal(targetPath)
       return true
     } catch (err) {
-      console.error('[launcher] openExternal failed:', err instanceof Error ? err.message : String(err))
-      restoreDockAfterFailedLaunch(hideSeq)
+      logError('launcher', 'shell.openExternal 失败', err)
+      restoreDockAfterFailedLaunch(hideState)
       return false
     }
   }
@@ -1495,7 +1259,7 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       )
     } catch (err) {
       // execFile 对非法参数等会同步抛错，不是所有失败都会走 'error' 事件
-      console.error('[launcher] execFile threw:', err instanceof Error ? err.message : String(err))
+      logError('launcher', 'execFile 抛异常', err)
       resolve('spawn-failed')
       return
     }
@@ -1528,44 +1292,114 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
           try {
             const msg = await shell.openPath(targetPath)
             if (msg) {
-              console.error('[launcher] Shell fallback also failed:', msg)
+              logError('launcher', 'ShellExecute 兜底也失败', msg)
               resolve('spawn-failed')
               return
             }
             resolve('ok')
           } catch (e) {
-            console.error('[launcher] Shell fallback threw:', e instanceof Error ? e.message : String(e))
+            logError('launcher', 'ShellExecute 兜底抛异常', e)
             resolve('spawn-failed')
           }
         })()
         return
       }
-      console.error('[launcher] Failed to launch:', err.message)
+      logError('launcher', '启动失败', err)
       resolve('spawn-failed')
     })
   })
 
   if (spawnOutcome === 'spawn-failed') {
-    restoreDockAfterFailedLaunch(hideSeq)
+    logWarn('launcher', `run-app spawn 失败，Dock 回滚: ${targetPath}`)
+    restoreDockAfterFailedLaunch(hideState)
     return false // renderer 据此提示「启动失败：目标不存在或无法运行」
   }
+  logInfo('launcher', `run-app 已启动: ${targetPath}`)
   return true
 })
 
 
-/** 启动失败后把 Dock 还给用户：点图标时已经先隐藏到托盘，若不还回来，
+// ─── 设置中心打开期间的 Dock 让位（开设置自动藏、关掉自动回来）──────────────
+// 与下面的 hideDockAfterLaunch 是两套语义：那条按用户设置的三态走（hide / keep / sink），
+// 这条是**固定行为**——设置窗是普通窗口，而 Dock 是 alwaysOnTop，两者叠在一起时
+// 设置窗的标题栏会被 Dock 压住，用户根本拖不动窗口。
+//
+// 用独立布尔记「这一次是我们藏的」而不是复用 dockTrayHidden：用户可能在此之前
+// 就把 Dock 收在托盘里了（那种情况下开设置不该「顺便」改变关窗后的状态）。
+let dockHiddenBySettings = false
+
+function hideDockForSettings(): void {
+  const win = mainWindow
+  if (!win || win.isDestroyed()) return
+  if (!win.isVisible()) return // 本来就在托盘里 —— 不动，也不记账
+  dockHiddenBySettings = true
+  dockTrayHidden = true
+  sinkSeq++ // 作废在途沉底：不能让它去操作一扇即将隐藏的窗口
+  win.hide()
+  logInfo('dock', '设置中心打开，Dock 让位')
+}
+
+function showDockAfterSettings(): void {
+  if (!dockHiddenBySettings) return
+  dockHiddenBySettings = false
+  const win = mainWindow
+  if (!win || win.isDestroyed()) return
+  dockTrayHidden = false
+  sinkSeq++ // 作废在途沉底
+  markDockShown() // 刚显示：2.5s 内的 blur 都是焦点抖动，别立刻让位
+  win.show()
+  recoverDock(win)
+  logInfo('dock', '设置中心关闭，Dock 回来')
+}
+
+/** 一次「启动后让位」的结果：模式 + 当时 sinkSeq 代际（回滚只认这一代）。 */
+type LaunchHideState = { mode: 'hide' | 'keep' | 'sink'; seq: number }
+
+/**
+ * 启动目标后如何处理 Dock（设置里的「启动后行为」三态）：
+ * - `hide`（默认）：收进托盘，把整块桌面让出来；托盘 / Alt+Space 随时唤回。
+ * - `keep`：什么都不做，Dock 留在原地（用户习惯把 Dock 当常驻工具条）。
+ * - `sink`：不收托盘，但沉到 z-order 最底让位；鼠标移回或点它即恢复置顶。
+ *
+ * 三种模式都要 `sinkSeq++`（除了 keep 那种「什么都不改」的语义）——
+ * 隐藏与沉底在异步落地的过程中，任何后续唤回都必须能作废它们。
+ */
+function hideDockAfterLaunch(): LaunchHideState {
+  const win = mainWindow
+  const mode = getSettingsCache().afterLaunch
+  if (!win || win.isDestroyed() || mode === 'keep') {
+    return { mode: 'keep', seq: sinkSeq }
+  }
+  if (mode === 'sink') {
+    sinkSeq++
+    sendToBottom(win)
+    return { mode: 'sink', seq: sinkSeq }
+  }
+  dockTrayHidden = true
+  sinkSeq++
+  win.hide()
+  return { mode: 'hide', seq: sinkSeq }
+}
+
+/** 启动失败后把 Dock 还给用户：点图标时已经先让位，若不还回来，
  *  用户看到的是「Dock 消失、什么都没启动」，只能靠 Alt+Space 找回。
  *
- *  ⚠️ `hideSeq` 必须传「**这次隐藏时**的 sinkSeq」，不能只看 `dockTrayHidden`
+ *  ⚠️ 必须传**这次让位时**的 state（含 sinkSeq 代际），不能只看 `dockTrayHidden`
  *  （v1.13.4 修，这条是实测出来的）：
  *  spawn 失败是**异步**通知的（实测 ~400ms 后）。这段时间里用户完全可能
  *  ① 自己 Alt+Space 唤回，或 ② 又点了另一个图标并成功启动。
  *  那时 `dockTrayHidden` 的**值**可能凑巧又是 true（比如被第二次 run-app 重新置真），
  *  只比值就会把第二个应用刚启动的 Dock 又弹出来。比对**代际**才准确：
- *  代际不同 ⇒ 这次隐藏早已不是当前意图，什么也别做。 */
-function restoreDockAfterFailedLaunch(hideSeq: number): void {
+ *  代际不同 ⇒ 这次让位早已不是当前意图，什么也别做。 */
+function restoreDockAfterFailedLaunch(state: LaunchHideState): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
-  if (sinkSeq !== hideSeq) return // 期间有更新的意图（唤回 / 又启动了一个）—— 不抢用户的操作
+  if (sinkSeq !== state.seq) return // 期间有更新的意图（唤回 / 又启动了一个）—— 不抢用户的操作
+  if (state.mode === 'keep') return // Dock 本来就没动过
+  if (state.mode === 'sink') {
+    sinkSeq++ // 作废在途沉底
+    recoverDock(mainWindow)
+    return
+  }
   if (!dockTrayHidden) return // 已经不是「我们藏起来」的状态了
   dockTrayHidden = false
   sinkSeq++ // 作废在途沉底：Dock 被还给用户后不能再被压到底部
@@ -1795,25 +1629,7 @@ const FOLDER_ICON_LIMIT = 96
 const FOLDER_BLOCKLIST = new Set(['desktop.ini', 'thumbs.db', '$recycle.bin', 'system volume information'])
 const folderCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' })
 
-interface FolderChild {
-  name: string
-  path: string
-  isDir: boolean
-  /** 文件字节数；目录恒为 -1（不递归统计——大文件夹会把卡片卡死） */
-  size: number
-  iconDataUrl: string
-}
-interface FolderListing {
-  path: string
-  name: string
-  folders: number
-  files: number
-  items: FolderChild[]
-  /** 超出列举上限、未列出的条目数（卡片底部提示一句，让用户去资源管理器看） */
-  truncated: number
-  /** 仅在失败时出现：missing=不存在 / denied=没权限 / notdir=不是文件夹 */
-  error?: 'missing' | 'denied' | 'notdir'
-}
+// FolderChild / FolderListing 的真相源在 src/shared/types.ts（renderer 的 env.d.ts 同源）
 
 const folderListCache = new Map<string, { at: number; data: FolderListing }>()
 /** 正在枚举中的目录。`sender` 是**可变**的：渲染端会「悬停预取 + 卡片打开」请求两次，
@@ -2063,7 +1879,7 @@ ipcMain.handle('open-path', async (_e, targetPath: unknown) => {
   // 此时若已经把 Dock 藏起来，用户就是「点了没反应、Dock 还消失了」，只能靠 Alt+Space 找回
   const err = await shell.openPath(targetPath)
   if (err) {
-    console.error('[launcher] openPath failed:', err)
+    logError('launcher', 'shell.openPath 失败', err)
     return false
   }
   // 与点 Dock 图标一致：打开成功后 Dock 让出桌面
@@ -2087,13 +1903,8 @@ void app.whenReady().then(() => {
 // 以管理员身份运行（Start-Process -Verb RunAs → UAC 提权，与资源管理器「以管理员身份运行」一致）
 ipcMain.handle('run-as-admin', (_e, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
-  let hideSeq = sinkSeq
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    dockTrayHidden = true
-    sinkSeq++ // 隐藏即作废在途沉底
-    hideSeq = sinkSeq // 记下代际：UAC 取消/失败的回滚只认这一代
-    mainWindow.hide()
-  }
+  // 与 run-app 一致：按「启动后行为」三态让位（UAC 取消/失败时按同一 state 回滚）
+  const hideState = hideDockAfterLaunch()
   // ⚠️ `Start-Process` 的 -ArgumentList / -WorkingDirectory 都是 [ValidateNotNullOrEmpty]：
   // 传空串会**先**在校验阶段抛错（实测 PS 5.1：Cannot validate argument on parameter
   // 'ArgumentList'. The argument is null or empty），根本走不到创建进程那一步。
@@ -2117,8 +1928,8 @@ Start-Process @p`
       if (!err) { resolve(true); return }
       // UAC 被用户取消（The operation was canceled by the user）也走这里：
       // 此时同样要把 Dock 还给用户，否则「点了没反应 + Dock 消失」没有任何出路
-      console.error('[launcher] run-as-admin failed:', err.message, '| stderr:', (stderr || '').slice(0, 300))
-      restoreDockAfterFailedLaunch(hideSeq)
+      logError('launcher', `以管理员运行失败: ${err.message} | stderr=${String(stderr ?? '').slice(0, 300)}`)
+      restoreDockAfterFailedLaunch(hideState)
       resolve(false)
     })
   })
@@ -2136,7 +1947,7 @@ ipcMain.handle('open-file-location', (_e, targetPath: unknown) => {
     if (!existsSync(targetPath)) return
     shell.showItemInFolder(targetPath)
   } catch (err) {
-    console.error('[launcher] open-file-location failed:', err instanceof Error ? err.message : String(err))
+    logError('launcher', '在资源管理器中定位失败', err)
   }
 })
 
@@ -2196,6 +2007,12 @@ const DOCK_HIT_PAD = 8
  *  ⚠️ 不要调到 ≥24：`SetWindowRgn` 连绘制一起裁，会把悬浮标签的顶边切掉一截。 */
 const DOCK_HIT_INSET = 20
 
+/** 当前生效的内缩量。默认等于 DOCK_HIT_INSET（60px 图标档），renderer 上报时会带上
+ *  随图标尺寸缩放后的值（E1：48px 档 → 16，72px 档 → 24），这里只做 clamp。
+ *  以 renderer 为准是必要的：内缩量取决于**玻璃条里内容的实际位置**，而那由 CSS 变量
+ *  `--dock-icon` / `--dock-pad` 决定，主进程看不见。 */
+let dockHitInset = DOCK_HIT_INSET
+
 /** 排查用：置 true 后每次真正生效的 region 都打一行日志（默认关，别在发布版打开）。 */
 const DOCK_HIT_DEBUG = false
 
@@ -2233,7 +2050,7 @@ function applyDockHitRegion(win: BrowserWindow | null = mainWindow): void {
       dockShapeApplied = ''
       if (!dockShapeErrorLogged) {
         dockShapeErrorLogged = true
-        console.error('[dock-hit-region] setShape failed, falling back to full-window:', err)
+        logError('hit-region', 'setShape 失败，降级为整窗命中（功能不受影响）', err)
       }
     }
   }
@@ -2252,11 +2069,11 @@ function applyDockHitRegion(win: BrowserWindow | null = mainWindow): void {
   // top 档整套几何垂直镜像、在 bar 下方。所以只内缩那一侧，贴边侧照旧外扩 8px。
   const growUp = dockEdge !== 'top'
   const y = growUp
-    ? Math.max(0, Math.floor(barTop + DOCK_HIT_INSET))
+    ? Math.max(0, Math.floor(barTop + dockHitInset))
     : Math.max(0, Math.floor(barTop - DOCK_HIT_PAD))
   const bottom = growUp
     ? Math.min(ch, Math.ceil(barBottom + DOCK_HIT_PAD))
-    : Math.min(ch, Math.ceil(barBottom - DOCK_HIT_INSET))
+    : Math.min(ch, Math.ceil(barBottom - dockHitInset))
   apply(x, y, right - x, bottom - y)
 }
 
@@ -2272,6 +2089,10 @@ ipcMain.on('dock-hit-region', (_e, payload: unknown) => {
   const height = Number(p.height)
   const shaped = [x, y, width, height].every((n) => Number.isFinite(n)) && width > 0 && height > 0
   if (shaped) dockBarRect = { x, y, width, height }
+  // E1：内缩量随图标尺寸缩放。clamp 到 0..40 —— 上报值来自 renderer 的算术，别让它
+  // 用一个荒谬的值把 region 算成空（空 region 会被 apply() 直接丢掉，表现为「整窗吃鼠标」）。
+  const inset = Number(p.inset)
+  if (Number.isFinite(inset)) dockHitInset = Math.max(0, Math.min(40, Math.round(inset)))
   // 形状不可用（元素还没布局 / 窗口刚重建）时只更新 overlay —— 保留上一次可用矩形，
   // 不要用 NaN/0 覆盖成「整窗放开」，否则一次瞬时上报就会让穿透失效好一会儿
   dockOverlayOpen = overlay
@@ -2297,142 +2118,6 @@ ipcMain.on('dock-hit-region', (_e, payload: unknown) => {
 //   FindPid 永远返回 0，"激活"功能静默失效（表面看只是"没生效"，不报错）。
 //   本项目其它 C# 常量（ICON_EXTRACTOR_CS / DESKTOP_ICONS_CS / WinZ）实测都是 0 个非 ASCII
 //   字符 —— 那不是巧合，是这条约定在撑着。改这里请保持纯 ASCII，说明写在 TS 这一侧。
-const ACTIVATE_CS = `
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class QLActivate
-{
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-
-    const int SW_SHOW = 5;
-    const int SW_RESTORE = 9;
-    const uint SWP_NOSIZE = 0x0001;
-    const uint SWP_NOMOVE = 0x0002;
-    const uint SWP_SHOWWINDOW = 0x0040;
-
-    /// Pids of the target app.
-    /// Match by full exe path when readable; ALSO accept a match on the exe file
-    /// NAME, because reading MainModule.FileName fails for elevated / protected
-    /// processes (148 of 273 processes on the dev box). Without that fallback we
-    /// would report "not running" for an app that IS running and start a second
-    /// copy - which is exactly what this whole feature exists to prevent.
-    /// preferPath gets the pids that matched the full path (used to pick a window).
-    static HashSet<int> Pids(string exePath, out HashSet<int> preferPath)
-    {
-        string want = exePath.ToLowerInvariant();
-        string wantName = Path.GetFileNameWithoutExtension(exePath).ToLowerInvariant();
-        var all = new HashSet<int>();
-        preferPath = new HashSet<int>();
-        foreach (var p in Process.GetProcesses())
-        {
-            int id; string nm;
-            try { id = p.Id; nm = p.ProcessName; } catch { continue; }
-            if (nm == null || !string.Equals(nm.ToLowerInvariant(), wantName, StringComparison.Ordinal)) continue;
-            try {
-                string fn = p.MainModule.FileName;
-                if (string.Equals(fn.ToLowerInvariant(), want, StringComparison.Ordinal)) { preferPath.Add(id); all.Add(id); }
-                else all.Add(id);      // same name, different path: still counts as running
-            } catch { all.Add(id); }   // path unreadable: trust the name (safe side)
-        }
-        return all;
-    }
-
-    static IntPtr FindWindowIn(HashSet<int> pids)
-    {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) =>
-        {
-            uint pid; GetWindowThreadProcessId(h, out pid);
-            if (!pids.Contains((int)pid)) return true;
-            var t = new StringBuilder(256); GetWindowText(h, t, 256);
-            var c = new StringBuilder(256); GetClassName(h, c, 256);
-            if (t.Length == 0) return true;
-            if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            found = h;
-            return false;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    /// Find the app's main window. Returns 0 if none. Does NOT change any state.
-    /// Only titled windows are considered: Qt/Electron apps create many untitled
-    /// helper windows (message-only, IME) which must never be foregrounded.
-    public static IntPtr FindWindow(string exePath)
-    {
-        HashSet<int> prefer;
-        var all = Pids(exePath, out prefer);
-        if (all.Count == 0) return IntPtr.Zero;
-        return FindWindowIn(prefer.Count > 0 ? prefer : all);
-    }
-
-    /// Decide what the caller should do. THE CODES MATTER - do not collapse them:
-    ///   1 = process running, window visible/minimized: shown, raised, focus attempted
-    ///  -1 = process running, window hidden (tray). Caller must NOT force-show it.
-    ///   0 = process running but NO titled window found (maybe still starting up)
-    ///   2 = no such process at all -> the only code that may start a new instance
-    ///
-    /// History: this used to return 0 both for "no window found" AND for
-    /// "window found but SetForegroundWindow was rejected by the foreground lock".
-    /// The caller reads 0 as "maybe still starting" and retries, so a running app
-    /// whose focus request was refused ended up as "cannot determine" and the click
-    /// did nothing at all. A window that exists must never look like "nothing".
-    public static int Probe(string exePath)
-    {
-        HashSet<int> prefer;
-        var all = Pids(exePath, out prefer);
-        if (all.Count == 0) return 2;
-
-        IntPtr target = FindWindowIn(prefer.Count > 0 ? prefer : all);
-        if (target == IntPtr.Zero) return 0;
-        if (!IsWindowVisible(target) && !IsIconic(target)) return -1;
-
-        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-        IntPtr fg = GetForegroundWindow();
-        uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, IntPtr.Zero);
-        uint me = GetCurrentThreadId();
-        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
-        bool ok;
-        try { ok = SetForegroundWindow(target); }
-        finally { if (attached) AttachThreadInput(me, fgThread, false); }
-        if (!ok)
-        {
-            // Foreground lock refused the focus request. Still raise the window so the
-            // user sees it, and report 1: the app IS running, launching again would
-            // create a duplicate.
-            SetWindowPos(target, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            BringWindowToTop(target);
-        }
-        return 1;
-    }
-
-    /// Legacy 3-code view kept for the regression probes (1 = done, 0 = nothing, -1 = tray).
-    public static int Activate(string exePath)
-    {
-        int r = Probe(exePath);
-        return r == 2 ? 0 : (r == 0 ? 0 : r);
-    }
-}
-`
-
 /** 判断目标程序当前处于哪种状态，决定「激活 / 提示 / 启动」。
  *
  *  ⚠️ **方向是「宁可多开一次，也不要让用户点不开」**（v1.13.8 修正，此前是反的）。
@@ -2542,172 +2227,6 @@ Write-Output "STATE=$r"`],
 //   ② 无反斜杠 —— 这段 C# 嵌在 TS 的模板字符串里，写 "\n" 会被 JS 解成真换行、
 //      把 C# 字符串常量截断（踩过两次）。检查脚本见 devtools/probe/cs-escapes.cjs。
 //   所有中文（按钮名、面板名、目标名）都由 TS 侧以**参数**传进来。
-const TRAY_CLICK_CS = `
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading;
-using System.Windows.Automation;
-
-public static class QLTray
-{
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-
-    const string TRAY_CLS = "Shell_TrayWnd";
-    const string OVERFLOW_CLS = "TopLevelWindowForOverflowXamlIsland";
-
-    static string NameOf(AutomationElement e) { try { return e.Current.Name ?? ""; } catch { return ""; } }
-    static string ClassOf(AutomationElement e) { try { return e.Current.ClassName ?? ""; } catch { return ""; } }
-
-    static AutomationElementCollection TopLevel()
-    {
-        try { return AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition); }
-        catch { return null; }
-    }
-
-    static AutomationElement FindTopByClass(string cls)
-    {
-        var tops = TopLevel();
-        if (tops == null) return null;
-        foreach (AutomationElement e in tops) if (ClassOf(e) == cls) return e;
-        return null;
-    }
-
-    // NOTE: FindAll(NameProperty, <localized string>) returns 0 on this system even though the
-    // value arrives intact and the element exists (verified by dumping every name as codepoints).
-    // Walking the subtree and comparing names in managed code works, so that is what we do.
-    static void Walk(AutomationElement el, int depth, int maxDepth, string want, ref AutomationElement found)
-    {
-        if (found != null || depth > maxDepth) return;
-        AutomationElementCollection kids;
-        try { kids = el.FindAll(TreeScope.Children, Condition.TrueCondition); } catch { return; }
-        foreach (AutomationElement k in kids)
-        {
-            if (NameOf(k) == want) { found = k; return; }
-            Walk(k, depth + 1, maxDepth, want, ref found);
-            if (found != null) return;
-        }
-    }
-
-    static AutomationElement FindButton(string showHiddenName)
-    {
-        var tray = FindTopByClass(TRAY_CLS);
-        if (tray == null) return null;
-        AutomationElement found = null;
-        Walk(tray, 0, 8, showHiddenName, ref found);
-        return found;
-    }
-
-    static bool Click(AutomationElement el)
-    {
-        object p;
-        if (el == null) return false;
-        try
-        {
-            if (el.TryGetCurrentPattern(InvokePattern.Pattern, out p)) { ((InvokePattern)p).Invoke(); return true; }
-            if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out p))
-            {
-                var ep = (ExpandCollapsePattern)p;
-                if (ep.Current.ExpandCollapseState == ExpandCollapseState.Collapsed) ep.Expand(); else ep.Collapse();
-                return true;
-            }
-            if (el.TryGetCurrentPattern(TogglePattern.Pattern, out p)) { ((TogglePattern)p).Toggle(); return true; }
-        }
-        catch { }
-        return false;
-    }
-
-    // Titles of the target's top-level windows, joined by '|'.
-    // These are the tray-tooltip candidates: WeChat's window title equals its tray tooltip, while
-    // Process.MainWindowTitle is EMPTY for a hidden window. That was the real bug - the candidate
-    // list fell back to the exe name ("Weixin") and the tray icon ("WeChat-CN") never matched.
-    // Returned as ONE string on purpose: a C# array would make the PowerShell caller iterate.
-    public static string WindowTitles(string exePath)
-    {
-        string want = exePath.ToLowerInvariant();
-        var pids = new HashSet<int>();
-        foreach (var p in System.Diagnostics.Process.GetProcesses())
-        {
-            try { if (string.Equals(p.MainModule.FileName.ToLowerInvariant(), want, StringComparison.Ordinal)) pids.Add(p.Id); }
-            catch { }
-        }
-        if (pids.Count == 0) return "";
-        var found = new List<string>();
-        EnumWindows((h, l) =>
-        {
-            uint pid; GetWindowThreadProcessId(h, out pid);
-            if (!pids.Contains((int)pid)) return true;
-            var c = new StringBuilder(128); GetClassName(h, c, 128);
-            string cls = c.ToString();
-            if (cls.IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            if (cls.IndexOf("MessageWindow", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            var t = new StringBuilder(256); GetWindowText(h, t, 256);
-            if (t.Length == 0) return true;
-            string s = t.ToString();
-            if (!found.Contains(s)) found.Add(s);
-            return true;
-        }, IntPtr.Zero);
-        return string.Join("|", found.ToArray());
-    }
-
-    // Click the tray icon whose tooltip contains any candidate name.
-    // Returns 1 = clicked, 0 = no matching icon (nothing clicked), -1 = tray panel unavailable.
-    // The flyout is closed again afterwards so it is never left sitting on screen.
-    public static int ClickTrayIcon(string showHiddenName, string[] candidates)
-    {
-        var btn = FindButton(showHiddenName);
-        if (btn == null) return -1;
-
-        bool openedHere = FindTopByClass(OVERFLOW_CLS) == null;
-        if (openedHere && !Click(btn)) return -1;
-
-        AutomationElement panel = null;
-        // The flyout can close again quickly when focus changes, so poll fast.
-        for (int i = 0; i < 45 && panel == null; i++)
-        {
-            Thread.Sleep(60);
-            panel = FindTopByClass(OVERFLOW_CLS);
-        }
-        if (panel == null) return -1;
-
-        AutomationElement target = null;
-        AutomationElementCollection items;
-        try
-        {
-            items = panel.FindAll(TreeScope.Descendants,
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
-        }
-        catch { items = null; }
-        if (items != null)
-        {
-            foreach (AutomationElement b in items)
-            {
-                string n = NameOf(b);
-                if (n.Length == 0) continue;
-                foreach (string cand in candidates)
-                {
-                    if (string.IsNullOrEmpty(cand)) continue;
-                    if (n.IndexOf(cand, StringComparison.OrdinalIgnoreCase) >= 0) { target = b; break; }
-                }
-                if (target != null) break;
-            }
-        }
-
-        int rc = 0;
-        if (target != null && Click(target)) { rc = 1; Thread.Sleep(700); }
-
-        // never leave the flyout on screen
-        if (openedHere && FindTopByClass(OVERFLOW_CLS) != null) Click(btn);
-        return rc;
-    }
-}
-`
-
 // 托盘相关的中文名（UIA 元素的 Name 是中文）。放 TS 侧，C# 保持纯 ASCII。
 // 溢出面板用**类名** TopLevelWindowForOverflowXamlIsland 定位（C# 里），它的中文 Name
 // 在不同系统语言下会变，所以不靠名字。这个按钮的名字是稳定的。
@@ -2829,6 +2348,7 @@ public static class WinZ {
 [WinZ]::SetWindowPos([IntPtr]::new(${hwnd}), [IntPtr]::new(1), 0, 0, 0, 0, 0x0002 -bor 0x0001 -bor 0x0010) | Out-Null`
 
   sinkState = { win, seq: startSeq }
+  logInfo('dock', `sendToBottom 开始 seq=${startSeq} hwnd=${hwnd}`)
 
   runPowerShell(psScript, 4000, ({ err }) => {
     // ⚠️ 必须先捕获「这次沉底是不是我们自己的、还是否仍然成立」，**再**清 sinkState。
@@ -2840,7 +2360,7 @@ public static class WinZ {
     const ours = sinkState?.win === win && sinkState.seq === startSeq
     if (sinkState?.win === win) sinkState = null
     if (err) {
-      console.error('[dock] sendToBottom failed:', err.message)
+      logError('dock', 'sendToBottom 失败', err)
       // 失败时 blur 已经把窗口从置顶层降级（setAlwaysOnTop(false)），却没能真正沉底：
       // 窗口会停在「非置顶、又盖在普通窗口上面」的半吊子状态，且不会再自己回来。
       // 显式恢复置顶，把下一次让位交给下一次 blur 重新尝试。
@@ -2980,7 +2500,7 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url).catch((err) => {
-      console.error('[window] openExternal failed:', err instanceof Error ? err.message : String(err))
+      logError('window', '外部链接打开失败', err)
     })
     return { action: 'deny' }
   })
@@ -2992,7 +2512,7 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
     const devUrl = process.env['ELECTRON_RENDERER_URL']
     if (devUrl && url.startsWith(devUrl)) return // 开发模式 HMR 重载用
     event.preventDefault()
-    console.error('[window] blocked navigation:', url.slice(0, 200))
+    logWarn('window', `拦截页面导航: ${url.slice(0, 200)}`)
   })
 
   if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
@@ -3012,8 +2532,39 @@ app.whenReady().then(async () => {
   //    代价约 50~200ms（一次 PowerShell），换文案从首帧就对。
   await primeDesktopIconsHidden()
 
+  // 用户设置（settings.json）：必须在建窗之前读进来 —— renderer 首帧用 sendSync 读它，
+  // 晚于建窗就会出现「先按默认主题画一帧、再翻成用户主题」的闪烁。
+  initSettings()
+  registerSettingsIpc({
+    getDockEdge: () => dockEdge,
+    applyDockEdge: (v) => (isImplementedEdge(v) ? setDockEdge(v) : false)
+  })
+
+  // shortcuts.json 的读写 IPC（load / save / externalize-icons）：注册本身不做 IO，
+  // 放在建窗之前只是为了「renderer 一挂载就能 invoke」。
+  registerShortcutsIpc()
+
+  // 图标协议（A1）：条目上只存 iconFile，渲染端用 ql-icon://i/<file> 取图。
+  // 它只是读文件，建窗之前注册好，首帧的 <img> 就不会 404。
+  registerIconProtocol()
+
+  // 设置中心（独立窗口 760×560）：Dock 只有 300px 高、透明窗 resize 会白闪，
+  // 设置项没地方摆 → 「+」菜单里的分组选择器/偏好项全部搬进这扇窗，主菜单瘦回「动作」。
+  // 这里只注册 IPC；窗口按需创建（打开时不常驻，关掉即销毁）。
+  registerSettingsWindowIpc({
+    iconPath: resolveResource('icon.ico'),
+    preloadPath: join(__dirname, '../preload/index.js'),
+    dataDir: app.getPath('userData'),
+    onOpened: hideDockForSettings,
+    onClosed: showDockAfterSettings
+  })
+
   // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
   createWindow(readDockEdge(), startHiddenAtLogin)
+
+  // 更新检查（F1）：打包版启动 20s 后静默看一眼 latest.yml，有新版只走托盘气泡，
+  // 绝不弹窗抢焦点（Dock 是常驻桌面窗，弹窗会把用户正在干的事打断）。
+  scheduleSilentUpdateCheck(notifyUser)
   // 启动过程中收到过 second-instance（窗口还不存在时只能记账）：建好窗口后补一次唤回
   if (pendingSecondInstanceShow) {
     pendingSecondInstanceShow = false
@@ -3090,7 +2641,7 @@ app.whenReady().then(async () => {
     }
   }
   if (!shortcutRegistered) {
-    console.warn('Failed to register any global toggle shortcut')
+    logWarn('hotkey', '所有唤出快捷键都注册失败（Alt+Space / Ctrl+Alt+Space）')
   }
 
   app.on('activate', () => {
@@ -3102,9 +2653,15 @@ app.whenReady().then(async () => {
 })
 
 // 退出前落盘：renderer 的保存是 400ms 防抖的，退出那一刻可能还有一次改动没写盘。
-// 用 before-quit（窗口还活着、IPC 双向可用）推一条 flush-pending-save，并给 200ms
-// 让 renderer 的 save-shortcuts 回来 —— 只延迟一次，quit 重入直接放行。
+// 用 before-quit（窗口还活着、IPC 双向可用）推一条 flush-pending-save，然后**等
+// renderer 回 flush-save-done**（B5）——不是拍一个固定 200ms 的定时器：图标外置后
+// 一次落盘要过 externalize-icons + save-shortcuts 两次 IPC，磁盘忙时 200ms 会被挤掉，
+// 用户看到的就是「退出前最后改的那一下没了」。上限 800ms 兜住 renderer 卡死。
 let quitFlushed = false
+let finishQuit: ((reason: string) => void) | null = null
+ipcMain.on('flush-save-done', () => {
+  finishQuit?.('renderer 已确认写盘')
+})
 app.on('before-quit', (event) => {
   // 不能要求 forceQuit：只有托盘「退出」会置它，其它退出路径（window-all-closed、
   // 系统注销/关机等）也需要把 renderer 400ms 防抖窗口里的改动落盘。
@@ -3112,10 +2669,166 @@ app.on('before-quit', (event) => {
   if (!mainWindow || mainWindow.isDestroyed()) return
   quitFlushed = true
   event.preventDefault()
-  try { mainWindow.webContents.send('flush-pending-save') } catch {}
-  // 200ms 足够 renderer 把 invoke('save-shortcuts') 发回来（同步落盘、无异步等待）；
-  // 之后再次 quit，quitFlushed 已置位，直接放行
-  setTimeout(() => app.quit(), 200)
+  let finished = false
+  const finish = (reason: string): void => {
+    if (finished) return
+    finished = true
+    finishQuit = null
+    logInfo('persist', `退出前落盘：${reason}`)
+    // 再次 quit 时 quitFlushed 已置位，before-quit 直接放行
+    app.quit()
+  }
+  finishQuit = finish
+  const win = mainWindow
+  try {
+    win.webContents.send('flush-pending-save')
+  } catch {
+    // IPC 已经不通（页面崩溃 / webContents 已销毁）：没有可等的东西，立刻放行
+    finish('IPC 不可用，跳过等待')
+    return
+  }
+  setTimeout(() => finish('等待超时（800ms），已放行'), 800)
+})
+
+// ─── 诊断：渲染端错误上报 / 打开日志目录 / 导出诊断包（B2）───────────────
+// renderer 的 console.error 在打包版里用户永远看不到，所以让它把错误主动推过来
+ipcMain.on('report-renderer-error', (_e, payload: unknown) => {
+  const p = payload as { message?: unknown; stack?: unknown; source?: unknown } | null
+  const message = typeof p?.message === 'string' ? p.message : '(无消息)'
+  const stack = typeof p?.stack === 'string' ? p.stack : ''
+  const source = typeof p?.source === 'string' ? p.source : ''
+  logError('renderer', `${message}${source ? ` @ ${source}` : ''}${stack ? `\n${stack}` : ''}`)
+})
+
+ipcMain.handle('open-log-dir', async (): Promise<boolean> => {
+  if (!getLogDir()) return false
+  const err = await shell.openPath(getLogDir())
+  if (err) logWarn('diag', `打开日志目录失败: ${err}`)
+  return !err
+})
+
+/** 诊断包：日志 + 两份 JSON + 环境信息，打成 zip 放到桌面并打开资源管理器定位。
+ *  用系统自带的 Compress-Archive（不引第三方 zip 依赖：本项目刻意保持零运行时依赖）。 */
+ipcMain.handle('export-diagnostics', async (): Promise<string | false> => {
+  const userData = app.getPath('userData')
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
+  const ps = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$ud = '${userData.replace(/'/g, "''")}'
+$stage = Join-Path $env:TEMP 'ql-diag-${stamp}'
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+if (Test-Path (Join-Path $ud 'logs')) { Copy-Item (Join-Path $ud 'logs') $stage -Recurse -Force }
+foreach ($f in 'shortcuts.json','shortcuts.json.bak','window-position.json','settings.json') {
+  $p = Join-Path $ud $f
+  if (Test-Path $p) { Copy-Item $p $stage -Force }
+}
+$info = @(
+  'QuickLaunch diagnostics',
+  ('time: ' + (Get-Date -Format o)),
+  ('app: ${app.getVersion()}'),
+  ('electron: ${process.versions.electron}'),
+  ('node: ${process.versions.node}'),
+  ('packaged: ${app.isPackaged}'),
+  ('os: ' + [System.Environment]::OSVersion.VersionString),
+  ('userData: ' + $ud)
+)
+$info | Set-Content -Path (Join-Path $stage 'info.txt') -Encoding UTF8
+$dest = Join-Path ([Environment]::GetFolderPath('Desktop')) 'QuickLaunch-diagnostics-${stamp}.zip'
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $dest -Force
+Remove-Item $stage -Recurse -Force
+Write-Output ('DIAGOK=' + $dest)
+`
+  return new Promise((resolve) => {
+    runPowerShell(ps, 30000, ({ err, stdout, stderr }) => {
+      const lines = String(stdout ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+      const mark = lines.find((l) => l.startsWith('DIAGOK='))
+      if (err || !mark) {
+        logError('diag', `导出诊断包失败 code=${(err as NodeJS.ErrnoException | null)?.code ?? '-'} ${String(stderr ?? '').trim().slice(0, 400)}`)
+        resolve(false)
+        return
+      }
+      const dest = mark.slice('DIAGOK='.length).trim()
+      logInfo('diag', `诊断包已导出 ${dest}`)
+      try { shell.showItemInFolder(dest) } catch {}
+      resolve(dest)
+    })
+  })
+})
+
+// ─── 崩溃看门狗（B1）──────────────────────────────────────────────────────
+// 背景：透明无边框窗口一旦 renderer 挂掉，用户看到的是「Dock 消失了、进程还在、
+// Alt+Space 也没反应」。没有日志、没有重建，现场什么都留不下来。
+//
+// 策略：
+// - **自动重建**，但要限流。崩溃-重建死循环会把 CPU 打满，用户只看到 Dock 一直在闪，
+//   比「停手并告诉他去看日志」更糟。
+// - **不弹模态框**：真实崩溃现场弹 dialog 有可能把主进程也卡住（它要跑自己的事件循环），
+//   托盘气泡 + 日志文件已经够用户找到我们。
+// - 限流窗口 60s / 最多 3 次是拍的：单次崩溃（显卡驱动、HMR）能自愈，
+//   真·死循环（坏图标、坏 JSON）在第 3 次就停手。
+const CRASH_WINDOW_MS = 60_000
+const CRASH_MAX_REBUILDS = 3
+let crashTimes: number[] = []
+let crashGaveUp = false
+
+/** 托盘气泡（失败静默：有些系统策略禁掉了通知，不能让它反过来搞崩流程） */
+function notifyUser(title: string, content: string): void {
+  try {
+    tray?.displayBalloon({ title, content, iconType: 'error' })
+  } catch {
+    /* 忽略 */
+  }
+}
+
+function rebuildAfterRendererGone(reason: string): void {
+  if (crashGaveUp) return
+  const now = Date.now()
+  crashTimes = crashTimes.filter((t) => now - t < CRASH_WINDOW_MS)
+  crashTimes.push(now)
+  if (crashTimes.length > CRASH_MAX_REBUILDS) {
+    crashGaveUp = true
+    logError('crash', `渲染进程在 ${CRASH_WINDOW_MS / 1000}s 内第 ${crashTimes.length} 次异常退出，停止自动重建`)
+    notifyUser('快捷方式面板已停止自动恢复', `渲染进程反复退出。日志：${getLogDir()}`)
+    return
+  }
+  logWarn('crash', `渲染进程异常退出（${reason}），第 ${crashTimes.length} 次自动重建（edge=${dockEdge} hidden=${dockTrayHidden}）`)
+  try {
+    const old = mainWindow
+    mainWindow = null
+    old?.destroy()
+  } catch (err) {
+    logWarn('crash', '销毁崩溃窗口时出错（忽略）', err)
+  }
+  try {
+    createWindow(dockEdge, dockTrayHidden)
+    logInfo('crash', '窗口重建完成')
+  } catch (err) {
+    logError('crash', '窗口重建失败', err)
+    notifyUser('快捷方式面板未能恢复', `日志：${getLogDir()}`)
+  }
+}
+
+app.on('render-process-gone', (_event, webContents, details) => {
+  // 只关心主窗口：文件夹卡片/搜索浮层将来会有自己的 webContents，不该一起重建
+  if (mainWindow && !mainWindow.isDestroyed() && webContents !== mainWindow.webContents) {
+    logWarn('crash', `非主窗口的渲染进程退出（reason=${details.reason}），不重建`)
+    return
+  }
+  rebuildAfterRendererGone(`reason=${details.reason} exitCode=${details.exitCode ?? '?'}`)
+})
+
+app.on('child-process-gone', (_event, details) => {
+  // GPU / utility 进程崩溃不会让 Dock 消失（Chromium 会自己重启它们），只记录
+  logWarn('crash', `子进程退出 type=${details.type} reason=${details.reason} exitCode=${details.exitCode ?? '?'}`)
+})
+
+process.on('uncaughtException', (err) => {
+  logError('crash', 'uncaughtException（主进程）', err)
+  notifyUser('快捷方式面板遇到内部错误', `${err.message}\n日志：${getLogDir()}`)
+})
+
+process.on('unhandledRejection', (reason) => {
+  logError('crash', 'unhandledRejection（主进程）', reason)
 })
 
 app.on('will-quit', () => {

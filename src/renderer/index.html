@@ -3,6 +3,29 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      内容安全策略（B6）。这个窗口不加载任何远程内容：脚本只有打包产物，样式只有本地 CSS
+      （React 会写内联 style，所以 style-src 必须留 'unsafe-inline'），图片只有三种来源
+      —— 本地资源、data: URL（运行时短暂态图标）、ql-icon:（A1 外置图标的协议）。
+
+      connect-src 里的 localhost 通配只为开发模式（electron-vite 的 HMR websocket）；
+      打包产物里没有任何外连，命中不了这些规则也不影响运行。
+      object-src / base-uri / frame-ancestors 全部锁死：一个 Dock 面板不需要插件、不需要
+      <base> 改写相对路径、也不该被任何页面嵌套。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+               script-src 'self';
+               style-src 'self' 'unsafe-inline';
+               img-src 'self' data: ql-icon:;
+               font-src 'self' data:;
+               connect-src 'self' ws://localhost:* http://localhost:*;
+               object-src 'none';
+               base-uri 'none';
+               form-action 'none';
+               frame-ancestors 'none'"
+    />
     <title>快捷方式面板</title>
   </head>
   <body>

@@ -2,6 +2,51 @@
 
 基于 **React 19 + TypeScript 7 + Electron 43 + Vite 7** 构建的 Windows 桌面应用——透明毛玻璃 Dock 栏悬浮桌面，一键启动程序、文件夹和系统位置。
 
+## v1.17.0（2026-11-07）
+
+设置中心独立成形的一版：Dock 侧的逻辑一条没改，但「配置」全部搬出 300px 的 Dock，
+顺带补掉了一整批性能、稳定性与工程化欠账。
+
+### 新增：设置中心（独立窗口 480×308）
+
+- **透明毛玻璃独立窗**：`frame: false` + 自绘标题栏 + `transparent: true`，与 Dock 同材质
+  （黑夜 / 白天 / 透明三档数值全抄 Dock，圆角同为 24px），Esc 关窗、单例、开窗即让位
+- **左栏五类**：通用 / 外观 / 行为 / 数据 / 关于 —— 停靠位置、图标尺寸（48/60/72）、悬停放大、
+  玻璃强度、点击后行为、两个延迟、开机自启、桌面图标、数据目录、诊断包、版本与更新检查
+- **打开设置 Dock 自动隐藏、关闭自动恢复**（用户明确要求；只在自己藏过 Dock 时才恢复，不抢用户的手动收起）
+- **「+」菜单瘦身**：只剩动作（快捷方式 / 文件夹 / 桌面图标 / 自启 / 设置… / 检查更新 / 日志 / 诊断包 / 版本）
+- `settings.json` 为唯一真相源，主进程广播 `settings-changed`；旧的 `localStorage.ql-theme` 一次性迁移
+
+### 性能
+
+- **图标外置**：`icons/` + `ql-icon://` 自定义协议，`shortcuts.json` 不再内嵌 base64（60 个图标约省 1MB，每次保存不再整份重写大字符串）
+- **文件夹卡片局部渲染**：`FolderCard` 拆成 memo 组件 + `useSyncExternalStore` 图标订阅，图标分批推送不再让整个 App 重渲染
+- **悬停放大改几何缓存**：`offsetLeft/offsetWidth` 二分定位，60 个图标时单帧最多触及 6 个
+- **启动不再抢跑 PowerShell 列盘符**：延迟 4s，首帧更快
+
+### 稳定性
+
+- **崩溃看门狗**：`render-process-gone` 60s 内最多重建 3 次，超限托盘气泡告知
+- **落盘日志**：`{userData}/logs/main.log`（200KB × 3 轮转）+ renderer 错误上报 + 一键导出诊断包
+- **退出保存握手**：`before-quit` 等 renderer 确认写盘（最多 800ms），不再固定 sleep
+- **保存失败可观测**：写盘失败降级到 `.recovery` 并提示；`shortcuts.json` 损坏时保留现场并从 `.bak` 恢复
+- **CSP**（`default-src 'self'` + `img-src 'self' data: ql-icon:`）与 ErrorBoundary 崩溃界面
+
+### 交互
+
+- 拖文件到图标上 = 用该程序打开；删除可 5s 内撤销（分组会连带恢复成员）
+- 键盘导航补齐 Home / End / Tab / Delete / 右键菜单键 + 首字母 type-ahead
+- 边缘滚动改成幂函数曲线，Shift + 滚轮快滚；拖拽视觉（缩放 + 圆头落点线）
+- 图标归一化到 64×64 透明包围盒，尺寸不一的图标不再大小错落
+
+### 工程化
+
+- `src/shared/types.ts` 成为三进程唯一类型真相源；主进程按职责拆出 7 个模块
+- 自建 lint（`devtools/lint.mjs`，6 条项目专属规则：C# 纯 ASCII、禁止 renderer 碰 Node、IPC 必须被 preload 暴露…）
+- 单测（`node --test` 直跑 .ts）+ `npm run verify`（lint → typecheck → test → build → 命中区探针）
+- 119 个一次性探针归档到 `devtools/archive/`，只留 13 个长期回归；新增 `probe:settings` 验证 Dock 让位
+- 仓库瘦身：删掉 137MB 的 Electron 离线包，`electronDist` 指向 `node_modules/electron/dist`
+
 ---
 
 ## 技术栈

@@ -10,7 +10,13 @@ npm run build       # 生产构建
 npm run typecheck   # TypeScript 类型检查（= typecheck:node + typecheck:web，逐个子项目 tsc --noEmit）
 npm run preview     # 预览生产构建
 npm run package     # 构建并打包为可分发的安装程序（electron-builder）
+npm run lint        # 项目自建规则自检（devtools/lint.mjs，见「工程纪律」）
+npm run test        # 单测（node:test，直跑 .ts —— node 24 原生类型剥离）
+npm run probe       # 命中区回归探针（要真实 Electron 窗口，勿在 CI 跑）
+npm run verify      # lint → typecheck → test → build → 命中区探针（发布前跑这一条）
 ```
+
+⚠️ 跑任何 Electron 探针前先 `Remove-Item Env:ELECTRON_RUN_AS_NODE`：本机环境里这个变量**存在即生效**（赋空字符串也算），electron 会退化成纯 node 启动，报 `Assertion failed: (isolate_data->snapshot_data()) != nullptr` 或 `Cannot read properties of undefined (reading 'setPath')`。
 
 ## 架构概览
 
@@ -22,9 +28,24 @@ npm run package     # 构建并打包为可分发的安装程序（electron-buil
 
 | 进程 | 入口 | 职责 |
 |---|---|---|
-| **Main** | [`src/main/index.ts`](src/main/index.ts) | 应用生命周期、透明无边框窗口、系统托盘、全局快捷键、IPC 处理器、PowerShell 调用 |
-| **Preload** | [`src/preload/index.ts`](src/preload/index.ts) | `contextBridge.exposeInMainWorld` 暴露 `window.api` 和 `window.electron`，定义 `LnkInfo` 和 `AppEntry` 类型 |
-| **Renderer** | [`src/renderer/src/main.tsx`](src/renderer/src/main.tsx) | React 19 SPA，挂载 `<App />` 到 `#root`，样式在 [`App.css`](src/renderer/src/App.css) |
+| **Main** | [`src/main/index.ts`](src/main/index.ts) | 应用生命周期、透明无边框窗口、系统托盘、全局快捷键、z-order/沉底让位、命中区（`setShape`）、启动器与系统类 IPC |
+| **Preload** | [`src/preload/index.ts`](src/preload/index.ts) | `contextBridge.exposeInMainWorld` 暴露 `window.api` 和 `window.electron`；类型全部 **re-export** 自 `src/shared/types.ts`，不再本地定义 |
+| **Renderer** | [`src/renderer/src/main.tsx`](src/renderer/src/main.tsx) | React 19 SPA，挂载 `<ErrorBoundary><App /></ErrorBoundary>` 到 `#root`，样式在 [`App.css`](src/renderer/src/App.css) |
+| **Shared** | [`src/shared/types.ts`](src/shared/types.ts) | 三进程共用的**唯一类型真相源** + `DEFAULT_SETTINGS`；两个 tsconfig 的 `include` 都含 `src/shared/**/*.ts` |
+
+主进程已按职责拆成多个模块（`index.ts` 只留窗口 / z-order / 命中区 / 生命周期 / 启动器 IPC）：
+
+| 模块 | 职责 |
+|---|---|
+| [`src/main/ps.ts`](src/main/ps.ts) | PowerShell 层唯一入口：四段内嵌 C#（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `ACTIVATE_CS` / `TRAY_CLICK_CS`）+ `runPowerShell()` + 图标尺寸常量 |
+| [`src/main/persist.ts`](src/main/persist.ts) | `writeFileAtomic()`（临时文件 + fsync + `.bak` + rename） |
+| [`src/main/shortcutsStore.ts`](src/main/shortcutsStore.ts) | `shortcuts.json` 读写/清洗/损坏恢复 + 三个持久化 IPC |
+| [`src/main/iconStore.ts`](src/main/iconStore.ts) | 图标外置（`icons/`）、`ql-icon://` 协议、`normalizeIcon()` |
+| [`src/main/settings.ts`](src/main/settings.ts) | `settings.json` + 设置 IPC + 广播 |
+| [`src/main/logger.ts`](src/main/logger.ts) | 落盘日志（200KB × 3 轮转） |
+| [`src/main/updater.ts`](src/main/updater.ts) | 版本比对与更新检查 |
+
+🚫 **内嵌 C# 常量只能待在 `ps.ts`，且必须纯 ASCII** —— `devtools/lint.mjs` 的 `csharp-ascii` 规则会拦（GBK 解码会吃掉 `*/`，见下文「开机自启动」段）。
 
 Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接访问 Node.js 或 Electron API。
 
@@ -34,8 +55,12 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 | 配置文件 | 涵盖范围 |
 |---|---|
-| [`tsconfig.node.json`](tsconfig.node.json) | `src/main/` + `src/preload/`（ESNext，无 DOM） |
-| [`tsconfig.web.json`](tsconfig.web.json) | `src/renderer/src/`（ESNext + DOM + JSX） |
+| [`tsconfig.node.json`](tsconfig.node.json) | `src/main/` + `src/preload/` + `src/shared/`（ESNext，无 DOM） |
+| [`tsconfig.web.json`](tsconfig.web.json) | `src/renderer/src/` + `src/shared/`（ESNext + DOM + JSX） |
+
+- **类型只写一遍**：`AppEntry` / `LnkInfo` / `FolderChild` / `FolderListing` / `FolderIconsPayload` / `DriveInfo` / `AppSettings` / `RunAppResult` / `DockEdge` 全部在 [`src/shared/types.ts`](src/shared/types.ts)，preload 与 renderer 都从这里 import；主进程 `index.ts` 与 `shortcutsStore.ts` 也从这里取
+- **`src/renderer/src/env.d.ts` 必须用 `type X = import('../../shared/types').X`**（注意是**三层**相对路径：`env.d.ts` 在 `src/renderer/src/` 下）。写成 `../shared/types` 不会报错，但会把类型静默降级成 `unknown`，随后表现为一堆莫名其妙的 `Type 'unknown' is not assignable to type 'string'` 与 TS7006 —— 这个坑踩过一次
+- 用 `import(...)` 而不是 import 语句是刻意的：`env.d.ts` 是全局声明文件，一旦带上普通 import 就变成模块，里面的 `interface Window` 全局增强随即失效
 
 ### 透明窗口 + Dock 布局
 
@@ -83,7 +108,9 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   - **renderer 侧先挡一道重复上报**（`lastHitRegionRef`）：`ResizeObserver` / `window.resize` / 浮层开合三条通道会重复报同一个矩形，虽然主进程也去重，但那之前已经付过一次 IPC 序列化 + 一轮事件循环。把 `getBoundingClientRect()` 的四个值 `Math.round` 后与 `overlay` 拼成 key 比较——**取整再比，subpixel 抖动（0.0001px 级）不算变化**
   - **回归验证**：`node devtools/probe/hitregion-e2e.cjs`（自己起带 CDP 的 dev 版，读 `.dock-bar` 几何 → `GetWindowRgn` 读真实 region → **七个场景共 37 项断言**：默认 / 拖文件进玻璃条放开整窗（`.drop-hint` 必须真的渲染、且整条落在 region 内）/ 丢一个假快捷方式后 `dropHint` 定时器走完收回 / 「+」菜单开整窗 / 菜单关恢复 / `top` 档镜像 / 切回 `middle`，末尾打印 `all hit-region checks passed`；退出码 0/1）。断言里有一条**不变量** `region covers the glass bar itself`——玻璃条本体（`.dock-bar` 里 82px 之后那 76px）必须整块落在 region 内，调 `DOCK_HIT_INSET` 时它会最先变红，别删。
     ⚠️ 造合成拖拽事件有两个坑：①**必须带真的 `File`**（`new DataTransfer()` 后 `dt.items.add(new File(['x'],'a.lnk'))`）——`isFileDragEvent()`（`App.tsx:147`）按 `dataTransfer.types.includes('Files')` 判，空 DataTransfer 会被挡掉，于是表现出「`dragleave` 清不掉 `fileDragOver`、region 卡在整窗」，**这不是产品 bug**；②`dispatchEvent` 之后**必须跨一次事件循环再查 DOM**——React 18 在事件处理器内批量 flush，同步返回时还没重新渲染，当场 `querySelector('.drop-hint')` 一定是 `null`。
-    配套的一次性探针：`devtools/probe/region-probe.ps1`（读 region）、`hittest-real.ps1`（置顶后全窗网格命中率，实测玻璃条内 100% 命中、上方透明带 0%、整窗 **47.2%**（v1.15.2 内缩后；内缩前 56.6%）= region 面积占比）、`zdump.ps1`（z-order 排查）、`cdp.mjs`（在 renderer 里跑一句表达式，事件也能派发）、`shot-now.ps1`（Focus + 截图；窗口被 `run-app` 失败路径 hide 时截不到，属工具限制）
+    ⚠️ `devtools/probe/region-probe.ps1` 选窗口的条件是「`Chrome_WidgetWin_1` + 面积最大 + **高度 ≤ 400**」——设置中心是另一扇同类窗口（480×308，面积曾一度比 Dock 还大），面积比 Dock(1200×300) 还大，只按面积最大会读到它（它没有 region，读出来就是整窗矩形，表现为「region 全是整窗」的假失败）。同理 `hitregion-e2e.cjs` 开跑前会检查有没有别的实例：单实例锁会让新进程直接退出，探针会悄悄连到旧窗口上。
+
+配套的一次性探针：`devtools/probe/region-probe.ps1`（读 region）、`hittest-real.ps1`（置顶后全窗网格命中率，实测玻璃条内 100% 命中、上方透明带 0%、整窗 **47.2%**（v1.15.2 内缩后；内缩前 56.6%）= region 面积占比）、`zdump.ps1`（z-order 排查）、`cdp.mjs`（在 renderer 里跑一句表达式，事件也能派发）、`shot-now.ps1`（Focus + 截图；窗口被 `run-app` 失败路径 hide 时截不到，属工具限制）
 - **停靠位置三档（中间 / 下 / 上）**：类型 `DockEdge = 'bottom' | 'top' | 'left' | 'right' | 'middle'`，但 `IMPLEMENTED_EDGES` 只放行 `bottom`/`top`/`middle`——左/右竖排窗口尺寸不同，需要重建窗口（`recreateWindowForEdge` 已留好），是下一阶段的事。坐标由 `presetPosition(edge)` 在主显示器工作区上算：`top` 贴工作区顶边、`bottom` 贴工作区底边、`middle` 垂直居中；三者都水平居中、窗口尺寸（85% 屏宽 ≤ 1200px × 300px）完全相同，所以切换是**原地 `setBounds` + `webContents.send('dock-edge-changed')`**（实测 ~62ms，不重建窗口、不重载页面、无白闪），只有尺寸真的变了才走 `recreateWindowForEdge`。持久化在 `{userData}/window-position.json`（只存 `{"edge":"..."}`，**文件名沿用旧版**；旧版写的 `{x,y,displayId}` 直接忽略；读入与写入都把未实现档位归一化回 `DEFAULT_EDGE` = `middle`，防止手改配置文件改出竖排尺寸的窗口）。`setDockEdge` 对同档位（±2px 内）提前返回时**仍然重发事件**——页面重载过的 renderer 拿的是启动时 argv 里的旧边，不重发它的布局会一直停在旧位置；renderer 挂载时另外用 `get-dock-edge` 主动同步一次。首次参数走 preload 读的 `--ql-edge=<edge>` argv 常量，首帧就是正确方向，不会先画底部再翻上去
 - **窗口不可自由拖动**：代码里没有任何 `-webkit-app-region: drag`（CSS 里只剩两处解释性注释），也没有 `move`/`moved` 监听或位置巡检。原因：透明窗口下 Dock 栏要么贴窗口上沿、要么贴下沿，窗口位置一动就得补偿布局，实测表现为**明显跳动**（做过「边缘区域判定 + 拖动过程中不切位置 + 松手平滑收尾」也压不住），于是位置**只由预设决定**。不要再引入拖拽/位置记忆
 - **显示器参数变化**：`screen.on('display-metrics-changed' | 'display-added' | 'display-removed', reapplyDockEdgeOnDisplayChange)` 重新套用当前档位。**这三行必须写在 `app.whenReady()` 里**——`screen` 模块在 `ready` 之前使用会抛 `The 'screen' module can't be used before the app 'ready' event`，直接把启动打崩（曾发生过）
@@ -325,7 +352,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   - 高度上限 `overlayAvail` 用 `window.innerHeight - anchorOffset` 算，**不要用常量 `BASE_WINDOW_H`**：
     锚点偏移是从真实 `innerHeight` 推出的，用常量会差几像素，而内容本就贴着上限，
     差这几像素就把主题选择器推进滚动区
-- **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色与主题分段选择器统一——`--switch-on-bg`/`--switch-on-knob` 按主题定义：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）
+- **UI**：「+」菜单项「开机自启动」：右侧显示**开关指示器**（`.item-switch`，配色按主题定义——`--switch-on-bg`/`--switch-on-knob`：黑夜=白轨道+深球、白天/透明=深轨道+白球，关闭态均为弱轨道+白球；`.dropdown-item` 为 flex `space-between` 布局，左侧文字与其余菜单项完全对齐），菜单打开时 `getAutoStart()` 实时读取，点击 `setAutoStart()` 乐观更新——**与其他菜单项不同，切换后不关闭菜单**（开关类控件交互，用户可立即看到状态翻转并连续切换）
 - **「点图标后 Dock 隐藏到托盘」是既定行为，不是 bug（v1.13.7 与用户确认）**：
   用户报「点开微信后软件就退出到后台」，实测**进程没有退出**——`runApp` 返回 `true`、
   主窗口 `visible=false destroyed=false`、5 秒后仍存活、微信窗口 0→1 成功唤出。
@@ -333,6 +360,86 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   ⚠️ 以后再遇到「应用退出」类报障，**先量进程存活**（`Get-Process` + `isDestroyed()`）再动代码
 - **单实例锁**：模块顶层 `app.requestSingleInstanceLock()`——未获得锁直接 `app.quit()`，`whenReady` 开头 `return` 跳过初始化；`second-instance` 事件唤起已有窗口（防止开机自启 + 手动启动出现两个 Dock）
 
+### 设置系统（`{userData}/settings.json`）
+
+**唯一真相源是 `src/main/settings.ts`** —— renderer 只持有一份镜像（`settings` state + `settingsRef`），任何修改都走 `patchSettings()` 落盘、再由主进程广播回来。类型与 `DEFAULT_SETTINGS` 在 [`src/shared/types.ts`](src/shared/types.ts)。
+
+字段（`AppSettings`）：`theme`、`glassPlan`、`dockEdge`、`iconSize`（48/60/72）、`magnify`（1~1.6）、`glassBlur`（8~64）、`glassSaturate`（1~2.4）、`folderCardDelay`（0~1500）、`panelCloseDelay`（0~1500）、`afterLaunch`（`hide`/`keep`/`sink`）、`probeBeforeLaunch`、`searchEnabled`、`followSystemTheme`。
+
+- **`normalizeSettings()` 逐字段校验 + clamp，坏字段只回退那一项**，不让一个手改坏的值把整份设置打成默认
+- **`dockEdge` 不写进 `settings.json`**（`toStored()` 会剥掉）：真相源仍是 `window-position.json`，两处各存一份必然对不上。`set-settings` 收到 `dockEdge` 时转交 `applyDockEdge()`，被 `IMPLEMENTED_EDGES` 拒绝就忽略
+- **`get-settings-sync` 必须同步赋 `event.returnValue`**（同 `get-desktop-icons-hidden-sync` 那条铁律）：renderer 在 `useState` 初始化里同步读，首帧就是用户的主题/图标尺寸，不会先画默认值再跳
+- `set-settings` 写盘后向 `webContents.getAllWebContents()` 广播 `settings-changed`，重建的窗口也能跟上
+- **`initSettings()` + `registerSettingsIpc()` 必须在 `createWindow()` 之前**：renderer 一挂载就 sendSync，晚一步就只能拿到默认值
+- 历史包袱：主题早年存 localStorage（key `ql-theme`），现在仅作**一次性迁移源**（settings 仍是默认主题且 localStorage 有值时搬过去），迁完不再读它；导航位置仍存 `ql-nav-last`（纯 UI 状态，不必跨进程）
+
+### 设置中心（独立窗口，v1.17）
+
+Dock 只有 300px 高、且透明窗口 resize 会白闪，**配置界面必须另开一扇普通窗口**。实现在 [`src/main/settingsWindow.ts`](src/main/settingsWindow.ts)，页面是 [`src/renderer/src/settings/SettingsApp.tsx`](src/renderer/src/settings/SettingsApp.tsx) + `settings.css`。
+
+- 尺寸 **480×308**（`minWidth 420 / minHeight 300`，`resizable: true`），`frame: false` + 自绘标题栏；用户三次要求更紧凑（760×560 → 720×508 → 480×340 → **480×308**，最后一次是删掉页脚换来的 32px）。现在密度：标题栏 34px / 左栏 **max-content（实测 69px）** / 行 padding **4px** / **没有页脚**。**空格子比尺寸更刺眼**——加设置项先压现有页的间距，别把窗口撑大；真放不下才让它滚（外观页 5 行正好 `scroll == h`，再多一行就开始滚）
+- **整窗只有一层底色**：`.st-titlebar` / `.st-nav` / `.st-pane` 的 `background` 全是 `none`，只靠 1px 的 `--st-line` 分区。早期三块各给一个 `--st-panel` 半透明白，叠在透明窗上就是三种不同的灰（用户原话「整体颜色配置不一致」）。玻璃比 Dock 更实（`rgba(32,37,51,.9) → rgba(20,24,34,.93)`、blur 30 / sat 1.15）：Dock 只有 76px 高、背景是满屏桌面，而设置窗是 480×340 的大面积，62% 会让壁纸颜色把整块玻璃搅成脏灰
+- **窗口是透明 + 毛玻璃，与 Dock 同材质**：`transparent: true` + `backgroundColor: '#00000000'` + `hasShadow: false`，CSS 侧 `.st` 用 `backdrop-filter: blur(var(--st-blur)) saturate(var(--st-sat))` 和 `border-radius: 24px; overflow: hidden`（**圆角与 Dock 玻璃条同为 24px**）（透明窗没有 DWM 圆角与阴影，四角全靠 CSS 裁）。`html[data-win='settings'] body` 必须是 `background: transparent`，一旦刷成不透明色，毛玻璃立刻退化成死色板
+- 三种材质跟 Dock 的三档一一对应：`.st[data-theme='dark'|'light'|'transparent']`（值来自 `settings.theme`，用户在「外观 → 材质」里切换，两边同时变）。**色值是从 App.css 抄来的同一组数**（黑夜 `rgba(38,44,64,.7)` → `rgba(23,28,42,.62)`、白天 `rgba(252,252,254,.68)` → `rgba(238,241,248,.46)`、blur 36 + saturate 1.7；正文 `#fff` / 次要 `rgba(255,255,255,.62)` / 强调 `#3b7bd5`）—— 没有跨文件共享变量，改 Dock 主题时要同步改这里。透明档在窗口里是**近黑实心卡 + 10px 模糊**（Dock 的透明主题本身没有玻璃层，窗口不能没有底），`resolvedTheme` 必须把 `transparent` 透传出去；早期写成「透明等价于深色」会让这一档完全失效
+- 左栏五类：通用 / 外观 / 行为 / 数据 / 关于；右侧表单。**页脚那一栏被用户砍掉了**（「去掉下面的一栏重置本节」），原来的 `重置本节` 挪成**标题栏右侧的「↺ 恢复默认」**：`SECTION_KEYS` 只列 `appearance` / `behavior`，其余三节不渲染这个按钮（`canReset = SECTION_KEYS[section].length > 0`）。按钮样式必须写 `.st-tb-btn.st-tb-text`（**双类**）——单类 `.st-tb-text` 靠顺序压 `.st-tb-btn` 的 `display: grid` 在热更新/行内样式下会失效，表现是图标与文字竖着叠、文字溢出标题栏（用户截图报过）。状态提示改成绝对定位的 `.st-toast`（`.st` 已加 `position: relative`），不再占一行高度。左栏宽度改 `width: max-content`（原来写死 96px，右侧空了 30px），分界线现在贴在文字右边
+- 停靠位置放在「通用」（它决定 Dock 贴哪，不属于外观），通用页另有两行只读快捷键说明，用来把这一页填满
+- **单例**：`openSettingsWindow()` 已存在就 `restore() + show() + focus()`，不会开出第二扇
+- **开窗即让位、关窗即回来**（用户明确要求）：`registerSettingsWindowIpc({ onOpened, onClosed })` 由主进程注入 `hideDockForSettings` / `showDockAfterSettings`（`src/main/index.ts`）。**不要复用 `hideDockAfterLaunch()`**：那条按 `settings.afterLaunch` 三态走（可能是 `keep`），而设置窗是 alwaysOnTop 的 Dock 会压住它的标题栏，必须无条件让位；用独立布尔 `dockHiddenBySettings` 记「这次是我们藏的」，Dock 本来就在托盘里时不动、也不记账（关窗后不该突然冒出来）
+- 四个 IPC：`open-settings`（handle，返回布尔）、`settings-minimize` / `settings-close`（send，用 `BrowserWindow.fromWebContents(e.sender)` 定位本窗，**并且必须校验 `win === settingsWindow`**：这两个 API 在 preload 里是全局暴露的，Dock 的渲染进程也能调，不校验就会「关设置」把 Dock 关掉）、`settings-data-dir`（handle，`shell.openPath(userData)`）
+- Esc 关窗、标题栏 `-webkit-app-region: drag` + 按钮容器 `no-drag`（`devtools/lint.mjs` 的 `no-window-drag` 规则对 `src/renderer/src/settings/` 放行，但仍要求该目录出现 `drag` 时必须也有 `no-drag`）
+- 🚫🚫 **只有一个 HTML 入口，设置窗是 `index.html?view=settings`**：`electron-vite.config.ts` 里 `renderer.build.rollupOptions.input` 传多页对象**不生效** —— electron-vite 5.0.0 的渲染器预设先把它设成 `findInput(root)` 返回的**单个字符串路径**（`node_modules/electron-vite/dist/chunks/lib-q6ns0vZr.js:254-260`），随后 `mergeConfig` 遇到 string vs object 类型不匹配就把多页对象丢了（`:526-543`）；用 `enforce:'post'` 插件注入 config 也一样（那个阶段插件根本没跑）。**别再试多页**，构建产物永远只有 `index.html`
+  - 路由判定在 `src/renderer/src/main.tsx`：`?view=settings`（或 `#settings`）→ 渲染 `<SettingsApp/>`，否则 `<ErrorBoundary><App/></ErrorBoundary>`；同时给 `document.documentElement.dataset.win = 'settings'`
+  - `settingsWindow.ts` 用 `loadFile(..., { query: { view: 'settings' } })` / dev 下 `loadURL(`${devUrl}/index.html?view=settings`)`
+- ⚠️⚠️ **`settings.css` 的全局规则必须挂在 `html[data-win='settings']` 下**：设置窗与 Dock 共用同一份 bundle 的 CSS，裸写 `html, body { background: … }` 会把 Dock 那扇**透明**窗刷成不透明深色块。现在只有 `html[data-win='settings']` 才吃 `height/margin/overflow/background`，其余样式全部限定在 `.st` 容器内
+- **行布局是「修拥挤」的一部分，别改窄**：`.st-row { grid-template-columns: 92px 1fr; gap: 10px; padding: 4px 0 }`、`.st-seg { padding: 2px; border-radius: 9px }`、`.st-seg-btn { min-width: 52px; height: 26px; padding: 0 9px; white-space: nowrap }` —— 原来菜单里那个 28px 高、按百分比分宽的胶囊才让「标准」贴边溢出（用户截图报的就是它）；`min-width` + `white-space: nowrap` 是这条的命门，缩放字体时它们先红
+
+### 图标存储与 `ql-icon://` 协议（A1 / E4，改图标存取必读）
+
+图标不再以 base64 塞进 `shortcuts.json`：`src/main/iconStore.ts` 把 data URL 解出来写 `{userData}/icons/<sha1前16位>.<ext>`，条目只留 `iconFile`。
+
+- 写入链：`storeIconDataUrl()` → `externalizeIcons(entries)`（保存与加载两路都过一遍）→ `pruneIcons(entries)` 删掉没人引用的文件
+- 渲染端 `iconSrc(entry)`：**有 `iconFile` 就用 `ql-icon://i/<encodeURIComponent(iconFile)>`，否则回落到内联 `iconDataUrl`**。所有 `<img>` 都必须走它，别再直接读 `iconDataUrl`（那已是可选字段）
+- **`registerIconScheme()` 必须在 `app.whenReady()` 之前调用**（`protocol.registerSchemesAsPrivileged` 只在 ready 前有效）；`registerIconProtocol()` 在 ready 后用 `protocol.handle` + `net.fetch(file://…)` 回文件。处理器会拒绝 `..`、斜杠与非白名单扩展名（png/jpg/webp/gif/bmp/ico）
+- **换图标时必须同时清 `iconFile`**（`{ iconDataUrl: 新图, iconFile: undefined }`）——只改 `iconDataUrl` 的话 `iconSrc()` 仍优先读老文件，用户看到「改了没反应」
+- **归一化在写入侧（E4）**：`normalizeIcon()` 用 `nativeImage` 取 alpha 包围盒 → 正方形裁剪 → 缩到 64×64 存 PNG。三个守卫：`toBitmap()` 长度必须等于 `w*h*4`（高 DPI 下 `scaleFactor ≠ 1` 就放弃归一化，而不是算出错位像素）、空图直接回落、任何异常只 `logWarn` 并保留原图
+- `sanitizeShortcutEntries` 的字符串白名单已含 `iconFile`；**新增可选字段要同步加进去**，否则会被当脏数据丢掉
+
+### 日志、崩溃看门狗与诊断包（B1 / B2）
+
+- `src/main/logger.ts`：`{userData}/logs/main.log`，**同步 append**（崩溃前最后一行不能留在缓冲区），超过 200KB 轮转 `main.1.log` / `main.2.log`（只留 3 份）。写盘失败置降级位、只走 console，不影响主流程
+- **看门狗**：`app.on('render-process-gone')` 只对主窗口重建（60s 内最多 3 次，超限就停手并提示），其它 webContents 只记日志；`uncaughtException` / `unhandledRejection` 记日志 + 托盘气泡，**刻意不弹 modal**
+- renderer 侧：`main.tsx` 的 `error` / `unhandledrejection` 监听与 `ErrorBoundary` 都走 `reportClientError()`（`src/renderer/src/errors.ts`）→ `report-renderer-error` IPC → 主进程日志。**只在 DEV 打 console，生产不刷屏**；**刻意不做「报错就重渲染」自愈**（每帧报错会把日志刷爆），自愈是主进程看门狗的活
+- 「+」菜单 →「打开日志目录」/「导出诊断包」：后者把 logs + `shortcuts.json`(+`.bak`/`.recovery`) + `window-position.json` + `settings.json` + 环境信息压成桌面的 `QuickLaunch-diagnostics-<stamp>.zip`
+- ⚠️ **解析这条 PowerShell 的输出只认标记行**：脚本 `Write-Output 'DIAGOK=<path>'`，主进程只找最后一个 `startsWith('DIAGOK=')` —— 整段等值判断会被未赋值方法调用的返回值污染（同类坑在 `toggle-desktop-icons` 上踩过一次）
+
+### 安全策略（CSP，B6）
+
+`src/renderer/index.html` 里一条 meta：
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: ql-icon:; font-src 'self' data:; connect-src 'self' ws://localhost:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+```
+
+- **`img-src` 必须含 `ql-icon:`**，否则图标外置后整条 Dock 变空白（而且只在生产暴露，dev 下容易被 HMR 掩盖）
+- `style-src` 的 `'unsafe-inline'` 是为了根元素注入 CSS 变量（`--dock-icon` 等）与 `.dock-item` 的 inline `transform`；`connect-src` 的 localhost 通配只为 dev HMR，打包产物里没有别的网络请求
+
+### 更新检查（F1，零依赖）
+
+`src/main/updater.ts` 自己读 `latest.yml` 比对版本，**刻意不用 `electron-updater`**：① 它是运行时依赖，而 `electron-builder.yml` 整目录排除 `node_modules`；② 它默认静默下载 + 退出安装，会绕过本项目向导式 NSIS（用户要选安装路径）；③ 它要求代码签名与 update feed，缺一环就静默失败。
+
+- `UPDATE_FEED_URL` **现在是占位地址 `https://example.invalid/…`，发布前必须改** —— 现在点「检查更新」得到「检查更新失败：HTTP 404」是预期的
+- `checkForUpdates()` 在 `!app.isPackaged` 时直接返回 `{ status: 'dev' }`；网络请求 8s 超时；`compareVersions()` 自己按 `[.+-]` 切段比较（不引 semver）
+- 「+」菜单 →「检查更新」：有新版就「发现新版本 vX，正在打开下载页…」+ `openUpdatePage()`
+- `scheduleSilentUpdateCheck(notify)` 只在打包版跑，启动 20s 后静默查一次，有新版仅托盘气泡提醒，不打断用户
+
+### 工程纪律（D5 / D6）
+
+- **探针分三类，别乱放**：`devtools/probe/` 只留长期回归/测量工具（`hitregion-e2e`、`regression`、`nav-deterministic`、`visibility-state`、`runapp-four-states`、`flip-e2e`、`sink-logic`、`themes`、`settings-dock`、`settings-shot`、`probe-main`、`cdp.mjs`、`region-probe.ps1`、`hittest-real.ps1`、`shot-now.ps1`）；一次性排查脚本进 `devtools/archive/probe/`；图标/构建类一次性脚本进 `devtools/archive/oneoff/`。**新建探针先想清楚它要不要长期跑**，别又堆回一百多个
+- **`.gitignore` 只忽略 `devtools/` 下的产物**（`archive/`、`**/out/`、`*.png`、`*.log`）——整目录忽略会让克隆后的 `npm run lint/test/verify` 直接失效（踩过）
+- `devtools/lint.mjs` 六条规则：`csharp-ascii` / `no-console`（白名单 `logger.ts`、`errors.ts`、`index.ts`）/ `no-window-drag` / `no-electron-in-renderer` / `no-node-in-renderer` / `no-backup-in-src`，外加 warn 级 `ipc-unexposed`（新 IPC 通道必须出现在 preload 里）。**不引 eslint 是刻意的**：TypeScript 7 预发布版与 `typescript-eslint` 的 peer 范围对不上（实测 ERESOLVE），而真正要守的项目约定通用 linter 也管不了
+- **单测直跑 `.ts`**：`node --test "devtools/tests/*.test.mjs"`，node 24 原生类型剥离。**必须传 glob，传目录会 `Cannot find module`**
+- **CI（`.github/workflows/ci.yml`）只跑 lint → typecheck → test → build，不跑探针**：它们要真实窗口 / `SetWindowRgn` / 托盘点击，runner 没有交互桌面，跑出来只是环境噪声
+- 发布前跑 `npm run verify`（lint → typecheck → test → build → 命中区探针）
 ### IPC 通道
 
 所有 IPC 使用 `ipcMain.handle` / `ipcRenderer.invoke`（Promise 模式）。Preload 暴露两个对象：
@@ -363,25 +470,53 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 | `nav-enter` | Main → Renderer | Alt+Space 唤出 Dock 时推送（`webContents.send`，非 handle/invoke）；renderer 据此进入键盘导航模式并恢复到上次选中位置 |
 | `get-dock-edge` / `set-dock-edge` | Renderer → Main | 读取 / 切换停靠位置（`middle`/`bottom`/`top`；横向三档窗口尺寸相同 → `applyDockEdge` 原地 `setBounds` + 推事件并写 `window-position.json`；未实现档位被拒并归一化回默认） |
 | `dock-edge-changed` | Main → Renderer | 停靠位置变更推送（含显示器参数变化后的重新归位）；renderer 收到后翻 `data-edge` 布局。**同档位提前返回时也会重发**（页面重载过的 renderer 只有启动 argv 里的旧边） |
-| `list-folder` | Renderer → Main | 文件夹预览卡片的数据源：`fs.readdir` + 目录优先自然序 + 400 项上限，文件大小只 stat 文件（目录不递归，**并发受限 16**，别用无脑 `Promise.all` 压垮 libuv 线程池），**首批 14 个图标在返回前填好**（目录用一次提取常驻的 shell32 index 4 黄色文件夹图标、文件用 `app.getFileIcon`）；5s TTL 缓存（上限 40，写入前先清理过期项）+ 在途请求 Promise 去重；失败返回 `error: 'missing' \| 'denied' \| 'notdir'` |
+| `list-folder` | Renderer → Main | 文件夹预览卡片的数据源：`fs.readdir` + 目录优先自然序 + 400 项上限，文件大小只 stat 文件（目录不递归，**并发受限 16**，别用无脑 `Promise.all` 压垮 libuv 线程池），**首批 14 个图标在返回前填好**（目录用一次提取常驻的 shell32 index 4 黄色文件夹图标、文件用 `app.getFileIcon`）；5s TTL 缓存（上限 FOLDER_CACHE_MAX = 24 条，写入前先清理过期项）+ 在途请求 Promise 去重；失败返回 `error: 'missing' \| 'denied' \| 'notdir'` |
 | `folder-icons` | Main → Renderer | 预览图标后台分批推送（每批 24 个，总上限 150）；renderer 按路径就地替换（**本批没命中当前卡片目录时直接返回原状态**，不建新对象）。**推送目标从「在途记录」里实时取，不是建 job 那一刻的 sender 快照**（v1.13.1）：窗口重建后新窗口会命中同一条在途 Promise，用旧 sender 推的话新窗口永远停在占位块 |
 | `open-path` | Renderer → Main | `shell.openPath`（ShellExecuteEx 语义）打开任意路径——目录开资源管理器、文档/图片交给关联程序；**返回成功后才隐藏 Dock**（目标不存在/无关联程序时保持可见，否则用户看到「点了没反应 + Dock 消失」） |
+| `externalize-icons` | Renderer → Main | 保存前把条目里的内联 base64 落成 `icons/` 文件（返回 `{ entries, changed }`）——A1 的入口 |
+| `report-renderer-error` | Renderer → Main | 渲染端未捕获错误上报（`ipcRenderer.send`），落日志供看门狗与诊断包使用 |
+| `open-log-dir` | Renderer → Main | 打开 `{userData}/logs` |
+| `export-diagnostics` | Renderer → Main | 把日志 + 三份配置文件 + 环境信息压成桌面 zip 并 `showItemInFolder`；返回路径或 `false` |
+| `get-settings-sync` | Renderer → Main | `sendSync` 首帧同步读设置（处理器必须**同步**赋 `event.returnValue`） |
+| `open-settings` | Renderer → Main | 打开/聚焦设置中心窗口（单例），返回是否成功 |
+| `settings-minimize` / `settings-close` | Renderer → Main | 设置窗自绘标题栏的最小化 / 关闭（按 `e.sender` 定位窗口） |
+| `settings-data-dir` | Renderer → Main | 打开 `{userData}` 目录（设置 → 数据） |
+| `get-settings` / `set-settings` | Renderer → Main | 异步读 / 局部改（merge 后写盘并广播 `settings-changed`；patch 里的 `dockEdge` 转交 `applyDockEdge`） |
+| `settings-changed` | Main → Renderer | 设置变更广播（窗口重建后也靠它同步） |
+| `flush-save-done` | Renderer → Main | B5 握手：renderer 确认未落盘改动已写完，主进程据此立即放行退出（800ms 超时兜底） |
+| `check-update` / `open-update-page` | Renderer → Main | 读 `latest.yml` 比对版本 / 用默认浏览器打开下载页 |
 
 ### React UI
 
-App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)）：
+`App` 仍是渲染端主组件（[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)），但**不再是一个文件干完**——D1 拆出了一组同目录模块，改交互前先看这张表：
+
+| 文件 | 职责 |
+|---|---|
+| `App.tsx` | 状态机（`apps` / `navId` / 浮层开合 / 拖放 / 撤销）+ JSX 装配 |
+| `hooks/useDockKeyboard.ts` | 键盘导航整块（`ADD_BTN_ID`、type-ahead、Home/End/Tab/Delete/ContextMenu/F10） |
+| `hooks/useMagnify.ts` | 悬停放大（`MAGNIFY_RANGE` / `MAGNIFY_EXTRA`，倍数读 `settings.magnify`） |
+| `hooks/useEdgeScroll.ts` | 拖拽边缘自动滚动（`EDGE_ZONE = 60`、`EDGE_MAX_SPEED = 18`） |
+| `dockGeometry.ts` | `measureCenters()`（offsetLeft/offsetWidth 快路径）+ `applyZoom()`（WeakMap 记忆） |
+| `FolderCard.tsx` | 文件夹预览卡片：`memo` + `useSyncExternalStore` 订阅 `folderIcons.ts`，图标分批推送只重渲染对应行 |
+| `AddMenu.tsx` | 「+」菜单：**只放动作**（添加快捷方式 / 文件夹 / 桌面图标 / 开机自启动 / 设置… / 检查更新 / 日志目录 / 诊断包 / 版本行） |
+| `EmptyState.tsx` | 统一空状态（`main` + `sub` + 可选 icon） |
+| `folderIcons.ts` / `format.ts` / `errors.ts` | 图标订阅 store / `normPath`+`fmtFileSize` / `reportClientError` |
+
+⚠️ **`folderIcons.ts` 与 `format.ts` 是刻意抽出来的独立模块**：`FolderCard.tsx` 要用它们，若继续留在 `App.tsx` 里反向 import 会绕成循环依赖，Vite 热更新时会拿到半初始化的模块。
+
+以下是 `App` 的行为说明：
 
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
 - 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
 - **Dock 栏**：毛玻璃横栏（位置由根元素 `data-edge` 决定：`bottom`/`middle` 在窗口下沿、`top` 在上沿），图标水平排列，gap 4px；内容超过宽度时横向滚动
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单（添加快捷方式/文件夹/**停靠位置分段选择器**/**主题嵌套选择器**/**隐藏或显示桌面图标**/**开机自启动**；「此电脑」「回收站」由启动扫描自动加入，无手动入口）。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角。**停靠位置选择器**（`DOCK_EDGE_CHOICES`：中间/下/上）复用主题分段控件的 `.theme-seg` 样式——位置选择后菜单保持打开，`handleEdgePick` 不做本地短路，一切以主进程 `setDockEdge` + 事件回推为准
-- **主题分段选择器**（`.theme-seg`，纯 flex 分段控件——绝对定位滑块方案反复出布局问题后重写）：主行「透明 | 毛玻璃」两段（激活项自带底色 `--nt-ink` 高亮 + 文字 `--nt-ink-on`）；毛玻璃激活时下方展开子行「黑夜 | 白天」（透明态 `display: none` 隐藏），选中项底色 `--nt-sub-bg`。`handleThemePick(next)` 选择后**菜单保持打开**可连续预览；`glassPlan` state 记忆毛玻璃子主题（切去透明再切回不丢）。配色经 CSS 变量随主题适配，定义于 `.app`/`.theme-light`/`.theme-transparent`
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单 —— **只放动作，不放配置**（添加快捷方式 / 添加文件夹 / 隐藏或显示桌面图标 / 开机自启动 / **设置…** / 检查更新 / 打开日志目录 / 导出诊断包 / 版本行；「此电脑」「回收站」由启动扫描自动加入，无手动入口）。菜单本体在 `AddMenu.tsx`。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角。**停靠位置选择器**（`DOCK_EDGE_CHOICES`：中间/下/上）复用主题分段控件的 `.theme-seg` 样式——位置选择后菜单保持打开，`handleEdgePick` 不做本地短路，一切以主进程 `setDockEdge` + 事件回推为准
+- **配置项已全部迁到设置中心（v1.17）**：停靠位置 / 主题材质 / 图标大小 / 放大倍数 / 玻璃强度 / 悬停延迟 / 点击后行为 / 跟随系统主题，都不再是菜单里的分段控件，而是 `src/renderer/src/settings/SettingsApp.tsx` 里的 `.st-seg`。菜单可用高度只有约 200px —— 早先把它们塞进菜单时，`.theme-seg` 的高 28px 胶囊里「标准」两个字贴边溢出（用户报的原图），且每加一个设置项就得挤一次。**App.css 里 `.theme-seg*` / `.prefs-*` / `--nt-ink` 一族变量已随之删除，不要再加回来**
 - **菜单自动关闭**：鼠标移出即关（点击外部 `mousedown`、鼠标移出窗口也关）。三条防误关规则：① `menuHoveredRef` 门控——**必须先真正进过菜单本体**才启用「移出即关」（右键瞬间鼠标还停在图标上、离菜单几十像素，一上来就判定会把菜单秒关）；② 进菜单后 150ms 内的「掠过」不算离开；③ 菜单矩形外扩 24px 宽容区——从图标移向菜单的路上要掠过菜单底角/边缘，贴着走不算离开。「+」按钮只负责「保持打开」，不置位 hovered（否则鼠标一离开按钮就秒关）
-- **文件夹悬停预览卡片**：悬停文件夹条目 300ms 弹出（`openFolderCard`），与「此电脑」盘符卡片同构、复用 `.drives-card` 浮层几何。三条关键设计：① **悬停即预取**——`mouseenter` 立刻 `listFolder()`，300ms 后真弹卡片时直接命中主进程缓存，看不到「先占位块再换图标」；② **延迟关闭 150ms 宽限**——鼠标从图标移到卡片上会先离开图标，宽限期内移入卡片即取消关闭（可继续在卡片里滚动看）；③ 同一目录且已加载完时只更新锚点，不清成「读取中」再重载（否则闪一下、缓存过期还要整目录重扫）。卡片宽度先按图标中心渲染，`useLayoutEffect` 测量后在 paint 前把水平位置钳制进窗口（贴边缘时内收，不会看到跳一下）。拖拽排序 / 文件拖入进行中不弹（会挡住落点指示线）
+- **文件夹悬停预览卡片**：悬停文件夹条目 `settings.folderCardDelay`（默认 300ms）后弹出（`openFolderCard`）；分组面板自动收起用 `settings.panelCloseDelay`（默认 180ms，下限 60）；两处 150ms 关闭宽限是硬编码，别一起改（C5），与「此电脑」盘符卡片同构、复用 `.drives-card` 浮层几何。三条关键设计：① **悬停即预取**——`mouseenter` 立刻 `listFolder()`，300ms 后真弹卡片时直接命中主进程缓存，看不到「先占位块再换图标」；② **延迟关闭 150ms 宽限**——鼠标从图标移到卡片上会先离开图标，宽限期内移入卡片即取消关闭（可继续在卡片里滚动看）；③ 同一目录且已加载完时只更新锚点，不清成「读取中」再重载（否则闪一下、缓存过期还要整目录重扫）。卡片宽度先按图标中心渲染，`useLayoutEffect` 测量后在 paint 前把水平位置钳制进窗口（贴边缘时内收，不会看到跳一下）。拖拽排序 / 文件拖入进行中不弹（会挡住落点指示线）
 - **桌面图标开关**：菜单打开时 `getDesktopIconsHidden()` 读取状态决定文案（隐藏/显示），点击 `toggleDesktopIcons()` 乐观更新（先切文案，IPC 返回后校正）
 - **开机自启动开关**：菜单打开时 `getAutoStart()` 读取注册表状态决定开关开/关（`.item-switch`），点击 `setAutoStart()` 乐观更新（先切开关，IPC 返回后校正，**不关闭菜单**）；写注册表 `HKCU\...\Run` 登录项
 - **快捷方式/文件夹多选**：`parse-lnk` / `select-folder` 对话框均开 `multiSelections`，一次多选逐个生成条目（`handleAdd` / `handleAddFolder` 批量 append，文件夹图标统一取 shell32 黄色文件夹图标）
-- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，由「+」菜单的**主题分段选择器**设置，见上条——不再是循环按钮），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好持久化到 localStorage（key `ql-theme`）。
+- **白天/黑夜/透明主题**：`theme` state（`'dark' | 'light' | 'transparent'`，在**设置中心 → 外观 → 材质**里选，写 `settings.json`；renderer 收到 `settings-changed` 广播后 `setTheme`），根元素加 `theme-light` / `theme-transparent` 类切换 CSS 变量（Dock 背景/标签/菜单/右键菜单全部跟随）；偏好写 `settings.json`（`ql-theme` 仅剩一次性迁移作用）。
   - ⚠️ **多层半透明要一起算总不透明度（v1.13.3 修「白天偏白」）**：`.dock-bg` 的观感由**三层**叠加决定 ——
     ① 渐变描边（`--dock-border-grad-*`，1px）② **上沿白色径向高光 `--dock-sheen`** ③ 玻璃填充（`--dock-bg-top/bottom`）。
     原来白天填充是 `.92/.74`（几乎不透）**且**高光是 `.14`，两层白叠起来就是一块白板、壁纸完全透不出来。
@@ -399,16 +534,16 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
      显式排进**微软雅黑 UI**（雅黑的 UI 变体，小字号 hinting 明显更好）
   2. 🚫 **`<button>` / `<input>` 不继承 `font`**（Chromium UA 样式表给它们设了自己的 font，不是 inherit）——
      所以 `.dropdown-item`（按钮）拿不到 body 的字体栈，实测 computed font-family 就是 `Arial`；
-     而同在菜单里的 `.theme-seg-btn` 因为显式写了 `font: inherit` 用的是应用字体栈 →
+     而任何自己写了 `font: inherit` 的按钮控件（早先菜单里的分段控件就是）用的是应用字体栈 →
      **同一个浮层里两种中文字形并排**（用户原话「两种字体感觉不匹配」）。
      已在基础层统一收口：`button, input, select, textarea { font: inherit }`，不要在各自的类里零散补
-  3. 菜单内字号/字重也要一致：`.dropdown-item` 与 `.theme-seg-btn` 现在同为 `.84rem/500`，
-     子行 `.78rem/500`（**只缩字号不缩字重** —— 字重不一致在并排时最像「两种字体」）
+  3. 菜单内字号/字重也要一致：`.dropdown-item` 为 `.84rem/500`；**设置窗的分段控件单独一套**
+     （`.st-seg-btn` 62×32 / `.78rem`），两边不共用变量，改一边不会牵连另一边
 - **左键点击**：启动程序/打开文件夹（拖拽启动后忽略点击）
 - **右键菜单**：custom（编辑/打开文件位置/以管理员身份运行/复制路径/新建分组/在此之前插入分隔线/删除），fixed 定位、**向上弹出**（`data-edge='top'` 时整套浮层改由 `overlayTop()` 锚在玻璃条**下沿外侧**8px，向下弹出、`maxHeight` 按窗口剩余高度算），底边固定在实测的 Dock 毛玻璃条外侧 8px（`overlayBottom()` / `overlayTop()` 读 `.dock-bg` 的 rect，不硬编码）；水平锚点让**光标落在菜单内侧 8px**（`left: x - 8`，靠近窗口右缘时翻转为贴右缘向左展开）——早期写成 `left: x + 4` 会让光标停在菜单左缘外，垂直上移进不去、稍一横移就触发「移出即关」而秒关。`maxHeight` = Dock 栏上方可用空间（约 208px），超出时内部滚动。分隔线条目的菜单只有「删除」；**Dock 空白处右键不再弹菜单**。**编辑模式**：菜单内切换为表单（名称/启动参数/工作目录 + 更换图标 + 保存/取消），`editingId` 控制；更换图标走 `pick-icon` IPC（exe/dll/ico 提取、png/jpg 直读）；「打开位置」仅文件系统路径显示（`explorer /select`），「管理员运行」仅程序条目（`isFolder`/`specialType`/URL 隐藏），「复制路径」始终显示。编辑表单输入框需 `user-select: text`（全局 `user-select: none`）
 - **拖拽排序**：mousedown 设置 dragRef → mousemove 超过 5px 阈值启动拖拽 → 计算 dropIdx 显示蓝色指示线 → mouseup 执行数组重排。`calcDropIndex` 与悬停放大共用同一份几何缓存，**两处都必须在内容坐标里比较**（见上方坐标系说明——v1.12.0 漏了 `scrollLeft`，Dock 滚动后插入位置会偏）。**防误启动**：真实拖拽结束时（mouseup 时 `dragStartedRef` 为 true）置 `suppressClickRef=true`，紧随其后的 click 在 `handleRun` 中被吞掉——click 在 mouseup 之后才派发，此时 `setDragId(null)` 已生效，仅凭 `dragId` 判断不可靠；每次新的 mousedown 先清除该标记，避免误吞正常点击
 - **放大效果**：`handleDockMouseMove` 在几何缓存上二分定位，只对左右各 140px 内的图标缩放 + 上浮（拖拽时暂停）。**不要改回「逐图标 getBoundingClientRect」**——那是 layout thrashing，详见上方「悬停放大走几何缓存」
-- **持久化（v1.12.0 起是 400ms 防抖 + 退出落盘）**：`apps` 变化时 `useEffect` 设置一个 400ms 防抖定时器再 `saveShortcuts()`，启动时 `useEffect` 自动恢复。**不要改回「每次变更立刻保存」**——拖拽排序每帧都会变更一次 `apps`，那等于每帧跨进程克隆整个数组（含全部 base64 图标）+ `JSON.stringify` + 写盘。退出时由主进程 `before-quit` 推 `flush-pending-save`（并留 200ms）让 renderer 立刻落盘；renderer 卸载时也会 flush 一次。**必须用 `before-quit` 而不是 `will-quit`**——后者触发时窗口已销毁、IPC 不通，兜底是无效的
+- **持久化（v1.12.0 起是 400ms 防抖 + 退出落盘）**：`apps` 变化时 `useEffect` 设置一个 400ms 防抖定时器再 `saveShortcuts()`，启动时 `useEffect` 自动恢复。**不要改回「每次变更立刻保存」**——拖拽排序每帧都会变更一次 `apps`，那等于每帧跨进程克隆整个数组（含全部 base64 图标）+ `JSON.stringify` + 写盘。退出时由主进程 `before-quit` 推 `flush-pending-save` 让 renderer 立刻落盘，**renderer 写完回 `flush-save-done`**，主进程收到即放行退出（800ms 超时兜底）——固定 sleep 200ms 在慢盘上会丢最后一次改动（B5）。renderer 卸载时也会 flush 一次。**必须用 `before-quit` 而不是 `will-quit`**——后者触发时窗口已销毁、IPC 不通，兜底是无效的
 - **文件夹图标：直接存真实 data URL（v1.12.2 撤掉哨兵，别再引入中间态）**：v1.12.0 曾把文件夹条目的图标换成一个短哨兵串、渲染/写盘时再换回模块常量 `sharedFolderIcon`，想省内存和磁盘。**那个设计有致命缺陷**：`sharedFolderIcon` 只有一个赋值点（加载时从磁盘上找「带非空图标的文件夹条目」），而唯一给文件夹条目写图标的路径（桌面扫描）又存的是哨兵、把主进程刚提取好的真图标丢了 → **全新安装首启就把空串写进磁盘，而且永远自愈不了**（详见 CHANGELOG v1.12.2）。现在每条自帶真图标；模块级 `sharedFolderIcon` 只作为**修复源**（启动时回填历史坏数据的空图标、兜住主进程没给图标的扫描结果）。
   - 实测这笔优化的全部收益（60 个文件夹）：结构化克隆 0.11ms、`JSON.stringify` 0.19ms、磁盘 152KB——而且 V8 会把内容相同的字符串内部化，**renderer 侧的堆增量 ≈ 一份图标**而不是 N 份。为一个「能自锁成空值」的中间态去省这点东西，完全不划算
   - 教训：**写入路径上的「换算」必须以「换算不出来会怎样」为前提设计**。这个哨兵的失败模式是「写坏数据」而不是「少写数据」，代价差了一个量级
@@ -498,13 +633,17 @@ App 是**唯一的 React 组件**（[`src/renderer/src/App.tsx`](src/renderer/sr
 - 额外资源：`resources/icon.ico` → `icon.ico`，`resources/tray-icon.ico` → `tray-icon.ico`
 - Windows：`executableName: QuickLaunch`，图标 `resources/icon.ico`
 - **排除源码和配置文件，仅打包编译输出**。**额外排除 `node_modules/**`**（v1.12.3）：三个产物都不在运行时 require 第三方包——main 只依赖 `electron` + Node 内置模块，preload 只依赖 `electron`，renderer 由 Vite 把 react/react-dom 全量打进 bundle。实测 asar 里的 `node_modules`（react/react-dom/scheduler）7.2 MB 纯属白占（asar 145.7 → 138.41 MB）。⚠️ 一旦将来真要引入外部/原生模块（例如 sqlite），**必须去掉这一行**，否则那个包不会被打进产物
-- `electronDist: ./electron-v*.zip`：用项目根目录**手动下载**的 Electron 分发包打包，跳过网络下载（日志出现 `using custom electronDist zip file` 即为生效）。zip 已被 `.gitignore` 的 `electron-v*.zip` 规则忽略；需与 `package.json` 的 Electron 版本一致，换机器打包前删掉该行或用 `ELECTRON_MIRROR` 环境变量
+- `electronDist: ./node_modules/electron/dist`：直接用 `npm install` 装好的**已解包** Electron 打包，跳过网络下载（日志出现 `using custom unpacked Electron distribution` 即为生效）。**仓库里已不再保存分发包 zip**（v1.16 删掉了那份 137 MB 的 `electron-v43.1.0-win32-x64.zip`）。换机器/换 Electron 版本只需重新 `npm install`，不必手工补 zip
 
 ### 持久化格式
 
-快捷方式保存至 `{userData}/shortcuts.json`，格式为 `AppEntry[]` 数组。字段：`id`、`iconDataUrl`、`targetPath`、`arguments`、`workingDirectory`、`description`，可选 `isFolder`（文件夹）、`specialType`（`'this-pc'` / `'recycle-bin'`）、`isGroup`（分组）、`groupId`（所属分组 id）、`isSeparator`（分隔线）。`parse-lnk` 解析出的 `windowStyle`/`hotkey`/`iconLocation` 在持久化时被丢弃（`AppEntry` 不含这些字段）。**加载归一化在主进程 `load-shortcuts`**：非数组（文件被外部改坏）返回 `[]`——否则 renderer 的 `baseline.filter` 会抛错并中断整轮加载与桌面扫描（未 await 的 Promise rejection）；早期开发版写过的 `separator` 字段会被就地转成 `isSeparator: true`。
+快捷方式保存至 `{userData}/shortcuts.json`，格式为 `AppEntry[]` 数组，类型见 [`src/shared/types.ts`](src/shared/types.ts)。字段：`id`、`targetPath`、`arguments`、`workingDirectory`、`description`，可选 `iconFile`（图标外置后的文件名，**优先**）、`iconDataUrl`（内联 base64，外置失败时的回落，**已变可选**）、`isFolder`、`specialType`（`'this-pc'` / `'recycle-bin'`）、`isGroup`、`groupId`、`isSeparator`、`page`、`hotkey`、`runCount`、`lastRunAt`。`parse-lnk` 解析出的 `windowStyle` / `iconLocation` 仍在持久化时被丢弃（`hotkey` 现在会保留在条目上）。
 
-主题偏好（白天/黑夜）存在渲染端 localStorage（key `ql-theme`），不走 IPC 文件持久化——纯 UI 偏好，无需主进程参与。
+- **加载归一化搬到 `src/main/shortcutsStore.ts`**：非数组返回 `[]`（文件被外部改坏时 renderer 的 `baseline.filter` 会抛错并中断整轮加载与桌面扫描）；JSON 解析失败先 `preserveCorruptShortcuts()` 再从 `.bak` 恢复（`recovered: true`）；字段类型不对的条目按白名单裁剪，`dropped > 0` 时先备份原文件
+- **写入失败不静默丢**：主进程把整份数据写到 `shortcuts.json.recovery` 并返回 `false`，renderer 弹「保存失败」提示（A5）
+- **A1 让这个文件从几百 KB～1 MB 降到纯文本量级**：老版本的内联 `iconDataUrl` 会在首次加载时由 `migrateLoadedIcons()` 搬进 `icons/` 并回写**加载归一化在主进程 `load-shortcuts`**：非数组（文件被外部改坏）返回 `[]`——否则 renderer 的 `baseline.filter` 会抛错并中断整轮加载与桌面扫描（未 await 的 Promise rejection）；早期开发版写过的 `separator` 字段会被就地转成 `isSeparator: true`。
+
+设置（主题 / 玻璃强度 / 图标尺寸 / 悬停延迟 / 点击后行为 / 跟随系统）存在 `{userData}/settings.json`，见上文「设置系统」。localStorage 的 `ql-theme` 只剩一次性迁移作用。
 
 Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字段**：`{"edge":"middle"|"bottom"|"top"}`。文件名沿用 v1.8.x 的「窗口位置记忆」文件（旧版写的 `{x,y,displayId}` 直接忽略，按默认位置启动）。读写都过一遍 `IMPLEMENTED_EDGES` 白名单，白名单外的档位（左/右竖排）一律归一化成 `DEFAULT_EDGE`（`middle`）——手改配置文件也改不出尺寸不对的窗口。
 
@@ -528,13 +667,16 @@ Dock 停靠位置存在 `{userData}/window-position.json`——**只有一个字
 
 ## 注意事项
 
-- **无测试框架**、**无 ESLint/Prettier**
-- `AppEntry` 类型在 [`src/preload/index.ts`](src/preload/index.ts)、[`src/renderer/src/App.tsx`](src/renderer/src/App.tsx)、[`src/renderer/src/env.d.ts`](src/renderer/src/env.d.ts) 三处各自定义，修改时需保持同步
-- `env.d.ts` 再次复刻 API 类型到 `Window` 接口——contextBridge 隔离导致 Renderer 端类型必须在此声明
+- **无第三方运行时依赖**（`electron-builder.yml` 连 `node_modules` 都排除）——加依赖前先确认它能不能打进产物；需要库时优先自己写几十行（`updater.ts`、`lint.mjs` 都是这么来的）
+- **类型只写一遍**：全部在 [`src/shared/types.ts`](src/shared/types.ts)，preload re-export、`env.d.ts` 用 `import('../../shared/types')` 取别名（见「TypeScript 项目引用」）。**不要再在任何一处本地重定义**
+- **有单测与自建 lint**：`npm run test`（`devtools/tests/*.test.mjs`，node 24 直跑 `.ts`）、`npm run lint`（`devtools/lint.mjs` 六条项目约定）、`npm run verify`（发布前一键全跑）——见「工程纪律」
+- `env.d.ts` 仍需把 API 类型复刻到 `Window` 接口——contextBridge 隔离导致 Renderer 端类型必须在此声明
 - `App.tsx` 使用模块级变量 `nextId`（非 React state）；启动时从已保存最大 ID + 1 重建
 - **窗口不可拖拽**（v1.10.0 起）：`.dock` 不再是 `drag` 区域，全项目**没有任何 `-webkit-app-region` 声明**（CSS 里只剩两处解释性注释）。位置只能由 `presetPosition` 预设决定——新增交互时不要往 Dock 空白区加 drag
 - 弹出层（「+」下拉菜单、右键菜单、「此电脑」卡片、文件夹卡片、分组面板）**必须渲染在滚动容器外**（fixed 定位 + 实测锚点）：`.dock-inner` 是横向滚动容器（`overflow-x: auto`），CSS 规范强制其垂直方向也裁剪，放容器内会被裁掉
-- 滚动容器会裁剪垂直溢出的放大图标：`.dock-inner` 在贴边侧留 **82px** 透明 padding 作为放大+悬浮标签显示区（`data-edge='top'` 时这 82px 在下方，其余在顶部）；`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区
+- 滚动容器会裁剪垂直溢出的放大图标：`.dock-inner` 在贴边侧留 `var(--dock-pad)` 的透明 padding 作为放大+悬浮标签显示区，`.dock-bg` 背景层只覆盖图标区，放大图标从该区顶出显示在透明区。
+
+  **E1 起整套 Dock 几何都是 CSS 变量的函数**（`src/renderer/src/App.tsx` 根元素注入）：`--dock-icon = settings.iconSize`（48/60/72）、`--dock-pad = iconSize + DOCK_PAD_EXTRA(22)`、`.dock-bar` 高度 = `pad + iconSize + 16`。默认 60 时正好是 82 / 158（与变量化前逐像素相同），48 → 70/134，72 → 94/182。**改这几条公式要同步改 `devtools/probe/hitregion-e2e.cjs` 的几何断言**（它按 60 档写死过若干数字）。`data-edge='top'` 时把 `padding-top` 换成 `padding-bottom`，`.dock-bg` / `.dock-edge` 的 `top` 换成 `bottom`
 - 开发模式下窗口加载 `ELECTRON_RENDERER_URL` 环境变量 URL；生产模式下加载 `../renderer/index.html` 文件
 - `setWindowOpenHandler` 拦截所有 `target=_blank`/新窗口请求：一律 `shell.openExternal()` 用默认浏览器打开并 `deny`，应用内不产生新窗口
 - `webPreferences.sandbox: false`：preload 依赖 `process.contextIsolated` 分支和 `@electron-toolkit/preload`，改成 `true` 会破坏 contextBridge

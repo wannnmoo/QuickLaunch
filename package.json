@@ -1,6 +1,6 @@
 {
   "name": "quicklaunch",
-  "version": "1.15.1",
+  "version": "1.17.0",
   "description": "QuickLaunch - Windows shortcut & folder launcher panel",
   "main": "./out/main/index.js",
   "scripts": {
@@ -10,7 +10,12 @@
     "package": "electron-vite build && electron-builder --config electron-builder.yml",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web"
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test": "node --test \"devtools/tests/*.test.mjs\"",
+    "lint": "node devtools/lint.mjs",
+    "probe": "node devtools/probe/hitregion-e2e.cjs",
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run build && node devtools/probe/hitregion-e2e.cjs",
+    "probe:settings": "node devtools/probe/settings-dock.cjs"
   },
   "dependencies": {
     "react": "^19.2.7",

@@ -1,0 +1,556 @@
+/**
+ * 设置中心样式。
+ *
+ * ⚠️ 这个文件与 App.css 打进**同一份产物**（设置窗不是独立页面，而是 index.html 的
+ * `?view=settings` 视图，理由见 src/renderer/src/main.tsx 顶部），所以：
+ *   **所有 html/body/#root 级规则都必须挂在 `html[data-win='settings']` 下面**，
+ *   否则 Dock 那扇透明窗口会被刷成不透明深色块（dock 窗口没有这个属性）。
+ *
+ * ── 与 Dock 的统一是「抄数值」，不是「共用类」 ──────────────────────────
+ * 两边的材质必须肉眼一致，所以这里的取值直接对齐 App.css 的 `.app` 主题块：
+ *   黑夜  --dock-bg-top rgba(38,44,64,.7) / --dock-bg-bottom rgba(23,28,42,.62)
+ *   白天  rgba(252,252,254,.68) / rgba(238,241,248,.46)
+ *   blur 36px + saturate 1.7（Dock 的 --dock-sat），圆角 24px（Dock 玻璃条同值）
+ *   正文 #fff、次要 rgba(255,255,255,.62)（Dock 的 --label-color）、强调 #3b7bd5（Dock 图标主色）
+ * **改 App.css 的主题变量时，这里要同步改一遍**（没有跨文件共享变量：Dock 用的是
+ * `.app.theme-*` 作用域下的 `--dock-*`，设置窗根节点是 `.st`，取不到）。不要为此把
+ * 两套 CSS 硬串起来 —— 那种「一个变量被两处覆盖」的结构比重复四个数值更难维护。
+ *
+ * 关键尺寸（改这里先读）：
+ *   - 整窗 480×340（用户要求「比 720×508 再小三分之一」），标题栏 34px；
+ *   - 左栏 **96px**、导航项 28px —— 五个两字菜单，96 刚好，别再宽；
+ *   - 表单行 `grid-template-columns: 92px 1fr`：480 − 96(左栏) − 24(padding) ≈ 360，
+ *     控件区还剩约 250px，三段胶囊（60/62/52px 一档）刚好排得下；
+ *   - 胶囊 `min-width: 52px` + `padding: 0 9px` + `white-space: nowrap` 是
+ *     「两个字的标签不被压扁」的直接原因（旧「+」菜单 28px 高、按百分比分宽才贴边）；
+ *   - 页脚 32px、按钮 24px 高 —— 用户嫌原来 42px 那栏太占高度。
+ */
+
+:root {
+  /* 毛玻璃黑夜（默认，与 Dock 的 theme=dark 同色） */
+  /* 比 Dock 玻璃条更实一点：Dock 只有 76px 高、背景是满屏桌面；
+     设置窗是 480×340 的大面积，62% 会让壁纸颜色透上来把整块玻璃搅成脏灰。
+     实测 0.9 还能看出壁纸在动，0.7 就开始发浑（真实壁纸截图对比过）。 */
+  --st-glass: linear-gradient(180deg, rgba(32, 37, 51, 0.9) 0%, rgba(20, 24, 34, 0.93) 100%);
+  --st-blur: 30px;
+  --st-sat: 1.15;
+  --st-glass-line: rgba(255, 255, 255, 0.12);
+  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.3);
+  --st-panel: rgba(255, 255, 255, 0.04);
+  --st-elev: rgba(255, 255, 255, 0.08);
+  --st-line: rgba(255, 255, 255, 0.085);
+  --st-line-strong: rgba(255, 255, 255, 0.16);
+  --st-text: #fff;
+  --st-dim: rgba(255, 255, 255, 0.62);
+  --st-faint: rgba(255, 255, 255, 0.46);
+  --st-accent: #3b7bd5;
+  --st-accent-ink: #fff;
+  --st-track: rgba(255, 255, 255, 0.1);
+  --st-hover: rgba(255, 255, 255, 0.09);
+  --st-danger: #e2685f;
+}
+
+html[data-win='settings'],
+html[data-win='settings'] body,
+html[data-win='settings'] #root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+html[data-win='settings'] body {
+  /* ⚠️ 必须透明：窗口是 `transparent: true`，这里再刷不透明底就把毛玻璃整个废掉了。
+     首帧防白闪交给 BrowserWindow 的 `backgroundColor: '#00000000'`。 */
+  background: transparent;
+  color: var(--st-text);
+  font-family: 'Segoe UI', 'Microsoft YaHei UI', system-ui, sans-serif;
+  font-size: 12.5px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.st button,
+.st input {
+  font: inherit;
+}
+
+/**
+ * 整窗就是一张玻璃卡片（与 Dock 玻璃条同材质、同圆角）。
+ * ⚠️ `backdrop-filter` 只有窗口自身透明时才啃得动桌面；`border-radius` 必须配
+ *    `overflow: hidden`，否则四角会露出方形玻璃（透明窗没有 DWM 圆角）。
+ */
+.st {
+  position: relative; /* 状态浮层 .st-toast 的定位基准（底部通栏已删） */
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: 24px;
+  overflow: hidden;
+  background: var(--st-glass);
+  backdrop-filter: blur(var(--st-blur)) saturate(var(--st-sat));
+  box-shadow: inset 0 0 0 1px var(--st-glass-line), var(--st-rim-light), var(--st-rim-dark);
+  color: var(--st-text);
+}
+
+/* 毛玻璃白天（与 Dock 的 theme-light 同色，只是更淡） */
+.st[data-theme='light'] {
+  --st-glass: linear-gradient(180deg, rgba(252, 253, 255, 0.92) 0%, rgba(237, 240, 247, 0.95) 100%);
+  --st-blur: 30px;
+  --st-sat: 1.1;
+  --st-glass-line: rgba(0, 0, 0, 0.1);
+  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.08);
+  --st-panel: rgba(255, 255, 255, 0.3);
+  --st-elev: rgba(255, 255, 255, 0.6);
+  --st-line: rgba(16, 22, 36, 0.1);
+  --st-line-strong: rgba(16, 22, 36, 0.18);
+  --st-text: #111;
+  --st-dim: rgba(0, 0, 0, 0.6);
+  --st-faint: rgba(0, 0, 0, 0.46);
+  --st-accent: #2f6ec4;
+  --st-track: rgba(16, 22, 36, 0.08);
+  --st-hover: rgba(16, 22, 36, 0.06);
+}
+
+/* 透明档（Dock 的 theme=transparent 本身没有玻璃、只有图标；设置窗不能没有底，
+   否则文字会漂在壁纸上）→ 取 Dock 那档的「深色药丸底」当整窗底：近黑、几乎不调色 */
+.st[data-theme='transparent'] {
+  --st-glass: linear-gradient(180deg, rgba(20, 23, 30, 0.86) 0%, rgba(11, 13, 18, 0.92) 100%);
+  --st-blur: 10px;
+  --st-sat: 1.05;
+  --st-glass-line: rgba(255, 255, 255, 0.14);
+  --st-panel: rgba(255, 255, 255, 0.04);
+  --st-track: rgba(255, 255, 255, 0.12);
+}
+
+/* ── 自绘标题栏 ─────────────────────────────────────────────────────── */
+
+.st-titlebar {
+  flex: 0 0 auto;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 5px 0 12px;
+  border-bottom: 1px solid var(--st-line);
+  /* 标题栏/左栏/表单都不再各自铺一层底色 —— 只有一层玻璃，靠 1px 线分区。
+     以前每块各给一个 rgba，叠在透明窗上就成了三种不同的灰（用户："整体颜色不一致"）。 */
+  background: none;
+  /* 整条标题栏可拖动窗口；下面两个按钮必须显式 no-drag */
+  -webkit-app-region: drag;
+}
+
+.st-title {
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--st-text);
+}
+
+.st-titlebar-btns {
+  display: flex;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.st-tb-btn {
+  width: 30px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--st-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.st-tb-btn:hover {
+  background: var(--st-hover);
+  color: var(--st-text);
+}
+
+.st-tb-close:hover {
+  background: rgba(226, 104, 95, 0.2);
+  color: var(--st-danger);
+}
+
+/* ── 主体：左栏 + 表单 ─────────────────────────────────────────────── */
+
+.st-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.st-nav {
+  /* 宽度跟着内容走：分界线贴在「通用 / 外观 …」文字右侧，不再留一大截死白。
+     实测 5 个两字分类 + 13px 图标 = 66px（原来写死 96px，右边空了 30px）。 */
+  flex: 0 0 auto;
+  width: max-content;
+  padding: 6px 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-right: 1px solid var(--st-line);
+  background: none;
+  overflow-y: auto;
+}
+
+.st-nav-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--st-dim);
+  font-size: 0.76rem;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.st-nav-ico {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  opacity: 0.75;
+}
+
+.st-nav-item:hover {
+  background: var(--st-hover);
+  color: var(--st-text);
+}
+
+.st-nav-item:hover .st-nav-ico {
+  opacity: 1;
+}
+
+.st-nav-item.active {
+  background: var(--st-accent);
+  color: var(--st-accent-ink);
+  font-weight: 600;
+}
+
+.st-nav-item.active .st-nav-ico {
+  opacity: 1;
+}
+
+.st-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 12px 12px;
+  overflow-y: auto;
+}
+
+.st-pane::-webkit-scrollbar {
+  width: 6px;
+}
+
+.st-pane::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.st-pane::-webkit-scrollbar-thumb {
+  background: var(--st-line-strong);
+  border-radius: 3px;
+}
+
+.st-pane::-webkit-scrollbar-thumb:hover {
+  background: var(--st-dim);
+}
+
+.st-nav::-webkit-scrollbar {
+  width: 0;
+}
+
+.st-h2 {
+  margin: 0 0 1px;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.st-desc {
+  margin: 0 0 2px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--st-dim);
+}
+
+/* ── 表单行 ─────────────────────────────────────────────────────────── */
+
+.st-row {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--st-line);
+}
+
+.st-row:last-of-type {
+  border-bottom: 0;
+}
+
+.st-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 0.78rem;
+  line-height: 1.28;
+  color: var(--st-text);
+}
+
+.st-row-hint {
+  font-size: 0.68rem;
+  line-height: 1.28;
+  color: var(--st-faint);
+}
+
+.st-row-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.st-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+/* ── 分段控件（「标准」贴边问题的正解）────────────────────────────── */
+
+.st-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: var(--st-track);
+  max-width: 100%;
+}
+
+.st-seg-btn {
+  min-width: 52px;
+  height: 26px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--st-dim);
+  font-size: 0.76rem;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.st-seg-btn:hover {
+  background: var(--st-hover);
+  color: var(--st-text);
+}
+
+.st-seg-btn.active {
+  background: var(--st-accent);
+  color: var(--st-accent-ink);
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+
+/* ── 开关 / 滑块 / 按钮 ────────────────────────────────────────────── */
+
+.st-switch {
+  position: relative;
+  width: 38px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--st-track);
+  cursor: pointer;
+  transition: background 0.18s;
+}
+
+.st-switch.on {
+  background: var(--st-accent);
+}
+
+.st-switch-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 0.18s;
+}
+
+.st-switch.on .st-switch-knob {
+  transform: translateX(18px);
+}
+
+.st-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.st-slider input[type='range'] {
+  flex: 1 1 auto;
+  min-width: 70px;
+  height: 16px;
+  accent-color: var(--st-accent);
+  cursor: pointer;
+}
+
+.st-slider-val {
+  flex: 0 0 auto;
+  min-width: 40px;
+  font-size: 0.72rem;
+  color: var(--st-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.st-btn-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.st-btn {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--st-line-strong);
+  border-radius: 7px;
+  background: var(--st-elev);
+  color: var(--st-text);
+  font-size: 0.76rem;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.st-btn:hover {
+  background: var(--st-hover);
+  border-color: var(--st-accent);
+}
+
+.st-btn:active {
+  transform: translateY(1px);
+}
+
+.st-stat {
+  font-size: 0.78rem;
+  color: var(--st-dim);
+}
+
+/* 只读的快捷键展示（不是控件，别给它加 hover 反馈） */
+.st-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.st-kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--st-line-strong);
+  border-radius: 5px;
+  background: var(--st-elev);
+  color: var(--st-text);
+  font-family: inherit;
+  font-size: 0.7rem;
+  line-height: 1;
+}
+
+.st-key-plus,
+.st-key-tip {
+  font-size: 0.7rem;
+  color: var(--st-faint);
+}
+
+.st-key-tip {
+  margin: 0 2px 0 1px;
+}
+
+/* ── 底部通栏已删（v1.17.2）────────────────────────────────────────────
+   用户要求去掉「重置本节」那一栏。它原本的作用：把**当前分类**的字段回退成
+   `DEFAULT_SETTINGS`（外观 7 项 / 行为 3 项；通用是系统状态、数据是磁盘操作、
+   关于页没有可重置项，点了只会提示「没有可重置的项」）。
+   现在改成标题栏右侧一个小图标按钮，只在有可重置字段的分类里出现——
+   功能保留，但不再占一条 32px 的通栏。 */
+
+/* 用双类提高权重：单类 + 后置规则「本该」赢过 .st-tb-btn 的 display:grid，
+   但行内样式/热更新顺序一乱就会退回 grid，图标与文字竖着叠、文字溢出标题栏
+   （用户截图就是这个现象）。双类不依赖顺序。 */
+.st-tb-btn.st-tb-text {
+  display: inline-flex;
+  align-items: center;
+  width: auto;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 0.72rem;
+  line-height: 1;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+/* 状态提示从通栏挪成浮层：写盘成功/失败、重置完成都走这里 */
+.st-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  padding: 5px 11px;
+  border-radius: 9px;
+  background: rgba(10, 12, 18, 0.84);
+  color: #fff;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  animation: st-toast-in 0.14s ease-out;
+}
+
+.st[data-theme='light'] .st-toast {
+  background: rgba(28, 32, 42, 0.9);
+}
+
+@keyframes st-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 4px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* 键盘可达性：所有可交互元素统一焦点环（与 Dock 侧 :focus-visible 同色系） */
+.st button:focus-visible,
+.st input:focus-visible {
+  outline: 2px solid var(--st-accent);
+  outline-offset: 2px;
+}
