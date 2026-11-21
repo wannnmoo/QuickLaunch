@@ -203,6 +203,11 @@ function App(): React.ReactElement {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editFields, setEditFields] = useState({ description: '', arguments: '', workingDirectory: '' })
   const [editIconUrl, setEditIconUrl] = useState('')
+  // 启动反馈（V6）：正在起跳 / 刚启动失败。主进程会把隐藏推迟 300ms，
+  // 这段时间就是这两个 class 唯一能被看到的窗口。
+  const [launchingId, setLaunchingId] = useState<number | null>(null)
+  const [launchFailedId, setLaunchFailedId] = useState<number | null>(null)
+  const launchClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 横向滚动边界状态：true 表示该侧还有图标未显示，用于显示渐隐提示
   const [scrollState, setScrollState] = useState({ left: false, right: false })
   // 删除撤销（C3）：快照 + 5s 自动清理。ref 与 state 并存 —— 定时器回调与
@@ -1604,6 +1609,27 @@ function App(): React.ReactElement {
     const lastSame = lastRunAtRef.current.get(app.targetPath) ?? 0
     if (now - lastSame < 600) return
     lastRunAtRef.current.set(app.targetPath, now)
+
+    // V6：起跳反馈。主进程的 hide() 被推迟 300ms（LAUNCH_HIDE_DELAY_MS），
+    // 所以这段动画真的看得见。清理用 480ms（动画 380ms + 余量），**不依赖 run-app
+    // 的返回时机** —— 它 4~10ms 就回来了，那时动画才刚起第一帧。
+    setLaunchFailedId(null)
+    setLaunchingId(app.id)
+    if (launchClearTimer.current) clearTimeout(launchClearTimer.current)
+    launchClearTimer.current = setTimeout(() => {
+      launchClearTimer.current = null
+      setLaunchingId((cur) => (cur === app.id ? null : cur))
+    }, 480)
+
+    /** 失败反馈：先收掉起跳（两条动画叠在同一元素上会有一次闪），再抖 620ms。
+     *  失败是**异步**到的（spawn 的 error 约 400ms），所以这两个 class 的先后顺序
+     *  不能靠 Promise 的执行顺序去碰，只能显式清一次。 */
+    const flagLaunchFailed = (): void => {
+      setLaunchingId((cur) => (cur === app.id ? null : cur))
+      setLaunchFailedId(app.id)
+      setTimeout(() => setLaunchFailedId((cur) => (cur === app.id ? null : cur)), 620)
+    }
+
     // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
     // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」。
     // 'in-tray'：目标已在运行但窗口收在托盘里（微信/QQ 关到托盘就是这种），而且主进程
@@ -1613,10 +1639,15 @@ function App(): React.ReactElement {
     //   （fail-open）—— 原来那条分支会把「进程在但连窗口都没有」的目标永久挡在门外。
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
       .then((ok) => {
-        if (ok === false) showDropHint('启动失败：目标不存在或无法运行')
-        else if (ok === 'in-tray') showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
+        if (ok === false) {
+          flagLaunchFailed()
+          showDropHint('启动失败：目标不存在或无法运行')
+        } else if (ok === 'in-tray') showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
       })
-      .catch(() => showDropHint('启动失败：目标不存在或无法运行'))
+      .catch(() => {
+        flagLaunchFailed()
+        showDropHint('启动失败：目标不存在或无法运行')
+      })
   }, [dragId, openGroupId, closeGroupPanel, showDropHint])
 
   // 右键条目：stopPropagation 防止冒泡到 .dock 的空白区菜单（否则两个菜单状态互相覆盖）
@@ -2380,6 +2411,9 @@ function App(): React.ReactElement {
     if (dragId === id) cls += ' dragging'
     // C2：文件正悬停在这个图标上 → 蓝光高亮 + 顶部小三角，示意「松手就用它打开」
     if (dragOpenAppId === id) cls += ' drop-open'
+    // V6：启动反馈（起跳 / 失败抖动），动画挂在 .dock-icon 上（见 CSS 注释）
+    if (launchingId === id) cls += ' launching'
+    if (launchFailedId === id) cls += ' launch-failed'
     return cls
   }
 
@@ -2770,7 +2804,8 @@ function App(): React.ReactElement {
                 <div key={m.id} style={{ display: 'contents' }}>
                   {panelDropIdx === slot && <div className="drop-indicator" />}
                   <div
-                    className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')}
+                    className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')
+                      + (launchingId === m.id ? ' launching' : '') + (launchFailedId === m.id ? ' launch-failed' : '')}
                     // C2：面板成员同样可以「拖文件上去用它打开」
                     data-app-id={m.id}
                     ref={(el) => {

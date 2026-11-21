@@ -63,6 +63,7 @@ if (!gotSingleInstanceLock) {
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show()
+      clearLaunchHide() // 用户又在启动栏上点了第二次：取消可能还在等的那次隐藏
       dockTrayHidden = false
       sinkSeq++
       markDockShown() // 与其它显示路径一致：刚唤回时的 blur 是焦点抖动
@@ -127,6 +128,23 @@ let sinkSeq = 0
 /** 目标窗口当前是否有沉底任务在跑（用于串行化，避免一次 blur 起一个 powershell.exe） */
 let sinkState: { win: BrowserWindow; seq: number } | null = null
 
+// ─── 启动反馈（V6，v1.18）────────────────────────────────────────────────
+// 点图标后先把「起跳」动画播完再把 Dock 收进托盘，否则窗口在 4~10ms 后就消失，
+// 动画一帧都看不到（用户只看到 Dock 一闪没了，分不清"点到了"还是"点空了"）。
+// 渲染端 `.dock-item.launching .dock-icon` 的动画是 380ms，这里留 300ms：
+// 用户看到最夸张的那一段（35% 处起跳最高点已是 133ms），窗口在落回途中收起。
+const LAUNCH_HIDE_DELAY_MS = 300
+let launchHideTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 取消「延迟隐藏」。任何**用户主动显示**的路径都必须先调它 ——
+ *  否则迟到的 hide 会把刚唤回的 Dock 又藏起来（与 sinkSeq 那套是同一种竞态）。 */
+function clearLaunchHide(): void {
+  if (launchHideTimer) {
+    clearTimeout(launchHideTimer)
+    launchHideTimer = null
+  }
+}
+
 /** 把 Dock 拉回前台。统一入口：置顶 + moveTop，并在 120ms 后再补一次——
  *  Windows 的前台激活锁可能拒绝首次激活（尤其刚从 explorer.exe 交接时），
  *  一次性 moveTop 会被 Explorer 的窗口重排盖掉。 */
@@ -179,6 +197,7 @@ function toggleWindow(fromKeyboard = false): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (dockTrayHidden || !mainWindow.isVisible()) {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
+    clearLaunchHide() // 刚刚点了别的图标还没收起：用户要把它叫回来，取消那次延迟隐藏
     dockTrayHidden = false
     sinkSeq++ // 声明意图：立刻作废在途的沉底（否则它迟到执行会把这扇刚显示的窗钉到底部）
     markDockShown() // 刚开始显示：接下来 2.5s 内的 blur 都是焦点抖动，不沉底
@@ -190,6 +209,7 @@ function toggleWindow(fromKeyboard = false): void {
     }
   } else {
     // 可见（置顶或被沉底）→ 隐藏到托盘
+    clearLaunchHide() // 用户自己按下隐藏：不需要那条延迟隐藏再来收一次
     dockTrayHidden = true
     sinkSeq++ // 隐藏同样作废在途沉底：不能让它去操作一扇已隐藏的窗口
     mainWindow.hide()
@@ -1367,6 +1387,8 @@ type LaunchHideState = { mode: 'hide' | 'keep' | 'sink'; seq: number }
 function hideDockAfterLaunch(): LaunchHideState {
   const win = mainWindow
   const mode = getSettingsCache().afterLaunch
+  // 连点两个图标时只保留最后一条延迟隐藏（旧的那条若还在跑，会把第二次启动的窗口提前藏掉）
+  clearLaunchHide()
   if (!win || win.isDestroyed() || mode === 'keep') {
     return { mode: 'keep', seq: sinkSeq }
   }
@@ -1377,8 +1399,22 @@ function hideDockAfterLaunch(): LaunchHideState {
   }
   dockTrayHidden = true
   sinkSeq++
-  win.hide()
-  return { mode: 'hide', seq: sinkSeq }
+  const seq = sinkSeq
+  // V6：延迟 LAUNCH_HIDE_DELAY_MS 再真的 hide()，把渲染端的起跳动画放完。
+  // ⚠️ 这个定时器有两条必须守住的约束：
+  //   ① 代际守卫（sinkSeq !== seq）——期间用户按 Alt+Space / 托盘唤回、或又点了
+  //      另一个图标，本次隐藏意图就该作废，不能把刚显示的窗口再藏起来；
+  //   ② `dockTrayHidden` 在这里**立刻**置真（而不是等定时器里再置）：这 300ms 内
+  //      窗口仍然可见，若 blur 先到，`dockTrayHidden` 已能让让位逻辑跳过，
+  //      也不会让 verifyDockOnTop 把窗口重新置顶（那一支同样看这个标志）。
+  launchHideTimer = setTimeout(() => {
+    launchHideTimer = null
+    if (sinkSeq !== seq) return
+    const w = mainWindow
+    if (!w || w.isDestroyed() || !dockTrayHidden) return
+    w.hide()
+  }, LAUNCH_HIDE_DELAY_MS)
+  return { mode: 'hide', seq }
 }
 
 /** 启动失败后把 Dock 还给用户：点图标时已经先让位，若不还回来，
@@ -1395,6 +1431,8 @@ function restoreDockAfterFailedLaunch(state: LaunchHideState): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (sinkSeq !== state.seq) return // 期间有更新的意图（唤回 / 又启动了一个）—— 不抢用户的操作
   if (state.mode === 'keep') return // Dock 本来就没动过
+  // 失败通知可能早于那条 300ms 的延迟隐藏（V6）：先撤掉它，否则它会在恢复之后再藏一次
+  clearLaunchHide()
   if (state.mode === 'sink') {
     sinkSeq++ // 作废在途沉底
     recoverDock(mainWindow)
@@ -2388,6 +2426,9 @@ public static class WinZ {
 function createWindow(edge: DockEdge, startHidden: boolean): void {
   const iconPath = resolveResource('icon.ico')
   dockEdge = edge
+  // 旧窗口留下的「延迟隐藏」必须作废：它闭包里只比对 sinkSeq 与 dockTrayHidden，
+  // 而新窗口这两者可能凑巧都成立 —— 迟到的 hide() 会把刚建好的 Dock 直接藏掉。
+  clearLaunchHide()
   // 🚫 换新 HWND 时必须清掉 region 去重 key，否则「重建窗口」这条路上 region 永久丢失：
   // ready-to-show 与 renderer 首帧上报算出来的 key 与上一扇窗口完全相同（尺寸不变、浮层
   // 关着），`apply()` 里 `key === dockShapeApplied` 直接 return → 新窗口从来没调过
@@ -2572,6 +2613,7 @@ app.whenReady().then(async () => {
     if (win && !win.isDestroyed()) {
       const reveal = (): void => {
         if (win.isDestroyed()) return
+        clearLaunchHide()
         dockTrayHidden = false
         sinkSeq++
         markDockShown()
@@ -2610,6 +2652,7 @@ app.whenReady().then(async () => {
         //    窗口钉到底部；② recoverDock 统一置顶入口；③ focus 由 recoverDock 的巡检兜住。
         // 原来只做 show()+focus()：一旦 Windows 前台锁拒绝这次激活（CLAUDE.md 里记过这个
         // 场景），窗口就停在「可见但不置顶」，而且没有任何宽限期保护
+        clearLaunchHide()
         dockTrayHidden = false
         sinkSeq++
         mainWindow.show()

@@ -63,8 +63,10 @@ export function useMagnify({ settingsRef, isTop }: Options): {
         const dist = Math.abs(mx - cx)
         if (dist >= MAGNIFY_RANGE) break
         const s = 1 + (1 - dist / MAGNIFY_RANGE) * extra
-        // 上浮方向朝 Dock 外侧：底部 Dock 向上顶出玻璃条，顶部 Dock 向下顶出
-        const lift = dist < liftRange ? (1 - dist / liftRange) * 8 : 0
+        // 上浮方向朝 Dock 外侧：底部 Dock 向上顶出玻璃条，顶部 Dock 向下顶出。
+        // V2：幅度随图标尺寸（60 档 = 8px，与改造前一致；72 档不再"图大了却只浮 8px"）
+        const liftMax = settingsRef.current.iconSize * 0.1333
+        const lift = dist < liftRange ? (1 - dist / liftRange) * liftMax : 0
         applyZoom(el, s, isTop ? lift : -lift)
         next.add(el)
       }

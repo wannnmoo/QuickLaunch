@@ -50,19 +50,26 @@ export function measureCenters(
 
 /** 把某个图标的放大状态落到 DOM 上。用 WeakMap 记住上一次写进去的值，
  *  值没变就完全不动 DOM —— 原来每帧对每个图标无条件写 transform/zIndex，
- *  即使数值与上一帧一模一样也会让浏览器重新做样式解析与合成。 */
-const appliedZoom = new WeakMap<HTMLElement, number>()
+ *  即使数值与上一帧一模一样也会让浏览器重新做样式解析与合成。
+ *
+ *  ⚠️ 去重 key 必须同时含 `lift`（v1.18 修）：只比 scale 的话，切换 dockEdge
+ *  （bottom ↔ middle ↔ top 会翻转上浮方向）时 scale 不变、lift 变号，transform
+ *  永远不重写 —— 表现为"切到顶部 Dock 后图标还是往上浮"。 */
+const appliedZoom = new WeakMap<HTMLElement, string>()
 
 export function applyZoom(el: HTMLElement, scale: number, lift: number): void {
+  const key = `${scale.toFixed(4)}|${lift.toFixed(2)}`
   const prev = appliedZoom.get(el)
-  if (prev === scale) return
-  if (scale <= 1) {
+  if (prev === key) return
+  if (scale <= 1 && Math.abs(lift) < 0.01) {
     el.style.transform = ''
     el.style.zIndex = ''
     appliedZoom.delete(el)
     return
   }
-  el.style.transform = `scale(${scale}) translateY(${lift}px)`
-  el.style.zIndex = '10'
-  appliedZoom.set(el, scale)
+  el.style.transform = scale <= 1
+    ? `translateY(${lift}px)`
+    : `scale(${scale}) translateY(${lift}px)`
+  el.style.zIndex = scale > 1 ? '10' : ''
+  appliedZoom.set(el, key)
 }

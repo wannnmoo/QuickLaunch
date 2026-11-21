@@ -116,8 +116,22 @@ button, input, select, textarea {
   --label-color: rgba(255, 255, 255, 0.62);
   --label-color-hover: #fff;
   --label-pill-bg: rgba(12, 16, 28, 0.55); /* 黑夜：深藏青药丸衬底（悬停显示标签） */
-  --icon-wrap-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.03) 100%);
-  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.08) 100%);
+  /* V1（v1.18）：图标衬底默认**不画**，只剩图标本体；悬停时才浮出一层薄底 + 内描边。
+     原来每个图标都常驻「渐变底 + 1px 内描边 + 顶部镜面」，60px 槽位里叠了 4 层装饰，
+     图标本体只占 44px —— 密集时读起来像一排按钮，而不是 Dock。
+     想要回旧观感：把下面两行换成
+       linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.03)) 与
+       linear-gradient(180deg, rgba(255,255,255,.18), rgba(255,255,255,.08))，
+     并把 --icon-wrap-ring 改成 rgba(255,255,255,.06)。 */
+  --icon-wrap-bg: transparent;
+  --icon-wrap-hover-bg: rgba(255, 255, 255, 0.13);
+  --icon-wrap-ring: transparent;
+  --icon-wrap-ring-hover: rgba(255, 255, 255, 0.18);
+  /* V2（v1.18）：间距与标签字号随图标尺寸联动 —— 60 档等于改造前的 4px/10.9px 观感
+     （gap 6.6px 是唯一有意的变化：原来 4px 只有槽位的 6.7%，图标之间几乎贴上）。
+     改这三行前先读 .dock-bar 的宽度/滚动说明：gap 会直接改变玻璃条宽度与滚动阈值。 */
+  --dock-gap: calc(var(--dock-icon, 60px) * 0.11);
+  --dock-label-size: clamp(11px, calc(var(--dock-icon, 60px) * 0.2), 13px);
   --add-btn-color: rgba(255, 255, 255, 0.25);
   --add-btn-hover-color: rgba(255, 255, 255, 0.7);
   /* 「+」按钮底衬（黑夜：几乎透明，只做一点点存在感） */
@@ -182,18 +196,21 @@ button, input, select, textarea {
   --label-color: rgba(0, 0, 0, 0.6);
   --label-color-hover: #111;
   --label-pill-bg: rgba(255, 255, 255, 0.75); /* 白天：浅白玻璃药丸衬底（悬停显示标签，深色文字） */
-  --icon-wrap-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.05) 0%, rgba(0, 0, 0, 0.02) 100%);
-  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.04) 100%);
+  /* V1：白天同样是「默认无衬底」，悬停用淡黑底 + 淡黑内描边（白玻璃上「变深」才符合直觉） */
+  --icon-wrap-bg: transparent;
+  --icon-wrap-hover-bg: rgba(0, 0, 0, 0.1);
+  --icon-wrap-ring: transparent;
+  --icon-wrap-ring-hover: rgba(0, 0, 0, 0.14);
   --add-btn-color: rgba(0, 0, 0, 0.4);
   --add-btn-hover-color: rgba(0, 0, 0, 0.75);
   /* 「+」按钮底衬：白天要「悬停变深」才符合直觉（原来复用黑夜的白色底衬 = 变亮） */
   --add-btn-bg: rgba(0, 0, 0, 0.03);
   --add-btn-hover-bg: rgba(0, 0, 0, 0.08);
   --add-btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
-  /* 图标瓷砖：白天主题此前**没有**定义这一对变量，一直在用黑夜的 9% 白，
-     叠在白玻璃上就是一个发灰的方块。改成淡灰（悬停加深），与白玻璃契合 */
-  --icon-wrap-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.055) 0%, rgba(0, 0, 0, 0.02) 100%);
-  --icon-wrap-hover-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.13) 0%, rgba(0, 0, 0, 0.06) 100%);
+  /* 图标瓷砖（V1 后只剩悬停底）：白天主题此前**没有**定义这一对变量，
+     会继承黑夜的白色系，叠在白玻璃上就是一个发灰的方块 —— 这里显式给淡黑。 */
+  --icon-wrap-hover-bg: rgba(0, 0, 0, 0.1);
+  --icon-wrap-ring-hover: rgba(0, 0, 0, 0.14);
   /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
   --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
   --menu-border: rgba(0, 0, 0, 0.12);
@@ -365,7 +382,8 @@ html[data-glass-fx='off'] .dock-bg::after {
      `align-items: center` 保留：`flex-direction: row` 下它是**交叉轴（纵向）**，把每个
      60px 衬底在 76px 内容盒里纵向居中（衬底内部再用自己的 flex 居中 44px 图标）。 */
   align-items: center;
-  gap: 4px;
+  /* V2：间距随图标尺寸（60 档 6.6px）。原来写死 4px，只有槽位的 6.7%，图标几乎贴上 */
+  gap: var(--dock-gap, 4px);
   /* 图标放不下时横向滚动查看。上方 82px 为透明放大区：hover 放大（1.4× + 8px 上浮）
      的图标在这里顶出背景，不被 overflow 裁剪；同时容纳悬浮在图标上的标签。
      ⚠️ 82 不是随手写的：要够高到让**悬浮标签**（`bottom: calc(100% + 4px)`、高 20px
@@ -477,11 +495,13 @@ html[data-glass-fx='off'] .dock-bg::after {
   align-items: center;
   justify-content: center;
   position: relative; /* 分组数量徽标（.dock-badge）定位参照 */
-  border-radius: 18px;
+  /* 圆角随尺寸（60 档 = 18px）：48/72 档原来沿用 60 档的 18，比例会跑掉 */
+  border-radius: calc(var(--dock-icon, 60px) * 0.3);
   background: var(--icon-wrap-bg);
-  /* 外缘 1px 内描边：没有它时瓷砖与玻璃条背景交界处是「渐变糊在一起」的，
-     有了这圈亮线瓷砖才有实体边界（暗色玻璃上尤其明显） */
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  /* 外缘 1px 内描边：V1 之后默认透明（--icon-wrap-ring），悬停才出现。
+     没有它时瓷砖与玻璃条背景交界处是「渐变糊在一起」的 —— 但常驻的那圈 6% 白
+     正是「每个图标都被框住」的元凶，所以改成只在 hover 时勾一下轮廓。 */
+  box-shadow: inset 0 0 0 1px var(--icon-wrap-ring, transparent);
   transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
 }
 
@@ -506,12 +526,12 @@ html[data-glass-fx='off'] .dock-bg::after {
   z-index: 1;
 }
 
-/* 悬停：底衬提亮 + 内描边加重 + 顶部镜面淡入 + 冷色辉光（原来只有一层纯黑影，
-   「弹出来」的感觉出不来）。辉光取强调色，和选中框/插入线同一套视觉语言 */
+/* 悬停：底衬浮出 + 内描边出现 + 顶部镜面淡入 + 冷色辉光。
+   V1 之后这是图标唯一的「底」，所以辉光保留、底衬改成一档很薄的白色。 */
 .dock-item:hover .dock-icon-wrap {
   background: var(--icon-wrap-hover-bg);
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.14),
+    inset 0 0 0 1px var(--icon-wrap-ring-hover, rgba(255, 255, 255, 0.16)),
     0 6px 20px rgba(0, 0, 0, 0.35),
     0 0 22px -6px rgba(96, 165, 238, 0.45);
 }
@@ -527,14 +547,59 @@ html[data-glass-fx='off'] .dock-bg::after {
   will-change: transform;
 }
 
+/* ─── 启动反馈（V6）──────────────────────────────────────────────────────
+   点击后 Dock 会被主进程隐藏（默认 300ms 后，见 LAUNCH_HIDE_DELAY_MS），中间这段
+   是唯一能给"我按到了"的视觉出口：起跳 → 落回；失败则左右抖两下。
+   ⚠️ 动画必须挂在 `.dock-icon`（<img>）上：`.dock-icon-wrap` 的 transform 已被
+      悬停放大（内联 style，由 applyZoom 写入）、选中/归组（CSS）占用，
+      动画会与内联 transform 互相覆盖 —— 表现为放大卡住或图标乱跳。
+   ⚠️ `prefers-reduced-motion` 下彻底关掉（不播放也不留合成层）。 */
+@keyframes launch-bounce {
+  0%   { transform: translateY(0) scale(1); }
+  35%  { transform: translateY(-9px) scale(1.1); }
+  70%  { transform: translateY(0) scale(0.985); }
+  100% { transform: translateY(0) scale(1); }
+}
+
+@keyframes launch-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-3px); }
+  40% { transform: translateX(3px); }
+  60% { transform: translateX(-2px); }
+  80% { transform: translateX(2px); }
+}
+
+.dock-item.launching .dock-icon {
+  animation: launch-bounce 0.38s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.dock-item.launch-failed .dock-icon {
+  animation: launch-shake 0.26s ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-item.launching .dock-icon,
+  .dock-item.launch-failed .dock-icon {
+    animation: none;
+  }
+}
+
 .dock-icon {
-  width: calc(var(--dock-icon, 60px) - 16px);
-  height: calc(var(--dock-icon, 60px) - 16px);
-  border-radius: 12px;
+  /* V2：图标与槽位的比例固定 73.3%（60 档 = 44px）。原来写死 `- 16px`，
+     于是 48 档只剩 67%、72 档涨到 78% —— 三档之间「图标占多满」是不一致的 */
+  width: calc(var(--dock-icon, 60px) * 0.7333);
+  height: calc(var(--dock-icon, 60px) * 0.7333);
+  border-radius: calc(var(--dock-icon, 60px) * 0.2);
   pointer-events: none;
   image-rendering: auto;
   /* 双层投影：近距实影贴合边缘（保留原有的清晰轮廓），远距虚影让图标从玻璃面上「浮起来」 */
   filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.35)) drop-shadow(0 8px 16px rgba(0, 0, 0, 0.25));
+}
+
+/* 空分组的 2×2 默认图标：SVG 尺寸也跟着槽位走（原来写死 30px） */
+.dock-icon.group-glyph svg {
+  width: calc(var(--dock-icon, 60px) * 0.5);
+  height: calc(var(--dock-icon, 60px) * 0.5);
 }
 
 /* macOS 式悬停标签：绝对定位悬浮在图标上方（不再占用图标下方的布局行，
@@ -548,7 +613,8 @@ html[data-glass-fx='off'] .dock-bg::after {
      被 overflow 裁掉（「此电脑」的「此电脑 · 可用 …」就会被切掉左半截），
      悬停时量一次宽度把标签推回 Dock 内 */
   transform: translateX(calc(-50% + var(--label-shift, 0px)));
-  font-size: 0.68rem;
+  /* V2：字号随图标尺寸（60 档 12px；原来固定 0.68rem≈10.9px，72 档明显偏小） */
+  font-size: var(--dock-label-size, 0.68rem);
   font-weight: 500;
   letter-spacing: 0.02em;
   color: var(--label-color);
@@ -703,6 +769,9 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 .dock-add-btn svg {
+  /* 加号随槽位缩放（28/60）。原来写死 28px，72 档会显得很小 */
+  width: calc(var(--dock-icon, 60px) * 0.4667);
+  height: calc(var(--dock-icon, 60px) * 0.4667);
   transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
@@ -1207,7 +1276,13 @@ html[data-glass-fx='off'] .dock-bg::after {
       「左上 + 右上」，看起来仍然整齐。
    ④ 单成员仍走 `.single` 大图并居中；此时徽标隐藏（数量 1 没有信息量）。
    ⚠️ 卡片用**绝对定位**，不能用 flex 排（`.dock-icon-wrap` 是 flex + center，
-      会把它们居中；而且网格 offsets 本身也不适合流式布局）。 */
+      会把它们居中；而且网格 offsets 本身也不适合流式布局）。
+   ⚠️⚠️ **所有尺寸都按 60 档比例从 `--dock-icon` 派生**（v1.18 / V3）。
+      原来这里全是绝对值（46 / 22 / 7 / 24），于是：
+        48 档 → 46 + 7×2 = 60 > 48，网格**溢出到玻璃条上**（真的看得见）；
+        72 档 → 网格仍 46，贴在左上角，右下留 19px 空洞。
+      60 档的数值必须与旧版**逐像素一致**：0.7667×60=46、0.3667×60=22、
+      0.1167×60=7、0.4×60=24。改这里请先按 60 反算一次。 */
 .dock-group-preview {
   position: absolute;
   top: 0;
@@ -1218,20 +1293,20 @@ html[data-glass-fx='off'] .dock-bg::after {
      并不豁免父级 flex 的对齐 —— 实测 offsetLeft/Top 仍被居中成 9/9。
      必须配四向 inset + `margin:auto` 才能钉死到指定位置：
      46×46 的网格在 60×60 框里四边各留 7px，严格居中。 */
-  margin: 7px auto auto 7px;
-  width: 46px;
-  height: 46px;
+  margin: calc(var(--dock-icon, 60px) * 0.1167) auto auto calc(var(--dock-icon, 60px) * 0.1167);
+  width: calc(var(--dock-icon, 60px) * 0.7667);
+  height: calc(var(--dock-icon, 60px) * 0.7667);
   align-self: flex-start;
   justify-self: flex-start;
 }
 
 .dock-group-preview img {
   position: absolute;
-  width: 22px;
-  height: 22px;
+  width: calc(var(--dock-icon, 60px) * 0.3667);
+  height: calc(var(--dock-icon, 60px) * 0.3667);
   object-fit: contain;
   -webkit-user-drag: none;
-  border-radius: 5px;
+  border-radius: calc(var(--dock-icon, 60px) * 0.0833);
   /* 卡片之间靠投影分开，否则同色系图标会糊成一片 */
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
@@ -1239,37 +1314,37 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* 2×2 网格：单元 22px、间隙 2px（22+2+22=46）。
    1 左上 → 2 右上 → 3 左下；右下第 4 格是徽标，不再放缩略图。 */
 .dock-group-preview img:nth-child(1) { left: 0; top: 0; }
-.dock-group-preview img:nth-child(2) { left: 24px; top: 0; }
-.dock-group-preview img:nth-child(3) { left: 0; top: 24px; }
+.dock-group-preview img:nth-child(2) { left: calc(var(--dock-icon, 60px) * 0.4); top: 0; }
+.dock-group-preview img:nth-child(3) { left: 0; top: calc(var(--dock-icon, 60px) * 0.4); }
 
-/* 单成员：一张大图，在 60×60 框里真正居中（inset 全 0 + margin:auto）。 */
+/* 单成员：一张大图，在槽位框里真正居中（inset 全 0 + margin:auto）。 */
 .dock-group-preview.single {
   margin: auto;
-  width: 36px;
-  height: 36px;
+  width: calc(var(--dock-icon, 60px) * 0.6);
+  height: calc(var(--dock-icon, 60px) * 0.6);
 }
 
 .dock-group-preview.single img {
   left: 0;
   top: 0;
-  width: 36px;
-  height: 36px;
+  width: calc(var(--dock-icon, 60px) * 0.6);
+  height: calc(var(--dock-icon, 60px) * 0.6);
 }
 
 /* 成员数量徽标：与缩略图共用同一套 2×2 网格，占右下 22×22 单元。
    right/bottom 7px 正是网格的外边距，不再用手感数字。 */
 .dock-badge {
   position: absolute;
-  right: 7px;
-  bottom: 7px;
-  min-width: 22px;
-  height: 22px;
-  padding: 0 5px;
+  right: calc(var(--dock-icon, 60px) * 0.1167);
+  bottom: calc(var(--dock-icon, 60px) * 0.1167);
+  min-width: calc(var(--dock-icon, 60px) * 0.3667);
+  height: calc(var(--dock-icon, 60px) * 0.3667);
+  padding: 0 calc(var(--dock-icon, 60px) * 0.0833);
   border-radius: 999px;
   background: #3a7bd5;
   color: #fff;
-  font-size: 11px;
-  line-height: 22px;
+  font-size: calc(var(--dock-icon, 60px) * 0.1833);
+  line-height: calc(var(--dock-icon, 60px) * 0.3667);
   font-weight: 600;
   text-align: center;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 1.5px var(--label-pill-bg);
@@ -1347,12 +1422,13 @@ html[data-glass-fx='off'] .dock-bg::after {
   max-width: calc(var(--dock-vw, 100vw) - 32px);
 }
 
-/* 玻璃底：只覆盖图标区（顶部 56px 是透明区，供悬停放大 + 悬浮标签顶出） */
+/* 玻璃底：只覆盖图标区（顶部透明区，供悬停放大 + 悬浮标签顶出）。
+   V3：透明区高度随图标尺寸（60 档仍是 56px，见 .group-panel-inner 的 padding 说明）。 */
 .group-panel-bg {
   position: absolute;
   left: 0;
   right: 0;
-  top: 56px;
+  top: calc(var(--dock-icon, 60px) - 4px);
   bottom: 0;
   z-index: 0;
   border-radius: 24px;
@@ -1368,10 +1444,13 @@ html[data-glass-fx='off'] .dock-bg::after {
   z-index: 1;
   display: flex;
   align-items: flex-end;
-  gap: 4px;
-  /* 顶部 56px 透明放大区 + 图标区上下各 8px（与 .dock-bg 的 76px 玻璃条一致）；
-     左右 16px 与主 Dock 的内边距对齐，面板打开时两张 Dock 的图标列看起来同一套网格 */
-  padding: 64px 16px 8px;
+  /* V2：与主 Dock 同一套间距 */
+  gap: var(--dock-gap, 4px);
+  /* 顶部透明放大区 + 图标区上下各 8px（与 .dock-bg 的 76px 玻璃条一致）；
+     左右 16px 与主 Dock 的内边距对齐，面板打开时两张 Dock 的图标列看起来同一套网格。
+     V3：透明区改为 `图标 + 4`（60 档仍是 64px，与 .group-panel-bg 的 `图标 - 4` 一起
+     保证图标在玻璃里上下各 8px）。原来两处都是绝对值，48/72 档会一大一小。 */
+  padding: calc(var(--dock-icon, 60px) + 4px) 16px 8px;
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
@@ -1503,7 +1582,8 @@ html[data-glass-fx='off'] .dock-bg::after {
   position: relative;
   z-index: 20; /* 高于放大中的图标（10），保证 1px 竖线始终可点 */
   width: 9px;
-  height: 40px;
+  /* 竖线高度随槽位（40/60）：48/72 档保持同一比例 */
+  height: calc(var(--dock-icon, 60px) * 0.6667);
   margin: 0 4px;
   align-self: center;
   flex-shrink: 0;
@@ -1797,7 +1877,10 @@ html[data-glass-fx='off'] .dock-bg::after {
 .drop-hint {
   position: fixed;
   left: 50%;
-  bottom: 168px; /* 实测间隙 2px：窗口 300 − 168 = hint 底 132；Dock 高 158 + 窗口下 padding 8 → bar 顶 134 */
+  /* V3：由 Dock 几何派生（60 档仍是 168px）。原来写死 168，72 档玻璃条顶升到距底 190，
+     提示条会**压进玻璃条里**（48 档则悬空偏高）。公式 = 窗口内边距 8 + 玻璃条高
+     (pad+icon+16) + 2 = pad + icon + 26。 */
+  bottom: calc(var(--dock-pad, 82px) + var(--dock-icon, 60px) + 26px);
   transform: translateX(-50%);
   z-index: 200;
   padding: 6px 14px;
@@ -1833,7 +1916,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 .undo-toast {
   position: fixed;
   left: 50%;
-  bottom: 206px;
+  /* V3：同样由 Dock 几何派生（60 档仍是 206px = pad + icon + 64） */
+  bottom: calc(var(--dock-pad, 82px) + var(--dock-icon, 60px) + 64px);
   transform: translateX(-50%);
   z-index: 300;
   display: flex;
@@ -1932,16 +2016,16 @@ html[data-glass-fx='off'] .dock-bg::after {
   top: calc(100% + 4px);
 }
 
-/* 拖入提示胶囊：浮到玻璃条下方 */
+/* 拖入提示胶囊：浮到玻璃条下方（V3：与底部布局同一条派生式） */
 .app[data-edge='top'] .drop-hint {
   bottom: auto;
-  top: 168px; /* 镜像：Dock 高 158 + 10px 间隙 */
+  top: calc(var(--dock-pad, 82px) + var(--dock-icon, 60px) + 26px);
 }
 
-/* 删除撤销条同样镜像：让到底部，位置比提示条更靠窗口下沿（与底部布局的 206px 对称） */
+/* 删除撤销条同样镜像：让到底部，位置比提示条更靠窗口下沿（与底部布局对称） */
 .app[data-edge='top'] .undo-toast {
   bottom: auto;
-  top: 206px;
+  top: calc(var(--dock-pad, 82px) + var(--dock-icon, 60px) + 64px);
 }
 
 /* 分组面板（迷你 Dock）同样镜像：玻璃在上、透明放大区在下。

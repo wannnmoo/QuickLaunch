@@ -96,7 +96,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     menuPos || contextMenu || folderCard || showDrivesCard || openGroupId !== null
       || fileDragOver || dropHint          // v1.15.2 追加：.drop-hint 也在透明带里
     ```
-    - ⚠️ **`fileDragOver` / `dropHint` 这条不能省（v1.15.2 修）**：`.drop-hint { position: fixed; bottom: 168px }`（`App.css:1829`）实测 rect `y=104.8 h=30.4`，落在玻璃条**上方**那条透明带里；不放开的话 `SetWindowRgn` 连绘制带命中一起裁掉，只剩约 6px 可见——表现为「点图标没反应、也没有任何解释」。受影响的是**全部** `showDropHint`：`App.tsx:1567`（启动失败）/ `:1333`（已添加 N 个）/ `:1286`（未能识别路径）/ `:2951`（拖文件「松开即添加」）
+    - ⚠️ **`fileDragOver` / `dropHint` 这条不能省（v1.15.2 修）**：`.drop-hint { position: fixed; bottom: calc(var(--dock-pad) + var(--dock-icon) + 26px) }`（v1.18 起是派生式，60 档 = 168px，与旧版逐像素相同）实测 rect `y=104.8 h=30.4`，落在玻璃条**上方**那条透明带里；不放开的话 `SetWindowRgn` 连绘制带命中一起裁掉，只剩约 6px 可见——表现为「点图标没反应、也没有任何解释」。受影响的是**全部** `showDropHint`：`App.tsx:1567`（启动失败）/ `:1333`（已添加 N 个）/ `:1286`（未能识别路径）/ `:2951`（拖文件「松开即添加」）
     - 实测：菜单开 region `(0,0)-(1200,303)`，关 region 回 `(16,157)-(1184,303)`；派发一次带 `Files` 的 `dragover` 后同样的整窗放开
   - ⚠️ **region 内侧不能压到标签/放大图标**：`SetWindowRgn` 连**绘制**一起裁（region 外那部分不画）。实测（middle 档 `bar.y=137.2`；`DOCK_HIT_INSET=20` → region 顶 `157.2`）：悬浮标签 rect `y=161.8 h=24.6`（顶边在 `barTop + 24.6`）→ 余量仅 **4.6px**；放大后的图标 rect `y=192 h=84`（顶边在 `barTop + 54.8`）→ 余量 34.8px。**`INSET` 加到 ≥ 24 就会先切掉标签顶边**（实测数据指向前者先红）。所以 `20` 是「把空白放大区尽量让给下层」与「不切标签」之间的上限值，**别再往上调**；想让下层多拿点击就只能走方案 C（原生 `WM_NCHITTEST`，见「已知取舍」）。⚠️ `top` 档几何垂直镜像，标签与放大方向相反，这组数字要镜像看
   - **三档镜像自动成立**：renderer 报的是 `.dock-bar` 的**实测** rect，`top` 档几何垂直镜像后 rect 就变成 `y=8`，region 自动是 `(16,0)-(1184,146)`（`bar.y-8` 到 `bar.bottom-20`，方向由 `growUp` 自动翻）；切档位会经 `useLayoutEffect` 的 `edge` 依赖重报一次，不需要在主进程里写任何镜像逻辑
@@ -153,6 +153,17 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     - 「此电脑」「回收站」这些**最前面的条目彻底找不回来**——滚轮、拖拽、`scrollIntoView` 都没用，因为可滚动区压根没包含它们
     纵向居中只能用 `padding-top: 82px` + `padding-bottom: 0` + `align-items: center`（`flex-direction: row` 下 `align-items` 管的是**纵轴**），**不要用 `justify-content`**。回归断言见 `regression.cjs` 第 7 组（`scrollLeft=0 时第一个图标完整可见` + `scrollWidth 覆盖全部内容` + `从最右用滚轮一路向左能回到第一个图标`）
   - **透明放大区 82px 的来历**：它必须 ≥ 悬浮标签顶部到 `.dock-inner` 顶边的距离（标签 `bottom: calc(100% + 4px)`、高 20px → 在衬底上方 24px），否则标签会被 `.dock-inner` 的 `overflow` 裁掉。实测标签顶边在 `.dock-inner` 顶边下方 58px，余量充足；标签与玻璃条上沿有 **4px 重叠**，那是原有设计（药丸底衬压一点玻璃上沿），不是 bug
+  - **v1.18「手感版」：这些数字改成了按 `--dock-icon` 派生（改这块必看）**。`iconSize` 三档（48/60/72）以前只有 `--dock-icon` 会变，其余尺寸全是按 60 档写死的绝对值：分组拼图 `46+7×2=60` 在 **48 档溢出到玻璃条上**、72 档偏左上；`.drop-hint`（168）/`.undo-toast`（206）在 **72 档压进玻璃条**。现在统一成比例，**60 档数值逐像素不变**（已用真实构建 CSS 在三档各量过）：
+    - `.dock-group-preview`：外边距 `0.1167×`、尺寸 `0.7667×`、单格 `0.3667×`、第 2 列/行偏移 `0.4×`；`.dock-badge` 右/下 `0.1167×`、边长 `0.3667×`、字号 `0.1833×`、行高 `0.3667×`（与拼图共用同一套 2×2 网格）
+    - `.dock-icon` 占槽位 **73.3%**（`0.7333×`，60 档 = 44px）。原来是 `- 16px`：48 档只有 67%、72 档 78% —— 三档「图标占多满」本来就不一致
+    - `.dock-inner` / `.group-panel-inner` 的 `gap` = `--dock-gap`（`0.11×`，60 档 6.6px；v1.17 是写死 4px，只有槽位 6.7%，图标几乎贴上）
+    - `.dock-label` 字号 = `--dock-label-size`（`clamp(11px, 0.2×, 13px)`，60 档 12px；v1.17 固定 10.9px）
+    - `.group-panel-inner` 上内边距 `图标 + 4`、`.group-panel-bg` 的 `top` = `图标 − 4`（60 档仍是 64 / 56）
+    - `.drop-hint` = `--dock-pad + --dock-icon + 26`、`.undo-toast` = `+ 64`（60 档仍是 168 / 206）
+    ⚠️ 改这些系数前先按 60 反算一次（46 / 22 / 7 / 24 / 40 / 44 / 168 / 206 都要对得上），否则**默认档先坏**
+  - **图标衬底默认透明（v1.18）**：`--icon-wrap-bg` / `--icon-wrap-ring` 默认 `transparent`，只在悬停用 `--icon-wrap-hover-bg` / `--icon-wrap-ring-hover`。原来每个图标常驻「渐变底 + 1px 内描边 + 顶部镜面」，60px 槽位里叠 4 层装饰、图标只占 44px，密集时像一排按钮。要回旧观感就把那两行换回 `.09→.03` 渐变与 `rgba(255,255,255,.06)` 描边（变量块里有注释）
+  - **启动反馈（v1.18）**：点图标 → `.dock-item.launching .dock-icon` 播 380ms 起跳；失败 → `.launch-failed` 抖 260ms。⚠️ 动画必须挂在 `.dock-icon`（`<img>`）上 —— `.dock-icon-wrap` 的 transform 已被悬停放大（`applyZoom` 写的内联值）/ 选中 / 归组占用，挂那儿会互相覆盖。为此主进程在 `afterLaunch === 'hide'` 时把 `win.hide()` 推迟 `LAUNCH_HIDE_DELAY_MS`(300) 执行；`clearLaunchHide()` 必须在**所有用户主动显示**的路径调用（`toggleWindow` 两个分支、托盘「显示窗口」、`second-instance`、`createWindow`、失败恢复），否则迟到的 hide 会把刚唤回的 Dock 又藏起来 —— 与 `sinkSeq` 那套是同一种竞态
+  - **`applyZoom()` 的去重 key 含 `lift`（v1.18 修）**：原来只比 `scale`，切 `bottom ↔ middle ↔ top` 时 scale 不变、lift 变号 → transform 永不重写，表现为「切到顶部 Dock 后图标还是往上浮」
   - **拖入文件的命中区按 `.dock-bar` 算，不能按 `.dock`**：`.dock` 占满整窗，图标少时条两侧大片透明区也在 `.dock` 内——不区分就会出现「在空白处松手也能添加，但那里不显示插入线和禁止光标」。`document` 级 `dragover` 用 `elementFromPoint` 判断是否在条上（不用 `e.target`：光标下方可能是被 transform 放大的图标），不在条上就 `dropEffect='none'` 并清掉插入线；`handleDockDrop` 里再用 `dockBarRef` 兜一道
   - **回归验证脚本**：`node_modules/electron/dist/electron.exe devtools/probe/probe-main.cjs`——起一个本地 HTTP 服务（**必须 HTTP，不能 file://**：探针页与构建产物不在同一目录，file:// 下属于不同不透明源，样式表会被判跨源而**静默不生效**，第一版探针就因此量到「没有样式」的全宽），引用真实构建产物的 CSS，在真实 Chromium 里逐个数图标量 `.dock-bar` 宽度。实测：0 个 → 32px、4 个 → 284px、16 个 → 1052px、20 个 → 封顶 1154px 且开始滚动（内容 1308）、30 个 → 仍 1154px
 - 图标支持拖拽排序（自定义 mousedown/mousemove/mouseup 事件，5px 阈值区分点击和拖拽，蓝色指示线显示插入点）。**落点换算（v1.13.1 修过一次，改这里必看）**：`calcDropIndex` 在 `dockCenters` 上二分，而 `measureCenters` **跳过了分隔线**（`if (el.dataset.sep) return`）——所以它返回的是「**可显示顶层条目**」下标（非分组成员 **且** 非分隔线）。因此：
