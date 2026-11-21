@@ -66,6 +66,225 @@ export const FOLDER_ICON_SIZE = 48
  *  shortcuts.json（每次保存都重序列化），统一缩到图标尺寸 */
 export const PICKED_IMAGE_MAX_EDGE = 256
 
+/**
+ * 音频设备（Core Audio）—— 枚举 + 切换系统默认设备。
+ *
+ * 用到的两个 COM 面：
+ *  - `IMMDeviceEnumerator`（公开文档）枚举 render/capture 端点、读友好名与形态；
+ *  - `IPolicyConfigVista`（**未文档化但 Win7→Win11 一直有效**）设默认设备。
+ *
+ * ⚠️ CLSID 有两个，**必须按顺序试**（本机实测只在第二个上存在）：
+ *  - `{870AF99C-171D-4F9E-AF0D-E64A4906EA05}` = CPolicyConfigClient（Win7 时代常用，
+ *    但在本机 Win11 上 **REGDB_E_CLASSNOTREG**，注册表里根本没有这一项）；
+ *  - `{294935CE-F637-4E7C-A41B-AB255460B862}` = CPolicyConfigVistaClient，指向
+ *    `AudioSes.dll`，本机注册表里只有它。
+ *  所以 C# 里先试 Vista 的，失败再回退，避免换台机器又哑掉。
+ *
+ * ⚠️ vtable 顺序错了会抛 `NullReferenceException`（不是 HRESULT）：`IMMDeviceEnumerator`
+ *  的第 1 个槽位是 `EnumAudioEndpoints`，**不是** `GetDefaultAudioEndpoint`。
+ *  第一版就写成了后者在前，表现为「枚举时 NRE」——排查了一轮才定位。
+ *
+ * ⚠️ 角色（ERole）：0=eConsole（系统默认）、1=eMultimedia（多媒体）、
+ *  2=eCommunications（通话，Discord/Teams/微信语音走这个）。只设 Console 会出现
+ *  「系统切了、语音还在旧设备」，所以默认三个一起设。
+ *
+ * 调用约定：本块只定义类型与静态方法，**不打印任何东西**；调用方自己在末尾拼
+ * `Write-Output 'AUDIOLIST=...'` 这类带标记的输出（见 audio.ts），
+ * 避免 v1.13.8 那种「stdout 多一行就把整段解析打死」的事故。
+ *
+ * ⚠️ 首行 `[Console]::OutputEncoding = UTF8` 不能省（v1.19 修）：`execFile` 按 UTF-8
+ *  解码 stdout，而 powershell.exe 在**没有控制台**的进程里（Electron 主进程 spawn 的
+ *  子进程就是）默认按 OEM 代码页（中文 Windows = 936）输出 —— 设备名里的中文会变成一串
+ *  U+FFFD，用户看到的是「耳机 (ZhuAudio ZG3)」显示成「���� (ZhuAudio ZG3)」。
+ *  实测：同一段脚本在带 UTF-8 控制台的终端里跑完全正常，所以在开发机上很容易漏掉。
+ */
+export const AUDIO_CS = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$null = Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+[ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMMDeviceEnumerator
+{
+    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection ppDevices);
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppDevice);
+    [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+    [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr pClient);
+    [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr pClient);
+}
+
+[ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMMDeviceCollection
+{
+    [PreserveSig] int GetCount(out int pcDevices);
+    [PreserveSig] int Item(int nDevice, out IMMDevice ppDevice);
+}
+
+[ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMMDevice
+{
+    [PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, out IntPtr ppInterface);
+    [PreserveSig] int OpenPropertyStore(int stgmAccess, out IPropertyStore ppProperties);
+    [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string ppstrId);
+    [PreserveSig] int GetState(out int pdwState);
+}
+
+[ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IPropertyStore
+{
+    [PreserveSig] int GetCount(out int cProps);
+    [PreserveSig] int GetAt(int iProp, out PROPERTYKEY pkey);
+    [PreserveSig] int GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+    [PreserveSig] int SetValue(ref PROPERTYKEY key, ref PROPVARIANT propvar);
+    [PreserveSig] int Commit();
+}
+
+public struct PROPERTYKEY { public Guid fmtid; public int pid; }
+
+[StructLayout(LayoutKind.Explicit)]
+public struct PROPVARIANT
+{
+    [FieldOffset(0)] public ushort vt;
+    [FieldOffset(8)] public IntPtr ptr;
+    [FieldOffset(8)] public uint uintVal;
+}
+
+[ComImport, Guid("568b9108-44bf-40b4-9006-86afe5b5a620"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IPolicyConfigVista
+{
+    [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, out IntPtr ppFormat);
+    [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, bool bDefault, out IntPtr ppFormat);
+    [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pEndpointFormat, IntPtr mixFormat);
+    [PreserveSig] int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, bool bDefault, out long pmftDefaultPeriod, out long pmftMinimumPeriod);
+    [PreserveSig] int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, ref long pmftPeriod);
+    [PreserveSig] int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, out IntPtr pMode);
+    [PreserveSig] int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr mode);
+    [PreserveSig] int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, bool bFxStore, ref PROPERTYKEY key, out PROPVARIANT pv);
+    [PreserveSig] int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, bool bFxStore, ref PROPERTYKEY key, ref PROPVARIANT pv);
+    [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int eRole);
+    [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, bool bVisible);
+}
+
+public class AudioDev
+{
+    public string id;
+    public string name;
+    public string adapter;
+    public string flow;
+    public int formFactor;
+    public bool isDefault;
+    public bool isCommDefault;
+}
+
+public static class QLAudio
+{
+    [DllImport("ole32.dll", PreserveSig = true)]
+    static extern int PropVariantClear(ref PROPVARIANT pv);
+
+    static readonly PROPERTYKEY PKEY_FriendlyName = new PROPERTYKEY { fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), pid = 14 };
+    static readonly PROPERTYKEY PKEY_DeviceInterface = new PROPERTYKEY { fmtid = new Guid("026e516e-b814-414b-83cd-856d6fef4822"), pid = 2 };
+    static readonly PROPERTYKEY PKEY_FormFactor = new PROPERTYKEY { fmtid = new Guid("1da5d803-d492-4edd-8c23-e0c0ffee7f0e"), pid = 0 };
+
+    static string GetStr(IPropertyStore store, PROPERTYKEY key)
+    {
+        PROPVARIANT pv;
+        if (store.GetValue(ref key, out pv) != 0) return "";
+        try
+        {
+            if (pv.vt == 31 && pv.ptr != IntPtr.Zero) return Marshal.PtrToStringUni(pv.ptr) ?? "";
+            if (pv.vt == 19) return pv.uintVal.ToString();
+            return "";
+        }
+        finally { PropVariantClear(ref pv); }
+    }
+
+    public static IMMDeviceEnumerator NewEnumerator()
+    {
+        var t = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
+        return (IMMDeviceEnumerator)Activator.CreateInstance(t);
+    }
+
+    public static string DefaultId(IMMDeviceEnumerator en, int flow, int role)
+    {
+        IMMDevice dev;
+        if (en.GetDefaultAudioEndpoint(flow, role, out dev) != 0 || dev == null) return "";
+        string id;
+        dev.GetId(out id);
+        return id ?? "";
+    }
+
+    public static AudioDev[] List()
+    {
+        var en = NewEnumerator();
+        var outList = new List<AudioDev>();
+        for (int flow = 0; flow <= 1; flow++)
+        {
+            string defId = DefaultId(en, flow, 0);
+            string commId = DefaultId(en, flow, 2);
+            IMMDeviceCollection col;
+            if (en.EnumAudioEndpoints(flow, 1, out col) != 0 || col == null) continue;
+            int n;
+            col.GetCount(out n);
+            for (int i = 0; i < n; i++)
+            {
+                IMMDevice dev;
+                if (col.Item(i, out dev) != 0 || dev == null) continue;
+                string id;
+                dev.GetId(out id);
+                IPropertyStore ps;
+                string name = "";
+                string adapter = "";
+                int formFactor = 0;
+                if (dev.OpenPropertyStore(0, out ps) == 0 && ps != null)
+                {
+                    name = GetStr(ps, PKEY_FriendlyName);
+                    adapter = GetStr(ps, PKEY_DeviceInterface);
+                    int ff;
+                    int.TryParse(GetStr(ps, PKEY_FormFactor), out ff);
+                    formFactor = ff;
+                }
+                var d = new AudioDev();
+                d.id = id ?? "";
+                d.name = name;
+                d.adapter = adapter;
+                d.flow = flow == 0 ? "render" : "capture";
+                d.formFactor = formFactor;
+                d.isDefault = d.id == defId && defId != "";
+                d.isCommDefault = d.id == commId && commId != "";
+                outList.Add(d);
+            }
+        }
+        return outList.ToArray();
+    }
+
+    static IPolicyConfigVista NewPolicyConfig()
+    {
+        string[] clsid = new string[] {
+            "294935ce-f637-4e7c-a41b-ab255460b862",
+            "870af99c-171d-4f9e-af0d-e64a4906ea05"
+        };
+        Exception last = null;
+        for (int i = 0; i < clsid.Length; i++)
+        {
+            try
+            {
+                var t = Type.GetTypeFromCLSID(new Guid(clsid[i]));
+                return (IPolicyConfigVista)Activator.CreateInstance(t);
+            }
+            catch (Exception ex) { last = ex; }
+        }
+        throw last ?? new Exception("no PolicyConfig CLSID registered");
+    }
+
+    public static int SetDefault(string deviceId, int role)
+    {
+        return NewPolicyConfig().SetDefaultEndpoint(deviceId, role);
+    }
+}
+'@`
+
 export const PS_ARGS = ['-NoProfile', '-NonInteractive', '-Command'] as const
 export type PSResult = { err: Error | null; stdout: string; stderr: string }
 /** PowerShell stdout 上限（见 runPowerShell 注释：默认 1 MiB 会让批量图标提取静默失败） */

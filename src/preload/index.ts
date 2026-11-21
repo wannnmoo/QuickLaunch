@@ -3,6 +3,7 @@ import { electronAPI } from '@electron-toolkit/preload'
 import type {
   AppEntry,
   AppSettings,
+  AudioSnapshot,
   DockEdge,
   FolderIconsPayload,
   FolderListing,
@@ -82,6 +83,18 @@ const api = {
     free: number
     ready: boolean
   }[]> => ipcRenderer.invoke('list-drives'),
+  /** 枚举音频设备（输出/输入，含 isDefault / isCommDefault）。主进程带 3s 缓存：
+   *  一次调用要起 PowerShell（约 0.7~1s），所以卡片反复开关不会每次起进程。
+   *  `force = true` 跳过缓存（切换设备后、用户点刷新时用）。 */
+  listAudioDevices: (force?: boolean): Promise<AudioSnapshot> =>
+    ipcRenderer.invoke('list-audio-devices', force === true),
+  /** 把某个音频设备设为系统默认。`roles`：0=系统 / 1=多媒体 / 2=通话，
+   *  缺省三个全设（只设系统会出现「切了但微信语音还在旧设备」）。 */
+  setDefaultAudioDevice: (id: string, roles?: number[]): Promise<boolean> =>
+    ipcRenderer.invoke('set-default-audio-device', id, roles),
+  /** 打开 Windows 的「系统 > 声音」设置页（ms-settings: URI，不是文件路径）。 */
+  openSoundSettings: (): Promise<boolean> =>
+    ipcRenderer.invoke('open-sound-settings'),
   /** 列出文件夹子项（文件夹条目悬停预览卡片）：目录优先 + 名称自然序，最多 400 项。
    *  图标先用通用图标秒回，真图标由 `folder-icons` 事件随后补齐。 */
   listFolder: (dir: string): Promise<FolderListing> =>
@@ -118,7 +131,7 @@ const api = {
   selectFolder: (): Promise<{ path: string; name: string; iconDataUrl: string }[]> =>
     ipcRenderer.invoke('select-folder'),
   /** 扫描桌面上的文件夹和指向文件夹的 .lnk 快捷方式，并固定附加「此电脑」「回收站」系统位置（启动时自动合并，renderer 端去重）。 */
-  scanDesktopFolders: (): Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]> =>
+  scanDesktopFolders: (): Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' | 'audio' | 'settings' }[]> =>
     ipcRenderer.invoke('scan-desktop-folders'),
   /** 检查哪些文件夹路径已不存在（用于清理被删除的桌面文件夹条目），返回不存在的子集。 */
   checkMissingFolders: (paths: string[]): Promise<string[]> =>

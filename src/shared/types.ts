@@ -30,7 +30,9 @@ export interface AppEntry {
   workingDirectory: string
   description: string
   isFolder?: boolean
-  specialType?: 'this-pc' | 'recycle-bin'
+  /** 系统位置条目：没有真实文件路径，点击行为由 specialType 决定
+   *  （this-pc / recycle-bin 交给 shell:；audio 打开音频切换卡片；settings 打开快捷设置卡片） */
+  specialType?: 'this-pc' | 'recycle-bin' | 'audio' | 'settings'
   /** 分组（Stack）：点击展开面板而不启动；targetPath 为空 */
   isGroup?: boolean
   /** 所属分组的 id（无此字段 = Dock 顶层图标） */
@@ -117,6 +119,33 @@ export interface DriveInfo {
   total: number
   free: number
   ready: boolean
+}
+
+/** 音频流向：render = 输出（播放），capture = 输入（录音） */
+export type AudioFlow = 'render' | 'capture'
+
+/** 一个音频端点（Core Audio 的 IMMDevice + 两个 PKEY）。
+ *  主进程 `src/main/audio.ts` 负责采集，renderer 只读。 */
+export interface AudioDevice {
+  /** `IMMDevice::GetId()`，形如 `{0.0.0.00000000}.{guid}`；切换时原样传回 */
+  id: string
+  /** PKEY_Device_FriendlyName。Win11 上通常已带 ` (适配器名)` 后缀，显示前剥掉 */
+  name: string
+  /** PKEY_DeviceInterface_FriendlyName（适配器/驱动名，界面上的第二行） */
+  adapter: string
+  flow: AudioFlow
+  /** EndpointFormFactor：1 扬声器 / 3 耳机 / 4 麦克风 / 5 耳麦 / 9 HDMI */
+  formFactor: number
+  /** 该流向的系统默认设备 */
+  isDefault: boolean
+  /** 该流向的默认通讯设备（Discord / Teams / 微信语音用这个） */
+  isCommDefault: boolean
+}
+
+/** `list-audio-devices` 的返回 */
+export interface AudioSnapshot {
+  render: AudioDevice[]
+  capture: AudioDevice[]
 }
 
 /** renderer 上报给主进程的命中区矩形（DIP，相对窗口内容区） */

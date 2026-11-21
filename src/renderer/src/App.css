@@ -138,15 +138,16 @@ button, input, select, textarea {
   --add-btn-bg: rgba(255, 255, 255, 0.03);
   --add-btn-hover-bg: rgba(255, 255, 255, 0.12);
   --add-btn-hover-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-  /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度），
-     仅靠 blur(20px) 毛玻璃与悬浮投影区分弹层 */
-  --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
-  --menu-border: rgba(255, 255, 255, 0.12);
-  --menu-text: #c0c0d0;
-  --menu-hover-bg: rgba(58, 123, 213, 0.35);
+  /* v1.19：浮层（菜单/右键菜单/卡片/面板）一律取共享的「表面」token
+     （见 styles/tokens.css 的 `--sf-*`），不再各自抄一版色值 ——
+     原来是「菜单抄 Dock 的 `--dock-bg-*`、卡片又抄菜单」，三处一改就漂。 */
+  --menu-bg: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  --menu-border: var(--sf-border);
+  --menu-text: var(--sf-text);
+  --menu-hover-bg: var(--sf-accent-hover);
   --menu-hover-text: #fff;
-  --context-hover-bg: rgba(255, 255, 255, 0.08);
-  --divider-bg: rgba(255, 255, 255, 0.1);
+  --context-hover-bg: var(--sf-hover);
+  --divider-bg: var(--sf-line);
   /* 「+」菜单底部的版本号等元信息文字：比 --menu-text 更弱，不跟操作项抢注意力 */
   --menu-meta: rgba(255, 255, 255, 0.42);
   --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
@@ -211,17 +212,10 @@ button, input, select, textarea {
      会继承黑夜的白色系，叠在白玻璃上就是一个发灰的方块 —— 这里显式给淡黑。 */
   --icon-wrap-hover-bg: rgba(0, 0, 0, 0.1);
   --icon-wrap-ring-hover: rgba(0, 0, 0, 0.14);
-  /* 菜单背景与 Dock 完全一致：直接引用 --dock-bg-top/bottom（同色同透明度） */
-  --menu-bg: linear-gradient(180deg, var(--dock-bg-top) 0%, var(--dock-bg-bottom) 100%);
-  --menu-border: rgba(0, 0, 0, 0.12);
-  --menu-text: #333;
-  --menu-hover-bg: rgba(58, 123, 213, 0.22);
-  --menu-hover-text: #1659b0;
-  --context-hover-bg: rgba(0, 0, 0, 0.06);
-  --divider-bg: rgba(0, 0, 0, 0.1);
+  /* v1.19：菜单/浮层的配色跟着「表面」token 走（`--sf-*` 已在 .theme-light 里被覆盖），
+     所以这里不再重复声明背景/描边/文字色 —— 原来那些 override 正是"三种灰"的来源。 */
   /* 白天：白玻璃上用中性灰，太浅会读不清 */
   --menu-meta: rgba(31, 36, 48, 0.5);
-  --menu-shadow: 0 12px 36px rgba(0, 0, 0, 0.2);
   --switch-off-bg: rgba(0, 0, 0, 0.2);
   /* 开机自启动开关配色（与分段选择器强调色统一） */
   --switch-on-bg: #1f2430;
@@ -797,10 +791,10 @@ html[data-glass-fx='off'] .dock-bg::after {
   backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
-  border-radius: 16px;
+  border-radius: var(--sf-radius-sm, 14px);
   padding: 6px 0;
   z-index: 100;
-  box-shadow: var(--menu-shadow);
+  box-shadow: var(--sf-shadow);
   overflow: hidden;
   animation: dropdown-in 0.16s ease-out;
   /* ⚠️ 菜单是「菜单容器 + 可滚动内容」两层（v1.13.7 改）：
@@ -952,10 +946,10 @@ html[data-glass-fx='off'] .dock-bg::after {
   backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
   border: 1px solid var(--menu-border);
-  border-radius: 16px;
+  border-radius: var(--sf-radius-sm, 14px);
   padding: 6px 0;
   z-index: 200;
-  box-shadow: var(--menu-shadow);
+  box-shadow: var(--sf-shadow);
   overflow: hidden;
   /* 两段式：滚动交给 .context-menu-scroll，底部 .context-menu-footer 常驻——
      空间不足时「删除」也永远可见，不会被滚出 200px 的可用高度 */
@@ -1432,11 +1426,11 @@ html[data-glass-fx='off'] .dock-bg::after {
   bottom: 0;
   z-index: 0;
   border-radius: 24px;
-  background: var(--menu-bg);
-  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
-  border: 1px solid var(--dock-border);
-  box-shadow: var(--dock-shadow);
+  background: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  -webkit-backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  border: 1px solid var(--sf-border);
+  box-shadow: var(--sf-shadow);
 }
 
 .group-panel-inner {
@@ -1634,6 +1628,9 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 /* 悬停卡片：与分组面板/菜单同款浮层（底边与高度由 JS 按实测几何设置） */
+/* 悬停卡片（「此电脑」盘符 / 文件夹预览 / 音频设备）共用这一层：
+   几何与材质都来自共享 token —— 这三张卡以前各调各的（18/18/18 圆角、
+   三套 padding、三套 title 字号），放在一起就能看出不齐。 */
 .drives-card {
   position: fixed;
   left: 50%;
@@ -1642,13 +1639,14 @@ html[data-glass-fx='off'] .dock-bg::after {
   width: max-content;
   min-width: 300px;
   max-width: calc(100vw - 32px);
-  padding: 10px 14px;
-  border-radius: 18px;
-  background: var(--menu-bg);
-  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
-  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-sat, 1));
-  border: 1px solid var(--dock-border);
-  box-shadow: var(--dock-shadow);
+  padding: 10px 12px;
+  border-radius: var(--sf-radius, 18px);
+  background: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  -webkit-backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  border: 1px solid var(--sf-border);
+  box-shadow: var(--sf-shadow);
+  color: var(--sf-text);
   overflow-y: auto;
   scrollbar-width: none;
 }
@@ -1660,8 +1658,9 @@ html[data-glass-fx='off'] .dock-bg::after {
 .drives-card-title {
   margin-bottom: 8px;
   font-size: 0.72rem;
+  font-weight: 600;
   letter-spacing: 0.02em;
-  color: var(--label-color);
+  color: var(--sf-text-dim);
 }
 
 .drive-row {
@@ -1716,12 +1715,355 @@ html[data-glass-fx='off'] .dock-bg::after {
 /* 透明风格：卡片不能全透明。白色文字压在白色壁纸/白色文档上会完全看不见，
    给一层半透明深色底 + 轻毛玻璃：浅色壁纸上文字清晰，深色壁纸上仍能透出背景。
    这是可读性兜底，不是把透明主题变回毛玻璃——只在悬停卡片这种「必须读字」的浮层上使用。 */
+/* 透明主题的卡片：不再单独调一档（v1.19 起统一取 `--sf-*`，透明档的那组
+   token 本身就是"深色浮层"），这里只保留文字投影保证浅壁纸可读 */
 .app.theme-transparent .drives-card {
-  background: rgba(16, 20, 28, 0.78);
-  backdrop-filter: blur(var(--glass-blur-sm, 18px)) saturate(var(--glass-sat-sm, 1.2));
-  -webkit-backdrop-filter: blur(var(--glass-blur-sm, 18px)) saturate(var(--glass-sat-sm, 1.2));
-  border-color: rgba(255, 255, 255, 0.16);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  background: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  backdrop-filter: blur(var(--sf-blur, 22px)) saturate(var(--sf-sat, 1.2));
+  -webkit-backdrop-filter: blur(var(--sf-blur, 22px)) saturate(var(--sf-sat, 1.2));
+  border-color: var(--sf-border);
+  box-shadow: var(--sf-shadow);
+}
+
+/* ─── 音频切换卡片（.audio-card 复用 .drives-card 的浮层几何与玻璃观感）─────
+   双栏：左输出、右输入。卡片本身不滚（列内滚），否则页脚会跟着滚出可视区。
+   宽度 460 / 两列各 ~220：在 1200 窗口里左右各有富余，而 340（文件夹卡片）放两列
+   会把设备名压成 8 个字，同名的「扬声器」根本分不出来。 */
+.audio-card {
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  /* 垂直预算（窗口 300px 时卡片上限 ≈202）：上下内边距 8 + 标题 ~14 + 页脚 ~26 = 48，
+     剩 154 给列表 → 5 行 × 30px 全露（实测列表只剩 149 时第 5 行会被切 1px，
+     所以这 2px 不是凑数）。改这里任何一个数字都要重算这行账。 */
+  padding: 5px 8px 3px;
+  overflow: hidden; /* 滚动交给 .audio-list */
+}
+
+.audio-cols {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-height: 0;
+}
+
+.audio-col {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.audio-col-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px 3px;
+  /* 与 .drives-card-title / .folder-card-name 同档标题字 */
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0.02em;
+  color: var(--sf-text-dim);
+}
+
+.audio-count {
+  font-size: 0.62rem;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+}
+
+/* 列内滚动：最多 5 行可见（行高 `--sf-row` = 28 → 140）。
+   `min-height: 0` 让它在卡片被 maxHeight 卡住时能收缩（否则 flex 项不缩、
+   内容顶出卡片后被 overflow: hidden 切掉半行）。 */
+.audio-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: calc(var(--sf-row, 28px) * 5);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.audio-list::-webkit-scrollbar {
+  display: none;
+}
+
+.audio-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  /* 行高与 .folder-row 统一到 `--sf-row`（28px）。5 行 = 140，正好装进卡片预算 */
+  height: var(--sf-row, 28px);
+  margin: 0;
+  padding: 0 6px;
+  border-radius: var(--sf-radius-row, 8px);
+  color: var(--sf-text-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.audio-row:hover {
+  background: var(--sf-hover);
+}
+
+/* 当前默认设备：强调色 + 右侧对勾（与「选中」的框分开表示，避免两个状态抢同一种视觉） */
+.audio-row.current {
+  color: var(--ui-accent-soft, #96c5ee);
+}
+
+/* 键盘光标：内描边，不占布局 */
+.audio-row.cursor {
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 238, 0.75);
+}
+
+.audio-row.pending {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.audio-glyph {
+  display: flex;
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+.audio-text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.15;
+}
+
+.audio-name {
+  overflow: hidden;
+  font-size: 0.74rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.audio-adapter {
+  overflow: hidden;
+  font-size: 0.64rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0.55;
+}
+
+.audio-check {
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+.audio-spinner {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid rgba(127, 127, 127, 0.45);
+  border-top-color: var(--ui-accent-soft, #96c5ee);
+  border-radius: 50%;
+  animation: ql-spin 0.8s linear infinite;
+}
+
+.audio-empty {
+  padding: 8px 6px;
+  font-size: 0.7rem;
+  opacity: 0.6;
+}
+
+.audio-skeleton {
+  height: 10px;
+  margin: 9px 6px;
+  border-radius: 5px;
+  background: linear-gradient(90deg, rgba(127, 127, 127, 0.18), rgba(127, 127, 127, 0.4), rgba(127, 127, 127, 0.18));
+  background-size: 200% 100%;
+  animation: ql-shimmer 1.4s ease-in-out infinite;
+}
+
+.audio-foot {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 4px 4px 0;
+  border-top: 1px solid var(--divider-bg);
+}
+
+.audio-btn {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.68rem;
+  color: var(--label-color);
+  background: rgba(127, 127, 127, 0.16);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.audio-btn:hover {
+  background: rgba(127, 127, 127, 0.3);
+}
+
+.audio-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 页脚：刷新(左) → 键盘提示(弹性) → 声音设置(右) */
+.audio-btn-primary {
+  margin-left: auto;
+}
+
+.audio-tip {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.62rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0.4;
+}
+
+/* Dock 上的音频图标：没有彩色贴图，只能靠字形本身撑住存在感 ——
+   用比标签更亮的前景色 + 一圈暗投影，避免在玻璃条上显得发灰。
+   （图标形态跟随当前默认输出：耳机 / 扬声器 / HDMI） */
+.dock-icon.audio-dock-glyph {
+  color: var(--ui-text, #fff);
+  opacity: 0.92;
+}
+
+.dock-icon.audio-dock-glyph svg {
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.45));
+}
+
+/* ─── 快捷设置卡片（Dock 上的「设置」条目）────────────────────────────────
+   与音频卡同构：460 宽、行高 `--sf-row`、页脚 26。
+   垂直预算：内边距 7 + 6 行 × 28 = 168 + 页脚 26 = 201 ≤ 202（浮层可用高度）。
+   加行/改行高前后都要重算 —— 超 1px 最后一行就会被 `overflow: hidden` 切半。 */
+.quick-card {
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  padding: 4px 8px 3px;
+  overflow: hidden;
+}
+
+.qc-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: calc(var(--sf-row, 28px) * 6);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.qc-list::-webkit-scrollbar {
+  display: none;
+}
+
+.qc-row {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  height: var(--sf-row, 28px);
+  padding: 0 4px;
+}
+
+.qc-label {
+  display: flex;
+  flex: 0 0 74px;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 0.72rem;
+  color: var(--sf-text-dim);
+  white-space: nowrap;
+}
+
+.qc-hint {
+  font-size: 0.62rem;
+  color: var(--sf-text-faint);
+}
+
+.qc-control {
+  display: flex;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+/* 分段控件：与设置窗 `.st-seg` 同一套「淡底 + 亮字」选中态（卡里铺实心蓝会比窗口还重） */
+.qc-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.qc-seg-btn {
+  min-width: 46px;
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  font-size: 0.7rem;
+  color: var(--sf-text-dim);
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+
+.qc-seg-btn:hover {
+  background: var(--sf-hover);
+  color: var(--sf-text);
+}
+
+.qc-seg-btn.active {
+  background: var(--sf-accent-hover);
+  color: var(--ui-accent-soft, #9cc3f5);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(120, 170, 235, 0.24);
+}
+
+/* 开关：与「+」菜单里的 `.item-switch` 同一套配色变量（--switch-*） */
+.qc-switch {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: var(--switch-off-bg);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.qc-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: left 0.2s, background 0.2s;
+}
+
+.qc-switch.on {
+  background: var(--switch-on-bg);
+}
+
+.qc-switch.on .qc-switch-knob {
+  left: 15px;
+  background: var(--switch-on-knob);
 }
 
 /* ─── 文件夹悬停预览卡片 ────────────────────────────────────────────── */
@@ -1754,29 +2096,31 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .folder-card-name {
   overflow: hidden;
-  font-size: 0.8rem;
+  /* 与 .drives-card-title / .audio-col-title 统一到同一档标题字 */
+  font-size: 0.72rem;
   font-weight: 600;
+  letter-spacing: 0.02em;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--label-color);
+  color: var(--sf-text);
 }
 
 .folder-card-path {
   overflow: hidden;
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--label-color);
-  opacity: 0.6;
+  color: var(--sf-text-dim);
+  opacity: 0.85;
 }
 
 .folder-card-open {
   flex: 0 0 auto;
   padding: 3px 9px;
-  border-radius: 8px;
+  border-radius: var(--sf-radius-row, 8px);
   font-size: 0.7rem;
-  color: var(--label-color);
-  background: rgba(127, 127, 127, 0.18);
+  color: var(--sf-text-dim);
+  background: var(--sf-hover);
   cursor: pointer;
   transition: background 0.15s;
 }
@@ -1788,21 +2132,22 @@ html[data-glass-fx='off'] .dock-bg::after {
 .folder-card-sub {
   margin-bottom: 6px;
   padding-right: 4px;
-  font-size: 0.7rem;
-  color: var(--label-color);
-  opacity: 0.7;
+  font-size: 0.68rem;
+  color: var(--sf-text-dim);
+  opacity: 0.85;
 }
 
-/* 子项行：图标 + 名字（省略号）+ 右列大小/类型；悬停高亮一行 */
+/* 子项行：图标 + 名字（省略号）+ 右列大小/类型；悬停高亮一行。
+   行高取 `--sf-row`（28px），与音频卡片的行同一档 —— 两张卡并排时不齐。 */
 .folder-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 26px;
+  height: var(--sf-row, 28px);
   padding: 0 6px 0 4px;
-  border-radius: 7px;
-  font-size: 0.75rem;
-  color: var(--label-color);
+  border-radius: var(--sf-radius-row, 8px);
+  font-size: 0.74rem;
+  color: var(--sf-text-dim);
   cursor: default;
   transition: background 0.12s;
   /* 卡片最多列 400 行，每行一个 17px 的 <img>：一次全量布局/paint 会让卡片弹出那几帧
@@ -1814,7 +2159,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 }
 
 .folder-row:hover {
-  background: rgba(127, 127, 127, 0.2);
+  background: var(--sf-hover);
 }
 
 .folder-row-icon {
@@ -1859,9 +2204,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 .folder-card-more {
   margin-top: 6px;
   padding-right: 4px;
-  font-size: 0.68rem;
-  color: var(--label-color);
-  opacity: 0.6;
+  font-size: 0.66rem;
+  color: var(--sf-text-faint);
 }
 
 /* ─── 拖入文件添加（外部拖放） ──────────────────────────────────────── */
@@ -1924,13 +2268,16 @@ html[data-glass-fx='off'] .dock-bg::after {
   align-items: center;
   gap: 10px;
   padding: 7px 8px 7px 14px;
-  border-radius: 12px;
-  background: var(--ui-surface, rgba(24, 28, 38, 0.94));
-  border: 1px solid var(--ui-surface-border, rgba(255, 255, 255, 0.1));
-  color: var(--ui-text, #fff);
-  font-size: 0.8rem;
+  border-radius: var(--sf-radius-sm, 14px);
+  /* 与卡片/菜单同一套表面材质（原来是 .94 的实心深色，比 Dock 上所有浮层都重） */
+  background: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  -webkit-backdrop-filter: blur(var(--sf-blur, 26px)) saturate(var(--sf-sat, 1.35));
+  border: 1px solid var(--sf-border);
+  color: var(--sf-text);
+  font-size: 0.78rem;
   white-space: nowrap;
-  box-shadow: var(--ui-shadow-lg, 0 10px 26px rgba(0, 0, 0, 0.4));
+  box-shadow: var(--sf-shadow);
   animation: undo-toast-in 0.16s ease-out;
 }
 

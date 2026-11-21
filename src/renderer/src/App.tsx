@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react'
-import { DEFAULT_SETTINGS, type AppEntry, type AppSettings, type DriveInfo } from '../../shared/types'
+import { DEFAULT_SETTINGS, type AppEntry, type AppSettings, type AudioDevice, type AudioSnapshot, type DriveInfo } from '../../shared/types'
 import FolderCard, { type FolderCardState } from './FolderCard'
+import AudioCard, { AudioGlyph, audioDisplayName } from './AudioCard'
+import SettingsCard from './SettingsCard'
 import { pushFolderIcons } from './folderIcons'
 import { normPath } from './format'
 import { reportClientError } from './errors'
@@ -154,13 +156,26 @@ function dockItemIdAt(x: number, y: number): number | null {
   return Number.isFinite(id) ? id : null
 }
 
+/** 「音频」虚拟条目（没有真实目标，点击打开设备切换卡片而不是启动进程）。
+ *  ⚠️ 判断要同时看 `specialType` 与 `targetPath`：把音频拖进分组时，合并逻辑会
+ *  `delete member.specialType`（此电脑/回收站同理），进组后就只剩 `ql:audio` 这个路径了，
+ *  只认 specialType 的话组里的音频成员会变成「点一下去启动一个叫 ql:audio 的程序」。 */
+export function isAudioEntry(app: Pick<AppEntry, 'specialType' | 'targetPath'>): boolean {
+  return app.specialType === 'audio' || app.targetPath === 'ql:audio'
+}
+
+/** 「设置」虚拟条目：点开贴在 Dock 上方的快捷设置卡（和音频条目同一套判断理由） */
+export function isSettingsEntry(app: Pick<AppEntry, 'specialType' | 'targetPath'>): boolean {
+  return app.specialType === 'settings' || app.targetPath === 'ql:settings'
+}
+
 /**
  * 这个条目能不能「接收被拖入的文件」（C2：拖上去松手 = 用它打开）。
- * 不能的几类：分隔线、分组、系统位置（此电脑/回收站没有可执行目标）、空路径，
+ * 不能的几类：分隔线、分组、系统位置（此电脑/回收站没有可执行目标）、音频虚拟条目、空路径，
  * 以及 URL/mailto 这类没有「程序」概念的条目。
  */
 function canOpenWith(app: AppEntry): boolean {
-  if (app.isSeparator || app.isGroup || app.specialType) return false
+  if (app.isSeparator || app.isGroup || app.specialType || isAudioEntry(app) || isSettingsEntry(app)) return false
   const target = (app.targetPath || '').trim()
   if (!target) return false
   if (/^(https?|ftp|steam):\/\/|^mailto:/i.test(target)) return false
@@ -560,6 +575,145 @@ function App(): React.ReactElement {
     if (dropHintTimer.current) clearTimeout(dropHintTimer.current)
   }, [])
 
+  // ─── 音频设备（「音频」系统条目 + 输出/输入切换卡片）─────────────────────
+  // 一次枚举要起 PowerShell（实测 ~0.9s），所以：启动后 8s 预热一次（避开 4s 的 listDrives，
+  // 两者都是 PowerShell 冷启动，撞在一起会把首屏拖慢），卡片打开读缓存，切换后强制刷新。
+  // 主进程侧还有 3s 缓存 + 请求合并，这里再加一层只是为了避免「反复开关卡片」也去问一遍。
+  const [audioSnapshot, setAudioSnapshot] = useState<AudioSnapshot | null>(null)
+  const [audioCardOpen, setAudioCardOpen] = useState(false)
+  const [audioCardLeft, setAudioCardLeft] = useState<number | null>(null)
+  const [audioLoading, setAudioLoading] = useState(false)
+  const [audioPendingId, setAudioPendingId] = useState<string | null>(null)
+  const audioCardTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const audioCardRef = useRef<HTMLDivElement>(null)
+
+  const loadAudio = useCallback((force = false): Promise<AudioSnapshot | null> => {
+    setAudioLoading(true)
+    return window.api
+      .listAudioDevices(force)
+      .then((snap) => { setAudioSnapshot(snap); return snap })
+      .catch(() => null)
+      .finally(() => setAudioLoading(false))
+  }, [])
+
+  useEffect(() => {
+    const t = setTimeout(() => { void loadAudio(false) }, 8000)
+    return () => clearTimeout(t)
+  }, [loadAudio])
+
+  /** 当前默认输出设备：图标形态（耳机/扬声器/HDMI）与悬浮标签都用它 */
+  const defaultRender = useMemo(
+    () => audioSnapshot?.render.find((d) => d.isDefault) ?? null,
+    [audioSnapshot]
+  )
+
+  const openAudioCardNow = useCallback((anchorX?: number) => {
+    if (audioCardTimer.current) { clearTimeout(audioCardTimer.current); audioCardTimer.current = null }
+    if (typeof anchorX === 'number') setAudioCardLeft(anchorX)
+    void loadAudio(false)
+    setAudioCardOpen(true)
+  }, [loadAudio])
+
+  /** 悬停开卡片：450ms 延迟（比盘符卡片的 300ms 更保守 —— 卡片有 460×200，
+   *  鼠标划过 Dock 时不该闪一下）；拖拽/拖入途中不弹 */
+  const openAudioCard = useCallback((anchorX: number) => {
+    if (audioCardOpen) return
+    if (audioCardTimer.current) clearTimeout(audioCardTimer.current)
+    audioCardTimer.current = setTimeout(() => {
+      audioCardTimer.current = null
+      if (dragStartedRef.current || fileDragOverRef.current) return
+      openAudioCardNow(anchorX)
+    }, 450)
+  }, [audioCardOpen, openAudioCardNow])
+
+  const closeAudioCard = useCallback(() => {
+    if (audioCardTimer.current) { clearTimeout(audioCardTimer.current); audioCardTimer.current = null }
+    setAudioCardOpen(false)
+  }, [])
+
+  /** 延迟关闭：鼠标从图标移到卡片上时会先离开图标，给 150ms 宽限 */
+  const scheduleCloseAudioCard = useCallback(() => {
+    if (audioCardTimer.current) clearTimeout(audioCardTimer.current)
+    audioCardTimer.current = setTimeout(() => {
+      audioCardTimer.current = null
+      setAudioCardOpen(false)
+    }, 150)
+  }, [])
+
+  useEffect(() => () => {
+    if (audioCardTimer.current) clearTimeout(audioCardTimer.current)
+  }, [])
+
+  /** 切换默认设备：先乐观把对勾挪过去（PowerShell 一次 ~0.9s，等它回来再挪太迟钝），
+   *  pending 期间该行显示 spinner；主进程返回后强刷列表，失败时列表会把对勾自然挪回来。 */
+  const handlePickAudioDevice = useCallback((device: AudioDevice) => {
+    if (audioPendingId) return
+    setAudioPendingId(device.id)
+    setAudioSnapshot((prev) => {
+      if (!prev) return prev
+      const mark = (list: AudioDevice[]): AudioDevice[] =>
+        list.map((d) => (d.flow === device.flow ? { ...d, isDefault: d.id === device.id } : d))
+      return { render: mark(prev.render), capture: mark(prev.capture) }
+    })
+    window.api
+      .setDefaultAudioDevice(device.id, [0, 1, 2])
+      .then((ok) => {
+        if (!ok) showDropHint('切换失败：设备可能已断开，已刷新列表')
+        return loadAudio(true)
+      })
+      .catch(() => showDropHint('切换失败：音频服务没有响应'))
+      .finally(() => setAudioPendingId(null))
+  }, [audioPendingId, loadAudio, showDropHint])
+
+  const openSoundSettings = useCallback(() => {
+    // ms-settings: 是 URI，走专门的 IPC（open-path 是文件路径语义，且会不经三态直接藏 Dock）
+    closeAudioCard()
+    void window.api.openSoundSettings().catch(() => {})
+  }, [closeAudioCard])
+
+  // ─── 快捷设置（Dock 上的「设置」条目）───────────────────────────────────
+  // 与音频卡同一套开合与锚定；内容只有 6 项「改完立刻能看到」的设置，
+  // 完整表单仍在独立窗口里（`完整设置…` 按钮 = 原来的 handleOpenSettings）。
+  const [settingsCardOpen, setSettingsCardOpen] = useState(false)
+  const [settingsCardLeft, setSettingsCardLeft] = useState<number | null>(null)
+  const settingsCardTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const settingsCardRef = useRef<HTMLDivElement>(null)
+
+  const openSettingsCardNow = useCallback((anchorX?: number) => {
+    if (settingsCardTimer.current) { clearTimeout(settingsCardTimer.current); settingsCardTimer.current = null }
+    if (typeof anchorX === 'number') setSettingsCardLeft(anchorX)
+    setSettingsCardOpen(true)
+  }, [])
+
+  /** 悬停开卡片：450ms（与音频卡同档）；拖拽/拖入途中不弹 */
+  const openSettingsCard = useCallback((anchorX: number) => {
+    if (settingsCardOpen) return
+    if (settingsCardTimer.current) clearTimeout(settingsCardTimer.current)
+    settingsCardTimer.current = setTimeout(() => {
+      settingsCardTimer.current = null
+      if (dragStartedRef.current || fileDragOverRef.current) return
+      openSettingsCardNow(anchorX)
+    }, 450)
+  }, [settingsCardOpen, openSettingsCardNow])
+
+  const closeSettingsCard = useCallback(() => {
+    if (settingsCardTimer.current) { clearTimeout(settingsCardTimer.current); settingsCardTimer.current = null }
+    setSettingsCardOpen(false)
+  }, [])
+
+  const scheduleCloseSettingsCard = useCallback(() => {
+    if (settingsCardTimer.current) clearTimeout(settingsCardTimer.current)
+    settingsCardTimer.current = setTimeout(() => {
+      settingsCardTimer.current = null
+      setSettingsCardOpen(false)
+    }, 150)
+  }, [])
+
+  useEffect(() => () => {
+    if (settingsCardTimer.current) clearTimeout(settingsCardTimer.current)
+  }, [])
+
+
   // 兜底：拖到透明区/菜单上时不让 Chromium 执行「导航到文件」的默认行为（会白屏）
   // 同时把非 Dock 区域的 dropEffect 置 none —— 光标显示「禁止」，明确「只有 Dock 栏能放」
   useEffect(() => {
@@ -678,6 +832,10 @@ function App(): React.ReactElement {
     contextMenu ||
     folderCard ||
     showDrivesCard ||
+    // 音频卡片：460×~210 的浮层，整块落在玻璃条上方的透明带里。
+    // 漏了它就会「画得出、点不动」（.drop-hint 那次事故的同一类）
+    audioCardOpen ||
+    settingsCardOpen ||
     openGroupId !== null ||
     fileDragOver ||
     dropHint ||
@@ -996,7 +1154,9 @@ function App(): React.ReactElement {
     // 300ms 的「悬停开卡片」计时器，否则卡片会在按下鼠标后自己弹出来
     closeDrivesCard()
     closeFolderCard()
-  }, [closeDrivesCard, closeFolderCard])
+    closeAudioCard()
+    closeSettingsCard()
+  }, [closeDrivesCard, closeFolderCard, closeAudioCard, closeSettingsCard])
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -1340,6 +1500,10 @@ function App(): React.ReactElement {
     // 另外 handleDocumentMouseDown 里点「+」是 early-return 的，不会替我们关右键菜单。
     setContextMenu(null)
     setOpenGroupId(null)
+    // 音频卡片也是同一条带里的浮层，菜单打开时收起来（它自己也会 hidden，
+    // 但收起更干净：菜单里点完「设置…」后不应该还留着一张设备卡片）
+    closeAudioCard()
+    closeSettingsCard()
     const rect = btn.getBoundingClientRect()
     setMenuPos({ cx: rect.left + rect.width / 2, top: rect.top })
     // 菜单打开时退出键盘导航（与右键菜单同理）：否则选中框被菜单盖住，
@@ -1356,7 +1520,7 @@ function App(): React.ReactElement {
     window.api.getAutoStart().then((v) => {
       if (typeof v === 'boolean' && !autoStartDirtyRef.current) setAutoStart(v)
     }).catch(() => {})
-  }, [menuPos])
+  }, [menuPos, closeAudioCard])
 
   // 切换桌面图标显隐（乐观更新：点击立即切换文案，IPC 结果再校正）
   const handleToggleDesktopIcons = () => {
@@ -1596,6 +1760,20 @@ function App(): React.ReactElement {
     }
     // 分隔符：不启动任何东西（点击/Enter 均无效）
     if (app.isSeparator) return
+    // 音频条目：不启动进程，直接开设备切换卡片（锚到它自己的图标中心）
+    if (isAudioEntry(app)) {
+      const el = iconRefs.current.get(app.id)
+      const r = el?.getBoundingClientRect()
+      openAudioCardNow(r ? r.left + r.width / 2 : undefined)
+      return
+    }
+    // 「设置」条目：同理，开快捷设置卡片
+    if (isSettingsEntry(app)) {
+      const el = iconRefs.current.get(app.id)
+      const r = el?.getBoundingClientRect()
+      openSettingsCardNow(r ? r.left + r.width / 2 : undefined)
+      return
+    }
     // 启动任意条目（尤其是点面板成员）前先收起子 Dock：主进程 run-app 会立刻把窗口
     // 隐藏到托盘，如果这里不复位 openGroupId，下次唤回 Dock 时子面板会原样挂着。
     if (openGroupId !== null) closeGroupPanel()
@@ -1648,7 +1826,7 @@ function App(): React.ReactElement {
         flagLaunchFailed()
         showDropHint('启动失败：目标不存在或无法运行')
       })
-  }, [dragId, openGroupId, closeGroupPanel, showDropHint])
+  }, [dragId, openGroupId, closeGroupPanel, showDropHint, openAudioCardNow, openSettingsCardNow])
 
   // 右键条目：stopPropagation 防止冒泡到 .dock 的空白区菜单（否则两个菜单状态互相覆盖）
   const handleContextMenu = (e: React.MouseEvent, id: number) => {
@@ -1662,6 +1840,8 @@ function App(): React.ReactElement {
     // 右键菜单弹出后自己冒出来）
     closeDrivesCard()
     closeFolderCard()
+    closeAudioCard()
+    closeSettingsCard()
     setContextMenu({ x: e.clientX, y: e.clientY, appId: id })
   }
 
@@ -2088,9 +2268,13 @@ function App(): React.ReactElement {
       const existing = new Set(baseline.map((a) => normPath(a.targetPath)))
       const fresh = found.filter((f) => !existing.has(normPath(f.path)))
       if (fresh.length === 0) return
-      // 固定顺序：此电脑 → 回收站 → 文件夹（其余保持扫描顺序）
-      const rank = (f: { specialType?: 'this-pc' | 'recycle-bin' }): number =>
-        f.specialType === 'this-pc' ? 0 : f.specialType === 'recycle-bin' ? 1 : 2
+      // 固定顺序：此电脑 → 音频 → 设置 → 回收站 → 文件夹（其余保持扫描顺序）
+      const rank = (f: { specialType?: 'this-pc' | 'recycle-bin' | 'audio' | 'settings' }): number =>
+        f.specialType === 'this-pc' ? 0
+          : f.specialType === 'audio' ? 1
+            : f.specialType === 'settings' ? 2
+              : f.specialType === 'recycle-bin' ? 3
+                : 4
       fresh.sort((a, b) => rank(a) - rank(b))
       // 显式标注 AppEntry[]：否则 map 推断出「带 specialType」/「带 isFolder」两个对象形状的
       // 联合类型，下面 add.filter((e) => e.specialType) 会在缺该字段的分支上报 TS2339
@@ -2099,14 +2283,15 @@ function App(): React.ReactElement {
         // **直接用主进程扫描返回的真实图标**。v1.12.0 这里曾写成哨兵（想省内存），
         // 结果把唯一一份真图标丢掉了、哨兵又解析成空串 → 首次安装后文件夹图标永久空白。
         // 现在每条自帶真图标；万一主进程没给（提取失败），才回落到共享的那一枚。
-        iconDataUrl: f.iconDataUrl || sharedFolderIcon,
+        // 音频条目例外：它没有图标文件，图标由渲染端按当前默认设备的形态现画。
+        iconDataUrl: f.specialType === 'audio' ? '' : (f.iconDataUrl || sharedFolderIcon),
         targetPath: f.path,
         arguments: '',
         workingDirectory: '',
         description: f.name,
-        // 系统位置（此电脑/回收站）保留 specialType；桌面文件夹标 isFolder
+        // 系统位置（此电脑/音频/回收站）保留 specialType；桌面文件夹标 isFolder
         ...(f.specialType
-          ? { specialType: f.specialType as 'this-pc' | 'recycle-bin' }
+          ? { specialType: f.specialType as 'this-pc' | 'recycle-bin' | 'audio' | 'settings' }
           : { isFolder: true })
       }))
       setApps((prev) => {
@@ -2115,10 +2300,15 @@ function App(): React.ReactElement {
         const have = new Set(prev.map((a) => normPath(a.targetPath)))
         const add = entries.filter((e) => !have.has(normPath(e.targetPath)))
         if (add.length === 0) return prev
-        // - 系统位置区块（此电脑 → 回收站，稳定排序保持相对顺序）+ 新文件夹 + 其余。
-        //   保证 Dock 前部固定为 此电脑 → 回收站 → 文件夹；若用户手动拖动过系统位置，
+        // - 系统位置区块（此电脑 → 音频 → 设置 → 回收站，稳定排序保持相对顺序）+ 新文件夹 + 其余。
+        //   保证 Dock 前部固定为这个次序；若用户手动拖动过系统位置，
         //   本次合并会把它们归位到区块前部（与固定顺序设计一致）
-        const spRank = (e: AppEntry): number => (e.specialType === 'this-pc' ? 0 : 1)
+        const spRank = (e: AppEntry): number =>
+          e.specialType === 'this-pc' ? 0
+            : e.specialType === 'audio' ? 1
+              : e.specialType === 'settings' ? 2
+                : e.specialType === 'recycle-bin' ? 3
+                  : 4
         const specialBlock = [...prev.filter((a) => a.specialType), ...add.filter((e) => e.specialType)]
           .sort((a, b) => spRank(a) - spRank(b))
         const newFolders = add.filter((e) => !e.specialType)
@@ -2644,6 +2834,12 @@ function App(): React.ReactElement {
                       }
                       if (app.specialType === 'this-pc') {
                         openDrivesCard()
+                      } else if (isAudioEntry(app)) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openAudioCard(r.left + r.width / 2)
+                      } else if (isSettingsEntry(app)) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openSettingsCard(r.left + r.width / 2)
                       } else if (app.isFolder && app.targetPath) {
                         const r = e.currentTarget.getBoundingClientRect()
                         openFolderCard(app, r.left + r.width / 2)
@@ -2651,11 +2847,13 @@ function App(): React.ReactElement {
                     }}
                     onMouseLeave={app.specialType === 'this-pc'
                       ? scheduleCloseDrivesCard
-                      : app.isFolder && app.targetPath ? scheduleCloseFolderCard
-                        : app.isGroup ? () => {
-                          groupHoverRef.current = false
-                          if (openGroupId === app.id) schedulePanelAutoClose()
-                        } : undefined}
+                      : isAudioEntry(app) ? scheduleCloseAudioCard
+                        : isSettingsEntry(app) ? scheduleCloseSettingsCard
+                          : app.isFolder && app.targetPath ? scheduleCloseFolderCard
+                            : app.isGroup ? () => {
+                              groupHoverRef.current = false
+                              if (openGroupId === app.id) schedulePanelAutoClose()
+                            } : undefined}
                     // 不设 title：App 自己有胶囊悬浮标签，再叠加系统的原生 tooltip 会变成
                     // 光标下方多出一个灰色提示框（与标签重复，观感也差）
                   >
@@ -2686,6 +2884,34 @@ function App(): React.ReactElement {
                             </div>
                           )
                         })()
+                      ) : isAudioEntry(app) ? (
+                        // 音频条目没有图标文件：按「当前默认输出设备」的形态现画
+                        // （耳机 / 扬声器 / HDMI），这样「现在插的是耳机」直接长在 Dock 上
+                        <div className="dock-icon group-glyph audio-dock-glyph" aria-hidden="true">
+                          <AudioGlyph
+                            formFactor={defaultRender?.formFactor ?? 1}
+                            flow="render"
+                            size={Math.round(settings.iconSize * 0.5)}
+                          />
+                        </div>
+                      ) : isSettingsEntry(app) ? (
+                        // 「设置」条目也没有图标文件：画一个齿轮（与设置窗左栏同一套线性图标语言）
+                        <div className="dock-icon group-glyph audio-dock-glyph" aria-hidden="true">
+                          <svg
+                            width={Math.round(settings.iconSize * 0.5)}
+                            height={Math.round(settings.iconSize * 0.5)}
+                            viewBox="0 0 16 16"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <path d="M2.5 5h11M2.5 11h11" />
+                            <circle cx="6" cy="5" r="1.7" fill="currentColor" stroke="none" />
+                            <circle cx="10.5" cy="11" r="1.7" fill="currentColor" stroke="none" />
+                          </svg>
+                        </div>
                       ) : (
                         <img className="dock-icon" src={iconSrc(app)} alt="" draggable={false} />
                       )}
@@ -2708,7 +2934,13 @@ function App(): React.ReactElement {
                     <span className="dock-label">
                       {app.specialType === 'this-pc' && driveSummary
                         ? `此电脑 · 可用 ${fmtSize(driveSummary.free)} / ${fmtSize(driveSummary.total)}`
-                        : (app.description || '未命名')}
+                        : isAudioEntry(app)
+                          ? (defaultRender
+                            ? `音频 · ${audioDisplayName(defaultRender)}`
+                            : '音频')
+                          : isSettingsEntry(app)
+                            ? `设置 · ${settings.theme === 'light' ? '白天' : settings.theme === 'transparent' ? '透明' : '黑夜'}`
+                            : (app.description || '未命名')}
                     </span>
                   </div>
                   {/* 落点在这条之后（slot 已自增，所以比的是 mySlot + 1） */}
@@ -2821,6 +3053,12 @@ function App(): React.ReactElement {
                       clampDockLabel(e.currentTarget as HTMLElement)
                       if (m.specialType === 'this-pc') {
                         openDrivesCard()
+                      } else if (isAudioEntry(m)) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openAudioCard(r.left + r.width / 2)
+                      } else if (isSettingsEntry(m)) {
+                        const r = e.currentTarget.getBoundingClientRect()
+                        openSettingsCard(r.left + r.width / 2)
                       } else if (m.isFolder && m.targetPath) {
                         const r = e.currentTarget.getBoundingClientRect()
                         openFolderCard(m, r.left + r.width / 2)
@@ -2828,11 +3066,40 @@ function App(): React.ReactElement {
                     }}
                     onMouseLeave={m.specialType === 'this-pc'
                       ? scheduleCloseDrivesCard
-                      : m.isFolder && m.targetPath ? scheduleCloseFolderCard : undefined}
+                      : isAudioEntry(m) ? scheduleCloseAudioCard
+                        : isSettingsEntry(m) ? scheduleCloseSettingsCard
+                          : m.isFolder && m.targetPath ? scheduleCloseFolderCard : undefined}
                     // 同主 Dock：不设 title，避免系统原生 tooltip 与胶囊标签重复
                   >
                     <div className="dock-icon-wrap">
-                      <img className="dock-icon" src={iconSrc(m)} alt="" draggable={false} />
+                      {isAudioEntry(m) ? (
+                        <div className="dock-icon group-glyph audio-dock-glyph" aria-hidden="true">
+                          <AudioGlyph
+                            formFactor={defaultRender?.formFactor ?? 1}
+                            flow="render"
+                            size={Math.round(settings.iconSize * 0.5)}
+                          />
+                        </div>
+                      ) : isSettingsEntry(m) ? (
+                        <div className="dock-icon group-glyph audio-dock-glyph" aria-hidden="true">
+                          <svg
+                            width={Math.round(settings.iconSize * 0.5)}
+                            height={Math.round(settings.iconSize * 0.5)}
+                            viewBox="0 0 16 16"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <path d="M2.5 5h11M2.5 11h11" />
+                            <circle cx="6" cy="5" r="1.7" fill="currentColor" stroke="none" />
+                            <circle cx="10.5" cy="11" r="1.7" fill="currentColor" stroke="none" />
+                          </svg>
+                        </div>
+                      ) : (
+                        <img className="dock-icon" src={iconSrc(m)} alt="" draggable={false} />
+                      )}
                     </div>
                     <span className="dock-label">{m.description || '未命名'}</span>
                   </div>
@@ -2860,6 +3127,79 @@ function App(): React.ReactElement {
           </div>
         </div>
       )}
+
+      {/* 音频设备切换卡片：双栏（输出 / 输入），点一行即切默认。
+          几何与「此电脑」盘符卡片同源（贴玻璃条外侧 8px、高度吃 overlayAvail），
+          只是更宽（460）并水平锚在「音频」图标中心。 */}
+      {audioCardOpen && (() => {
+        const W = 460
+        const half = W / 2
+        const raw = audioCardLeft ?? window.innerWidth / 2
+        const left = Math.min(Math.max(raw, half + 8), Math.max(half + 8, window.innerWidth - half - 8))
+        return (
+          <AudioCard
+            snapshot={audioSnapshot}
+            loading={audioLoading}
+            pendingId={audioPendingId}
+            style={{
+              ...(isTop ? { top: overlayTopOffset, bottom: 'auto' } : { bottom: overlayBottomOffset, top: 'auto' }),
+              left,
+              transform: 'translateX(-50%)',
+              width: W,
+              maxHeight: overlayAvail,
+              height: 'auto'
+            }}
+            // 与菜单互斥：菜单打开时卡片挪到 hidden（保留状态，关菜单立刻回来）
+            hidden={Boolean(menuPos || contextMenu)}
+            cardRef={audioCardRef}
+            onPick={handlePickAudioDevice}
+            onRefresh={() => { void loadAudio(true) }}
+            onOpenSystem={openSoundSettings}
+            onEnter={() => {
+              // 鼠标移进卡片：取消「移开图标后 150ms 自动关」
+              if (audioCardTimer.current) { clearTimeout(audioCardTimer.current); audioCardTimer.current = null }
+            }}
+            onLeave={closeAudioCard}
+            onClose={closeAudioCard}
+          />
+        )
+      })()}
+
+      {/* 快捷设置卡片：与音频卡同构（460 宽、6 行 + 页脚），
+          页脚的「完整设置…」打开原来那扇独立窗口（完整表单放不进 202px）。 */}
+      {settingsCardOpen && (() => {
+        const W = 460
+        const half = W / 2
+        const raw = settingsCardLeft ?? window.innerWidth / 2
+        const left = Math.min(Math.max(raw, half + 8), Math.max(half + 8, window.innerWidth - half - 8))
+        return (
+          <SettingsCard
+            settings={settings}
+            autoStart={autoStart}
+            style={{
+              ...(isTop ? { top: overlayTopOffset, bottom: 'auto' } : { bottom: overlayBottomOffset, top: 'auto' }),
+              left,
+              transform: 'translateX(-50%)',
+              width: W,
+              maxHeight: overlayAvail,
+              height: 'auto'
+            }}
+            hidden={Boolean(menuPos || contextMenu)}
+            cardRef={settingsCardRef}
+            onPatch={patchSettings}
+            onToggleAutoStart={handleToggleAutoStart}
+            onOpenWindow={() => {
+              closeSettingsCard()
+              handleOpenSettings()
+            }}
+            onEnter={() => {
+              if (settingsCardTimer.current) { clearTimeout(settingsCardTimer.current); settingsCardTimer.current = null }
+            }}
+            onLeave={closeSettingsCard}
+            onClose={closeSettingsCard}
+          />
+        )
+      })()}
 
       {/* 「此电脑」悬停卡片：列出各盘符与用量条。复用面板/菜单的浮层几何
           （贴在 Dock 毛玻璃条外侧，高度上限 = 可用空间），不改变窗口尺寸 */}
@@ -2994,7 +3334,6 @@ function App(): React.ReactElement {
         onAddFolder={handleAddFolder}
         onToggleDesktopIcons={handleToggleDesktopIcons}
         onToggleAutoStart={handleToggleAutoStart}
-        onOpenSettings={handleOpenSettings}
         onOpenLogDir={handleOpenLogDir}
         onExportDiagnostics={handleExportDiagnostics}
         onCheckUpdate={handleCheckUpdate}
@@ -3072,6 +3411,31 @@ function App(): React.ReactElement {
                 </div>
               </div>
             </>
+          ) : viewCtxApp && isAudioEntry(viewCtxApp) ? (
+            // 音频是虚拟条目：没有路径、不能编辑/删除（删了下一次桌面扫描又会回来）。
+            // 只给「打开面板」和「刷新列表」两个真正有用的动作。
+            <div className="context-menu-scroll">
+              <button
+                className="context-menu-item"
+                onClick={() => {
+                  setContextMenu(null)
+                  openAudioCardNow()
+                }}
+              >
+                打开音频面板
+              </button>
+              <button
+                className="context-menu-item"
+                onClick={() => {
+                  setContextMenu(null)
+                  void loadAudio(true)
+                }}
+              >
+                刷新设备列表
+              </button>
+              <div className="context-menu-divider" />
+              <button className="context-menu-item" onClick={openSoundSettings}>打开系统声音设置</button>
+            </div>
           ) : viewCtxApp?.isGroup ? (
             // 分组条目没有「删除」（用「解散分组」），所以整块都是滚动内容
             <div className="context-menu-scroll">

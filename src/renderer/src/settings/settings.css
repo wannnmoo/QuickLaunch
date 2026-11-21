@@ -6,15 +6,14 @@
  *   **所有 html/body/#root 级规则都必须挂在 `html[data-win='settings']` 下面**，
  *   否则 Dock 那扇透明窗口会被刷成不透明深色块（dock 窗口没有这个属性）。
  *
- * ── 与 Dock 的统一是「抄数值」，不是「共用类」 ──────────────────────────
- * 两边的材质必须肉眼一致，所以这里的取值直接对齐 App.css 的 `.app` 主题块：
- *   黑夜  --dock-bg-top rgba(38,44,64,.7) / --dock-bg-bottom rgba(23,28,42,.62)
- *   白天  rgba(252,252,254,.68) / rgba(238,241,248,.46)
- *   blur 36px + saturate 1.7（Dock 的 --dock-sat），圆角 24px（Dock 玻璃条同值）
- *   正文 #fff、次要 rgba(255,255,255,.62)（Dock 的 --label-color）、强调 #3b7bd5（Dock 图标主色）
- * **改 App.css 的主题变量时，这里要同步改一遍**（没有跨文件共享变量：Dock 用的是
- * `.app.theme-*` 作用域下的 `--dock-*`，设置窗根节点是 `.st`，取不到）。不要为此把
- * 两套 CSS 硬串起来 —— 那种「一个变量被两处覆盖」的结构比重复四个数值更难维护。
+ * ── 与 Dock 的统一：**共用 surface token**（v1.19 改，别再抄数值）──────────
+ * 以前这里是「抄数值不共用类」，理由是两套 CSS 串起来难维护。实践结论相反：
+ * 抄出来的结果是同一个应用里三块面板三种灰（用户原话「配色厚重、不统一」）。
+ * 现在表面材质（底色/描边/投影/毛玻璃/文字色/行高/圆角）全部来自
+ * `styles/tokens.css` 的 `--sf-*`，Dock 的菜单/卡片/撤销条用的是同一组；
+ * 这里只保留设置窗独有的几项（强调色、轨道色、rim、加强分隔线）。
+ * ⚠️ 别名必须声明在 `.st` 上而不是 `:root`：`var()` 在**声明它的元素**上求值，
+ *    `:root` 拿不到 `--sf-*`，整条会变成 guaranteed-invalid（背景直接不渲染）。
  *
  * 关键尺寸（改这里先读）：
  *   - 整窗 480×340（用户要求「比 720×508 再小三分之一」），标题栏 34px；
@@ -26,29 +25,13 @@
  *   - 页脚 32px、按钮 24px 高 —— 用户嫌原来 42px 那栏太占高度。
  */
 
+/* ⚠️ 设置窗的**全部**色值现在都在下面 `.st` / `.st[data-theme=…]` 块里，
+   并且引用共享的 `--sf-*`（见 styles/tokens.css）。这里只留 body 的首帧兜底：
+   窗口背景是 --sf-fill-*（见 `.st`），改这里等于同时改 Dock 上的卡片与菜单。 */
 :root {
-  /* 毛玻璃黑夜（默认，与 Dock 的 theme=dark 同色） */
-  /* 比 Dock 玻璃条更实一点：Dock 只有 76px 高、背景是满屏桌面；
-     设置窗是 480×340 的大面积，62% 会让壁纸颜色透上来把整块玻璃搅成脏灰。
-     实测 0.9 还能看出壁纸在动，0.7 就开始发浑（真实壁纸截图对比过）。 */
-  --st-glass: linear-gradient(180deg, rgba(32, 37, 51, 0.9) 0%, rgba(20, 24, 34, 0.93) 100%);
-  --st-blur: 30px;
-  --st-sat: 1.15;
-  --st-glass-line: rgba(255, 255, 255, 0.12);
-  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.22);
-  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.3);
-  --st-panel: rgba(255, 255, 255, 0.04);
-  --st-elev: rgba(255, 255, 255, 0.08);
-  --st-line: rgba(255, 255, 255, 0.085);
-  --st-line-strong: rgba(255, 255, 255, 0.16);
-  --st-text: #fff;
+  /* body 在 .st 之外拿不到 .st 上的别名；React 挂载（data-theme 上屏）前用它 */
+  --st-text: rgba(255, 255, 255, 0.92);
   --st-dim: rgba(255, 255, 255, 0.62);
-  --st-faint: rgba(255, 255, 255, 0.46);
-  --st-accent: #3b7bd5;
-  --st-accent-ink: #fff;
-  --st-track: rgba(255, 255, 255, 0.1);
-  --st-hover: rgba(255, 255, 255, 0.09);
-  --st-danger: #e2685f;
 }
 
 html[data-win='settings'],
@@ -93,34 +76,57 @@ html[data-win='settings'] body {
   color: var(--st-text);
 }
 
-/* 毛玻璃白天（与 Dock 的 theme-light 同色，只是更淡） */
-.st[data-theme='light'] {
-  --st-glass: linear-gradient(180deg, rgba(252, 253, 255, 0.92) 0%, rgba(237, 240, 247, 0.95) 100%);
-  --st-blur: 30px;
-  --st-sat: 1.1;
-  --st-glass-line: rgba(0, 0, 0, 0.1);
-  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.95);
-  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.08);
-  --st-panel: rgba(255, 255, 255, 0.3);
-  --st-elev: rgba(255, 255, 255, 0.6);
-  --st-line: rgba(16, 22, 36, 0.1);
-  --st-line-strong: rgba(16, 22, 36, 0.18);
-  --st-text: #111;
-  --st-dim: rgba(0, 0, 0, 0.6);
-  --st-faint: rgba(0, 0, 0, 0.46);
-  --st-accent: #2f6ec4;
-  --st-track: rgba(16, 22, 36, 0.08);
-  --st-hover: rgba(16, 22, 36, 0.06);
+/**
+ * v1.19：整窗材质不再自己抄一套色值，而是**引用共享的「表面」token**
+ * （`styles/tokens.css` 的 `--sf-*`，Dock 的卡片/菜单/撤销条用的是同一组）。
+ *
+ * 以前这里有一段注释说"两边是抄数值不是共用类，不要硬串起来"—— 那个判断被推翻了：
+ * 抄出来的结果是同一个应用里三块面板三种灰，而且用户一眼就看出来了
+ * （「配色不要太厚重，淡一点」）。现在的做法是：
+ *   - 表面（底色/描边/投影/毛玻璃/文字色）全部来自 `--sf-*`，改一处三处一起变；
+ *   - 这里只保留**设置窗独有**的几项：强调色、轨道色、rim、加强分隔线。
+ * ⚠️ 声明必须写在 `.st` 上而不是 `:root`：`var(--sf-*)` 是**在声明它的元素上**求值的，
+ *    `:root` 上没有 `--sf-*`，写成 `:root { --st-glass: … var(--sf-fill-top) … }`
+ *    会整条变成 guaranteed-invalid，背景直接不渲染。
+ */
+.st {
+  --st-glass: linear-gradient(180deg, var(--sf-fill-top) 0%, var(--sf-fill-bottom) 100%);
+  /* 大面积窗口比卡片多 4px 模糊：壁纸颜色透进来时更"匀"，不需要靠加不透明度压 */
+  --st-blur: calc(var(--sf-blur, 26px) + 4px);
+  --st-sat: var(--sf-sat, 1.35);
+  --st-glass-line: var(--sf-border);
+  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.18);
+  --st-elev: rgba(255, 255, 255, 0.07);
+  --st-line: var(--sf-line);
+  --st-line-strong: rgba(255, 255, 255, 0.14);
+  --st-text: var(--sf-text);
+  --st-dim: var(--sf-text-dim);
+  --st-faint: var(--sf-text-faint);
+  --st-hover: var(--sf-hover);
+  --st-accent: #3b7bd5;
+  /* 强调色的"文字态"：选中项不再铺一块饱和蓝底（在变淡的表面上一块实心蓝特别重），
+     改成「淡蓝底 + 亮蓝字」，选中依旧一眼可见，但重量降下来 */
+  --st-accent-soft: rgba(130, 180, 245, 0.95);
+  --st-accent-ink: #fff;
+  --st-track: rgba(255, 255, 255, 0.1);
+  --st-danger: #e2685f;
 }
 
-/* 透明档（Dock 的 theme=transparent 本身没有玻璃、只有图标；设置窗不能没有底，
-   否则文字会漂在壁纸上）→ 取 Dock 那档的「深色药丸底」当整窗底：近黑、几乎不调色 */
+/* 毛玻璃白天：表面色随 `--sf-*` 自动切换，这里只补设置窗独有的几项 */
+.st[data-theme='light'] {
+  --st-rim-light: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --st-rim-dark: inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+  --st-elev: rgba(255, 255, 255, 0.55);
+  --st-line-strong: rgba(16, 22, 36, 0.16);
+  --st-accent: #2f6ec4;
+  --st-accent-soft: #2f6ec4;
+  --st-track: rgba(16, 22, 36, 0.08);
+}
+
+/* 透明档（Dock 的 transparent 本身没有玻璃、只有图标；设置窗不能没有底，
+   否则文字会漂在壁纸上）→ 用 tokens 里透明档那组"深色浮层"，与卡片一致 */
 .st[data-theme='transparent'] {
-  --st-glass: linear-gradient(180deg, rgba(20, 23, 30, 0.86) 0%, rgba(11, 13, 18, 0.92) 100%);
-  --st-blur: 10px;
-  --st-sat: 1.05;
-  --st-glass-line: rgba(255, 255, 255, 0.14);
-  --st-panel: rgba(255, 255, 255, 0.04);
   --st-track: rgba(255, 255, 255, 0.12);
 }
 
@@ -234,9 +240,10 @@ html[data-win='settings'] body {
 }
 
 .st-nav-item.active {
-  background: var(--st-accent);
-  color: var(--st-accent-ink);
+  background: var(--sf-accent-hover);
+  color: var(--st-accent-soft);
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(120, 170, 235, 0.22);
 }
 
 .st-nav-item.active .st-nav-ico {
@@ -360,10 +367,12 @@ html[data-win='settings'] body {
 }
 
 .st-seg-btn.active {
-  background: var(--st-accent);
-  color: var(--st-accent-ink);
+  /* 与左栏选中项同一套「淡蓝底 + 亮蓝字」：原来这里是实心 --st-accent，
+     在一片淡玻璃上就是一块最重的色块（用户说的"厚重"主要来自它和左栏那块） */
+  background: var(--sf-accent-hover);
+  color: var(--st-accent-soft);
   font-weight: 600;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  box-shadow: inset 0 0 0 1px rgba(120, 170, 235, 0.24);
 }
 
 /* ── 开关 / 滑块 / 按钮 ────────────────────────────────────────────── */

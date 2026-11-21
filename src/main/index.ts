@@ -29,6 +29,8 @@ import {
 // shortcuts.json 持久化层（D2 拆分）：读写/校验/迁移 + load/save/externalize-icons 三个 IPC
 // 都在那里，这里只需要在启动时注册一次。
 import { registerShortcutsIpc } from './shortcutsStore'
+// 音频设备（Core Audio）：枚举 / 切默认。C# 互操作在 ps.ts 的 AUDIO_CS。
+import { getAudioSnapshot, setDefaultAudioDevice } from './audio'
 import { registerSettingsWindowIpc } from './settingsWindow'
 import { checkForUpdates, openUpdatePage, scheduleSilentUpdateCheck } from './updater'
 
@@ -662,6 +664,19 @@ const SPECIAL_LOCATION_NAMES = {
   'recycle-bin': '回收站'
 } as const
 
+/** 音频切换器：**虚拟条目**（没有真实路径、没有图标文件）。
+ *  `targetPath` 只作为 renderer 去重用的稳定 key；图标由渲染端按当前默认设备的
+ *  形态现画（耳机 / 扬声器 / HDMI），点开的是设备切换卡片而不是启动进程。
+ *  ⚠️ 它由主进程在每次桌面扫描时补进来（与「此电脑」「回收站」同一批），
+ *  所以用户删掉后下次桌面变化会回来 —— 与系统位置条目一致，属既定行为。 */
+const AUDIO_ENTRY_NAME = '音频'
+const AUDIO_ENTRY_PATH = 'ql:audio'
+
+/** 快捷设置：同样是虚拟条目，点开的是贴在 Dock 上方的「快捷设置」卡片
+ *  （6 项高频设置 + 「完整设置…」入口），完整表单仍在独立窗口里。 */
+const SETTINGS_ENTRY_NAME = '设置'
+const SETTINGS_ENTRY_PATH = 'ql:settings'
+
 ipcMain.handle('scan-desktop-folders', async () => {
   const desktop = desktopPath()
   return new Promise((resolve) => {
@@ -731,7 +746,13 @@ if ($results.Count -gt 0) {
   $results | ConvertTo-Json -Compress -Depth 3
 }`
     runPowerShell(psScript, 20000, ({ err, stdout }) => {
-      if (err || !stdout.trim()) { resolve([]); return }
+      // 音频切换器 / 快捷设置：虚拟条目，**扫描失败也要下发** —— 它们不依赖任何
+      // 文件系统信息，而 PowerShell 偶发失败（超时/被杀）不该让这两个入口整条消失。
+      const virtualItems = [
+        { path: AUDIO_ENTRY_PATH, name: AUDIO_ENTRY_NAME, iconDataUrl: '', specialType: 'audio' as const },
+        { path: SETTINGS_ENTRY_PATH, name: SETTINGS_ENTRY_NAME, iconDataUrl: '', specialType: 'settings' as const }
+      ]
+      if (err || !stdout.trim()) { resolve(virtualItems); return }
       try {
         const items: {
           path: string
@@ -739,16 +760,19 @@ if ($results.Count -gt 0) {
           iconBase64?: string
           specialType?: 'this-pc' | 'recycle-bin'
         }[] = JSON.parse(stdout.trim())
-        resolve(items.map((it) => {
-          const specialName = it.specialType ? SPECIAL_LOCATION_NAMES[it.specialType] : undefined
-          return {
-            path: it.path,
-            name: specialName ?? it.name ?? '',
-            iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : '',
-            ...(it.specialType ? { specialType: it.specialType } : {})
-          }
-        }))
-      } catch { resolve([]) }
+        resolve([
+          ...items.map((it) => {
+            const specialName = it.specialType ? SPECIAL_LOCATION_NAMES[it.specialType] : undefined
+            return {
+              path: it.path,
+              name: specialName ?? it.name ?? '',
+              iconDataUrl: it.iconBase64 ? 'data:image/png;base64,' + it.iconBase64 : '',
+              ...(it.specialType ? { specialType: it.specialType } : {})
+            }
+          }),
+          ...virtualItems
+        ])
+      } catch { resolve(virtualItems) }
     })
   })
 })
@@ -1644,6 +1668,36 @@ if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
     } catch { resolve([]) }
   })
 }))
+
+// 打开系统「声音」设置页：`ms-settings:sound` 是 URI 不是文件路径，不能走 open-path
+// （shell.openPath 走 ShellExecute 的路径语义，对 URI 会失败）。
+// 成功后才按「启动后行为」三态让位 —— 与点 Dock 图标启动一个程序保持一致。
+ipcMain.handle('open-sound-settings', async () => {
+  try {
+    await shell.openExternal('ms-settings:sound')
+  } catch (err) {
+    logError('audio', '打开系统声音设置失败', err)
+    return false
+  }
+  hideDockAfterLaunch()
+  return true
+})
+
+// ─── IPC: 音频设备（枚举 / 切默认） ───────────────────────────────────────
+// 一个 PowerShell 调用 ≈ 0.7~1s（进程冷启动 + Add-Type 编译 C#），所以列表在
+// audio.ts 里带 3s 缓存与请求合并；切换动作本身不做缓存，但要 invalidate。
+// `force = true` 用于「切换成功后刷新」与卡片上的手动刷新。
+ipcMain.handle('list-audio-devices', (_e, force: unknown) => getAudioSnapshot(force === true))
+ipcMain.handle('set-default-audio-device', async (_e, id: unknown, roles: unknown) => {
+  if (typeof id !== 'string' || !id) return false
+  const roleList = Array.isArray(roles)
+    ? roles.filter((r): r is number => typeof r === 'number' && (r === 0 || r === 1 || r === 2))
+    : [0, 1, 2]
+  const failed = await setDefaultAudioDevice(id, roleList.length > 0 ? roleList : [0, 1, 2])
+  // null = PowerShell 没跑起来（无法判断，按失败处理，让 UI 回滚并提示）；
+  // [] = 全部成功；非空 = 有角色失败（例如设备刚被拔掉，ID 已失效）
+  return failed !== null && failed.length === 0
+})
 
 // ─── IPC: 列出文件夹子项（文件夹条目悬停预览卡片） ────────────────────────
 // 枚举走 fs、图标走 Electron 内置的 app.getFileIcon（进程内 shell 图标查询）——

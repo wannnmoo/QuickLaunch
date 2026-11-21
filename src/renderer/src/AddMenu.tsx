@@ -11,7 +11,9 @@
  * `label + 三段胶囊` 一行，「标准」两个字在 28px 胶囊里贴边（用户截图反馈）。
  * v1.17 起这些配置全部搬到**独立设置窗口**（src/main/settingsWindow.ts，
  * 760×560，左栏分类 + 右侧表单），菜单恢复成 4 个动作 + 1 个「设置…」入口。
- * 再加菜单项前先问：它是不是「配置」？是就进设置窗口。
+ * v1.19 起「设置…」也撤了：Dock 上有了「设置」系统条目（点开是快捷设置卡，
+ * 卡里再进完整窗口）。菜单从此只有**动作**，没有任何配置入口。
+ * 再加菜单项前先问：它是不是「配置」？是就进设置卡/设置窗口。
  */
 import type { CSSProperties, RefObject } from 'react'
 
@@ -26,7 +28,6 @@ type Props = {
   onAddFolder: () => void
   onToggleDesktopIcons: () => void
   onToggleAutoStart: () => void
-  onOpenSettings: () => void
   onOpenLogDir: () => void
   onExportDiagnostics: () => void
   onCheckUpdate: () => void
@@ -67,14 +68,8 @@ export default function AddMenu(p: Props): React.JSX.Element | null {
           <span className={`item-switch${p.autoStart ? ' on' : ''}`} />
         </button>
         <div className="dropdown-divider" />
-        {/* 设置中心：所有配置（材质 / 尺寸 / 玻璃 / 延迟 / 行为 / 停靠位置）都在那扇窗里。
-            菜单只留一个入口 —— 见文件头注释。 */}
-        <button className="dropdown-item" onClick={p.onOpenSettings}>
-          <span>设置…</span>
-          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" className="item-chevron">
-            <path d="M4.5 2.5L8 6l-3.5 3.5" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" />
-          </svg>
-        </button>
+        {/* 设置入口**不在菜单里**（v1.19 起）：Dock 上已有「设置」系统条目，
+            点开就是快捷设置卡，卡里再进完整窗口。菜单只做动作，不再放设置。 */}
         {/* 更新（F1）：手动检查，结果走 drop-hint 提示 —— 菜单会先关掉 */}
         <button className="dropdown-item" onClick={p.onCheckUpdate}>
           检查更新

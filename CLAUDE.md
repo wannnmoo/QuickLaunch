@@ -178,6 +178,119 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   - **「+」按钮的可达性**：`→` 到最右时**仅当选中框不在面板内**才落到「+」（`if (!navInPanel) setNavId(ADD_BTN_ID)`）。因为在分组上按 `→` 会进入面板，随后 `→` 就在成员之间走、到最后一个成员不再移动——要够到「+」必须先 `←`/`Esc` 退出面板。这是既定交互（`←`/`Esc` 是面板的出口），不是 bug
   - 面板打开但选中框在主 Dock 时，`Escape` = 收起面板 + 退出导航；选中框在面板内时，`Escape` = 收起面板 + 选中返回该分组图标
 
+### 浮层材质：一套 `--sf-*` token（v1.19）
+
+菜单、右键菜单、盘符卡片、文件夹卡片、音频卡片、分组面板、撤销条，以及**设置中心整窗**，
+表面材质全部取 [`styles/tokens.css`](src/renderer/src/styles/tokens.css) 里的 `--sf-*`：
+
+| token | 用途 | 黑夜 / 白天 / 透明 |
+|---|---|---|
+| `--sf-fill-top/-bottom` | 浮层底色（渐变首尾） | `.62/.58` · `.78/.70` · `.70/.66` |
+| `--sf-border` `--sf-line` | 外描边 / 内分隔线 | `.10` / `.08` |
+| `--sf-shadow` | 外投影（比旧版轻一档） | `0 12px 30px rgba(0,0,0,.28)` |
+| `--sf-blur` `--sf-sat` | 毛玻璃强度 / 饱和度 | `26px` / `1.2` |
+| `--sf-text/-dim/-faint` | 三级文字 | 白 `.92/.62/.42` |
+| `--sf-hover` `--sf-accent-hover` | 行悬停 / 强调悬停 | 白 `.07` / 蓝 `.18` |
+| `--sf-radius` `-sm` `-row` | 卡片 18 / 菜单 14 / 行 9 | — |
+| `--sf-row` | 列表行高（文件夹/音频共用） | `28px` |
+
+- **统一是刻意的**：v1.17 之前每个浮层各抄一套色值（菜单抄 Dock、卡片又抄菜单、设置窗
+  自建 `--st-*`），结果是同一个应用里三种灰。改一处深浅要动四个文件，用户一眼就看出不齐。
+- **「淡」的取法**：不再用 0.9 的实心块，而是 0.62 的亮灰蓝 + blur；重量交给投影，
+  不交给不透明度。**某个壁纸下读不清时先加 `--sf-blur`，不要先加 alpha**（加 alpha 会
+  把整套回到"厚重"，而且三处要一起调）。
+- 设置窗（`.st`）只保留自己的强调色/轨道色/rim，其余全部引用 `--sf-*`；
+  `--st-glass` / `--st-blur` 等别名**必须声明在 `.st` 上，不能写在 `:root`** ——
+  `var()` 在声明它的元素上求值，`:root` 没有 `--sf-*`，整条会变成 guaranteed-invalid
+  （表现为"背景完全不渲染"，很难从现象联想到根因）。
+- 设置窗的**选中态是 tonal**（`--sf-accent-hover` 淡蓝底 + `--st-accent-soft` 亮蓝字），
+  不要改回实心 `--st-accent`：在淡玻璃上一块饱和蓝是最扎眼的"厚重"来源（左栏与分段控件同）。
+- ⚠️ **透明主题的菜单仍然全透明**（`.app.theme-transparent .dropdown-menu { background: transparent }`），
+  这是那一档的既定身份（文字靠 `-webkit-text-stroke` 立住），别被 `--sf-fill-*` 覆盖掉；
+  卡片在该档仍走 `--sf-fill-*`（深色浮层），因为卡片里有大段文字。
+
+### 音频设备（系统默认输出/输入切换）
+
+「音频」是 Dock 上的一个**虚拟系统条目**（`specialType: 'audio'`、`targetPath: 'ql:audio'`），
+点它或悬停 450ms 弹出双栏卡片（输出 | 输入），点一行即把该设备设为系统默认。
+
+- **技术路径**：Core Audio COM。枚举用 `IMMDeviceEnumerator`（公开文档），切默认用
+  `IPolicyConfigVista`（**未文档化，但 Win7→Win11 24H2 一直有效**，SoundSwitch 等工具同款）。
+  C# 互操作在 [`ps.ts`](src/main/ps.ts) 的 `AUDIO_CS`（**纯 ASCII**），收发与缓存
+  【在 [`audio.ts`](src/main/audio.ts)，IPC 是 `list-audio-devices` / `set-default-audio-device` / `open-sound-settings`。
+  🚫 不要改用 `AudioDeviceCmdlets`（第三方 PS 模块，破坏免安装）或 `IAudioPolicyConfigFactory`
+  （那是 per-app 路由，WinRT 面，成本翻几倍）。
+- ⚠️⚠️ **两个 CLSID，必须按顺序试**：本机（Win11）注册表里只有
+  `{294935CE-F637-4E7C-A41B-AB255460B862}`（→ `AudioSes.dll`，`CPolicyConfigVistaClient`）；
+  而常见写法里的 `{870AF99C-171D-4F9E-AF0D-E64A4906EA05}` **根本不存在**（`REGDB_E_CLASSNOTREG`）。
+  `NewPolicyConfig()` 里先试 Vista、失败回退，换台机器才不会哑。
+- ⚠️⚠️ **vtable 顺序错了报的是 `NullReferenceException`（不是 HRESULT）**：
+  `IMMDeviceEnumerator` 的第 1 个槽位是 `EnumAudioEndpoints`，`GetDefaultAudioEndpoint` 是第 2 个。
+  第一版把后者写在前，表现为「一枚举就 NRE」，查了一轮才定位。所有方法都要 `[PreserveSig]`。
+- **三个角色**（`ERole`）：`0` 系统 / `1` 多媒体 / `2` 通话。**默认三个一起设** ——
+  只设 `0` 会出现「系统切了、但 Discord/微信语音还走旧设备」。
+- **友好名在 Win11 上带后缀**：`PKEY_Device_FriendlyName` 常常已经是 `耳机 (ZhuAudio ZG3)`，
+  适配器名（`PKEY_DeviceInterface_FriendlyName`）要单独一行显示，所以渲染前用
+  `audioDisplayName()` 把重复的 ` (适配器)` 剥掉。**同名设备必须显示适配器**，否则两个「扬声器」分不清。
+- ⚠️⚠️ **stdout 必须是 UTF-8（v1.19 修，用户截图里就是一片 `����`）**：`execFile` 按 UTF-8
+  解码 stdout，而 `powershell.exe` 在**没有控制台**的进程里（Electron 主进程 spawn 的子进程就是）
+  默认按 OEM 代码页（中文 Windows = 936）输出 —— 设备名里的中文全变成 U+FFFD。
+  所以 `AUDIO_CS` 首行固定 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`；
+  项目里其它脚本（`scan-desktop-folders` / `list-drives` / `describe-paths` …）也都有这一行，
+  **新增任何 PS 脚本都必须带**。排查时注意：带 UTF-8 控制台的终端里跑同一段脚本是**正常**的，
+  很容易误判成"没问题"——复现要在 `chcp 936` 的会话里跑，或者直接看 App。
+- **性能**：一次调用 ≈ 0.85~0.95s（`powershell.exe` 冷启动 ~450ms + `Add-Type` 编译 ~250ms）。
+  所以：主进程 `audio.ts` 带 **3s 缓存 + 请求合并**；渲染端启动 8s 后**预热**一次（避开 4s 的 `listDrives`）；
+  卡片打开读缓存、切换后强制刷新。别加定时轮询（每次都是实打实的 PS 冷启动）。
+- **条目是虚拟的**：`scan-desktop-folders` 在 TS 侧无条件追加它（**PowerShell 扫描失败也要下发**，
+  它不依赖文件系统）；排序 `此电脑(0) → 音频(1) → 设置(2) → 回收站(3)`（设置条目见下一节）。
+  ⚠️ 拖进分组时合并逻辑会 `delete member.specialType`（与「此电脑」同一处理），
+  所以**判断一律用 `isAudioEntry(app)`**（`specialType === 'audio' || targetPath === 'ql:audio'`），
+  只认 specialType 的话组里的音频成员会变成「启动一个叫 ql:audio 的程序」。
+- **图标没有文件**：由 `AudioGlyph` 按**当前默认输出设备**的 formFactor 现画
+  （3 耳机 / 1 扬声器 / 9 HDMI / 4 麦克风），换设备时 Dock 上的字形跟着变；悬浮标签是 `音频 · 耳机`。
+- 🚫🚫 **卡片必须进 `overlayOpen`**（[`App.tsx`](src/renderer/src/App.tsx) 那一串 `menuPos || …`）。
+  它是 460×~202 的 `position: fixed` 浮层，整块落在玻璃条上方的透明带里；
+  漏了就是「画得出、点不动」—— 与 v1.15.2 的 `.drop-hint` 是同一种事故。
+- **卡片几何**：宽 460（两列各 ~220，340 放两列会把设备名压成 8 个字，同名设备分不出来）；
+  垂直预算 = 内边距 8 + 标题 14 + 页脚 26 → 列表 150 = **5 行 × 30px**。
+  改任何一个数字都要重算，否则第 5 行会被 `overflow: hidden` 切掉半行（第一版就是这样，
+  实测 `lastRowFullyVisible: false`）。列表有 `min-height: 0` + `overflow-y: auto`，卡片被压时改滚动而不是裁剪。
+- **键盘在卡片内部处理**：容器 `tabIndex={-1}`、打开即 `focus()`，`↑↓/Enter/Esc` 都在
+  `onKeyDown` 里 `stopPropagation`，**不要接 `useDockKeyboard`**（两套导航会抢同一个 Enter）。
+  光标框只在卡片真的持有焦点时显示，且数据到达后自动落在当前默认设备上。
+- **切换是乐观的**：点击立刻把对勾挪过去 + 该行 spinner（PowerShell 要 ~0.9s，等它回来再挪太迟钝），
+  返回后 `listAudioDevices(true)` 强刷；失败（设备刚被拔掉 → ID 失效）弹提示，列表刷新会自然把对勾挪回。
+- **「声音设置」按钮**走 `open-sound-settings`（`shell.openExternal('ms-settings:sound')`），
+  🚫 不要用 `open-path`：那个是**文件路径**语义（对 URI 会失败），而且会不经「启动后行为」三态直接藏 Dock。
+- 还没做（有意留的）：音量滑块 / 静音（要 `IAudioEndpointVolume`）、三个角色的独立开关、
+  设置中心里的「音频」页、设备热插拔的实时监听（现在是打开卡片时刷新）。
+
+### 快捷设置（Dock 上的「设置」条目）
+
+「设置」和「音频」一样是**虚拟系统条目**（`specialType: 'settings'`、`targetPath: 'ql:settings'`），
+点它或悬停 450ms 弹出 `SettingsCard`（460×202，6 行 + 页脚）。
+
+- **为什么不是把设置窗搬过来**：Dock 窗口 300px、浮层可用 ≈202px，而完整设置是
+  5 个分类 × 20 来行。所以卡片只放**改完立刻能看到效果**的 6 项
+  （材质 / 图标大小 / 悬停放大 / 停靠位置 / 跟随系统 / 开机自启），
+  页脚的「完整设置…」照旧打开那扇 480×308 的独立窗口。
+- **垂直预算（加行必看）**：内边距 7 + 6 行 × `--sf-row`(28) + 页脚 26 = **201 ≤ 202**。
+  加到第 7 行就会溢出最后半行（`.qc-list` 有 `min-height: 0` + `overflow-y: auto` 兜底，
+  但会变成"卡片里再滚一层"，观感差）；要加项就先砍一项或把行高降到 26。
+- **控件复用同一套视觉**：分段控件是「淡蓝底 + `--ui-accent-soft` 亮字」（与设置窗 `.st-seg`
+  的 tonal 选中态一致，别改回实心蓝）；开关复用 `--switch-*` 变量（与「+」菜单里的 `.item-switch` 同色）。
+- 改任何一项都走 `patchSettings()`（乐观更新 + 主进程广播），所以卡片里点完立刻生效
+  （实测点「大」后 `.app` 的 `--dock-icon` 直接变 72px）。`dockEdge` 也在其中。
+- **排序**：系统条目区块固定为 `此电脑(0) → 音频(1) → 设置(2) → 回收站(3)`。
+  这两个入口都由 `scan-desktop-folders` 在 TS 侧无条件追加（**PowerShell 扫描失败也下发**）。
+- ⚠️ 进分组时 `specialType` 会被删掉（与音频/此电脑同一处理），所以判断一律用
+  `isSettingsEntry(app)`（`specialType === 'settings' || targetPath === 'ql:settings'`）。
+- 图标没有文件：用**滑杆 glyph**（与设置窗左栏「通用」同一套线性图标），
+  30px 下比齿轮清楚 —— 齿轮在这个尺寸会读成一个太阳。
+- **「+」菜单里已经不再有「设置…」**（v1.19 撤掉）：设置入口只有 Dock 上这一个条目，
+  菜单回到「只放动作」。`handleOpenSettings` 仍保留，给快捷设置卡的「完整设置…」用。
+
 ### 系统托盘 + 快捷键（v1.11.0 起托盘图标为多尺寸 ICO）
 
 - **Alt+Space** 全局快捷键：隐藏/不可见时按 → 唤回置顶；可见（置顶或沉底）时按 → 隐藏到托盘。`toggleWindow()` 用**自维护意图状态 `dockTrayHidden`**（非 `isAlwaysOnTop()`——桌面无其他窗口时前台锁会拒绝激活，Dock 获得焦点约 500ms 后被抢回产生虚假 `blur` 沉底，读置顶位会陷入「显示→被压底→再显示」死循环，v1.7.1 修复）。`dockTrayHidden` 在所有显示/隐藏路径同步维护（run-app 隐藏、close 到托盘、`--autostart` 启动、second-instance、托盘「显示窗口」、dock-pointer、focus）。优先注册 Alt+Space，失败自动回退 `Ctrl+Alt+Space`；Ctrl+Alt 在 Windows 上等同 AltGr，易被输入法/键盘布局占用。**键盘唤出**（`toggleWindow(true)`，仅全局快捷键路径；托盘点击不传该参数）时额外 `webContents.send('nav-enter')`，renderer 据此进入键盘导航模式
@@ -509,7 +622,7 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src
 | `hooks/useEdgeScroll.ts` | 拖拽边缘自动滚动（`EDGE_ZONE = 60`、`EDGE_MAX_SPEED = 18`） |
 | `dockGeometry.ts` | `measureCenters()`（offsetLeft/offsetWidth 快路径）+ `applyZoom()`（WeakMap 记忆） |
 | `FolderCard.tsx` | 文件夹预览卡片：`memo` + `useSyncExternalStore` 订阅 `folderIcons.ts`，图标分批推送只重渲染对应行 |
-| `AddMenu.tsx` | 「+」菜单：**只放动作**（添加快捷方式 / 文件夹 / 桌面图标 / 开机自启动 / 设置… / 检查更新 / 日志目录 / 诊断包 / 版本行） |
+| `AddMenu.tsx` | 「+」菜单：**只放动作**（添加快捷方式 / 文件夹 / 桌面图标 / 开机自启动 / 检查更新 / 日志目录 / 诊断包 / 版本行；设置入口在 Dock 上的「设置」条目） |
 | `EmptyState.tsx` | 统一空状态（`main` + `sub` + 可选 icon） |
 | `folderIcons.ts` / `format.ts` / `errors.ts` | 图标订阅 store / `normPath`+`fmtFileSize` / `reportClientError` |
 
@@ -520,7 +633,7 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src
 - 单个 `useState<AppEntry[]>` 管理快捷方式列表
 - 模块级 `nextId` 生成自增 ID，启动时从已保存最大 ID + 1 恢复
 - **Dock 栏**：毛玻璃横栏（位置由根元素 `data-edge` 决定：`bottom`/`middle` 在窗口下沿、`top` 在上沿），图标水平排列，gap 4px；内容超过宽度时横向滚动
-- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单 —— **只放动作，不放配置**（添加快捷方式 / 添加文件夹 / 隐藏或显示桌面图标 / 开机自启动 / **设置…** / 检查更新 / 打开日志目录 / 导出诊断包 / 版本行；「此电脑」「回收站」由启动扫描自动加入，无手动入口）。菜单本体在 `AddMenu.tsx`。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角。**停靠位置选择器**（`DOCK_EDGE_CHOICES`：中间/下/上）复用主题分段控件的 `.theme-seg` 样式——位置选择后菜单保持打开，`handleEdgePick` 不做本地短路，一切以主进程 `setDockEdge` + 事件回推为准
+- **+ 按钮**：Dock 末尾的添加按钮，点击展开下拉菜单 —— **只放动作，不放配置，也不放设置入口**（添加快捷方式 / 添加文件夹 / 隐藏或显示桌面图标 / 开机自启动 / 检查更新 / 打开日志目录 / 导出诊断包 / 版本行；设置走 Dock 上的「设置」条目，v1.19 起菜单里的「设置…」已撤掉；「此电脑」「回收站」「音频」「设置」由启动扫描自动加入，无手动入口）。菜单本体在 `AddMenu.tsx`。菜单**渲染在滚动容器之外**（fixed 定位）：`addBtnRef` 提供按钮坐标存入 `menuPos` state，菜单底边对齐按钮上方 8px。滚动容器的 `overflow` 会裁剪向上弹出的菜单，故不能放容器内。菜单加 `maxHeight: menuPos.top - 8` + `overflow-y: auto`——超过窗口内可用高度时内部滚动，滚动条隐藏（与 `.dock-inner` 一致），滚轮/触控板滚动；水平位置钳制在窗口内（`Math.min(Math.max(cx, 100), innerWidth - 100)`），防止按钮靠窗口右缘时菜单伸出被裁掉圆角。**停靠位置选择器**（`DOCK_EDGE_CHOICES`：中间/下/上）复用主题分段控件的 `.theme-seg` 样式——位置选择后菜单保持打开，`handleEdgePick` 不做本地短路，一切以主进程 `setDockEdge` + 事件回推为准
 - **配置项已全部迁到设置中心（v1.17）**：停靠位置 / 主题材质 / 图标大小 / 放大倍数 / 玻璃强度 / 悬停延迟 / 点击后行为 / 跟随系统主题，都不再是菜单里的分段控件，而是 `src/renderer/src/settings/SettingsApp.tsx` 里的 `.st-seg`。菜单可用高度只有约 200px —— 早先把它们塞进菜单时，`.theme-seg` 的高 28px 胶囊里「标准」两个字贴边溢出（用户报的原图），且每加一个设置项就得挤一次。**App.css 里 `.theme-seg*` / `.prefs-*` / `--nt-ink` 一族变量已随之删除，不要再加回来**
 - **菜单自动关闭**：鼠标移出即关（点击外部 `mousedown`、鼠标移出窗口也关）。三条防误关规则：① `menuHoveredRef` 门控——**必须先真正进过菜单本体**才启用「移出即关」（右键瞬间鼠标还停在图标上、离菜单几十像素，一上来就判定会把菜单秒关）；② 进菜单后 150ms 内的「掠过」不算离开；③ 菜单矩形外扩 24px 宽容区——从图标移向菜单的路上要掠过菜单底角/边缘，贴着走不算离开。「+」按钮只负责「保持打开」，不置位 hovered（否则鼠标一离开按钮就秒关）
 - **文件夹悬停预览卡片**：悬停文件夹条目 `settings.folderCardDelay`（默认 300ms）后弹出（`openFolderCard`）；分组面板自动收起用 `settings.panelCloseDelay`（默认 180ms，下限 60）；两处 150ms 关闭宽限是硬编码，别一起改（C5），与「此电脑」盘符卡片同构、复用 `.drives-card` 浮层几何。三条关键设计：① **悬停即预取**——`mouseenter` 立刻 `listFolder()`，300ms 后真弹卡片时直接命中主进程缓存，看不到「先占位块再换图标」；② **延迟关闭 150ms 宽限**——鼠标从图标移到卡片上会先离开图标，宽限期内移入卡片即取消关闭（可继续在卡片里滚动看）；③ 同一目录且已加载完时只更新锚点，不清成「读取中」再重载（否则闪一下、缓存过期还要整目录重扫）。卡片宽度先按图标中心渲染，`useLayoutEffect` 测量后在 paint 前把水平位置钳制进窗口（贴边缘时内收，不会看到跳一下）。拖拽排序 / 文件拖入进行中不弹（会挡住落点指示线）

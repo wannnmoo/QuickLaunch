@@ -9,6 +9,7 @@ type FolderIconsPayload = import('../../shared/types').FolderIconsPayload
 type DockEdge = import('../../shared/types').DockEdge
 type LnkInfo = import('../../shared/types').LnkInfo
 type DriveInfo = import('../../shared/types').DriveInfo
+type AudioSnapshot = import('../../shared/types').AudioSnapshot
 type AppSettings = import('../../shared/types').AppSettings
 /** 持久化条目形状（= 共享的 AppEntry） */
 type ShortcutEntry = import('../../shared/types').AppEntry
@@ -34,6 +35,12 @@ interface Window {
       rejected: string[]
     }>
     listDrives: () => Promise<DriveInfo[]>
+    /** 音频设备（输出/输入）。主进程带 3s 缓存；force=true 跳过缓存 */
+    listAudioDevices: (force?: boolean) => Promise<AudioSnapshot>
+    /** 设为系统默认。roles：0=系统 / 1=多媒体 / 2=通话，缺省三个全设 */
+    setDefaultAudioDevice: (id: string, roles?: number[]) => Promise<boolean>
+    /** 打开 Windows「系统 > 声音」设置页 */
+    openSoundSettings: () => Promise<boolean>
     pickIcon: () => Promise<{ path: string; iconDataUrl: string } | null>
     listFolder: (dir: string) => Promise<FolderListing>
     onFolderIcons: (callback: (payload: FolderIconsPayload) => void) => () => void
@@ -49,7 +56,7 @@ interface Window {
       data: ShortcutEntry[]
     ) => Promise<{ entries: ShortcutEntry[]; changed: boolean }>
     selectFolder: () => Promise<{ path: string; name: string; iconDataUrl: string }[]>
-    scanDesktopFolders: () => Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' }[]>
+    scanDesktopFolders: () => Promise<{ path: string; name: string; iconDataUrl: string; specialType?: 'this-pc' | 'recycle-bin' | 'audio' | 'settings' }[]>
     checkMissingFolders: (paths: string[]) => Promise<string[]>
     onDesktopChanged: (callback: () => void) => () => void
     /** 退出前落盘：renderer 的保存有防抖，主进程退出时会推这条事件 */
