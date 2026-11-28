@@ -37,7 +37,7 @@ npm run verify      # lint → typecheck → test → build → 命中区探针�
 
 | 模块 | 职责 |
 |---|---|
-| [`src/main/ps.ts`](src/main/ps.ts) | PowerShell 层唯一入口：四段内嵌 C#（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `ACTIVATE_CS` / `TRAY_CLICK_CS`）+ `runPowerShell()` + 图标尺寸常量 |
+| [`src/main/ps.ts`](src/main/ps.ts) | PowerShell 层唯一入口：四段内嵌 C#（`ICON_EXTRACTOR_CS` / `DESKTOP_ICONS_CS` / `ACTIVATE_CS` / `TRAY_CLICK_CS`——最后一段**只给微信用**，见「系统托盘」一节）+ `runPowerShell()` + 图标尺寸常量 |
 | [`src/main/persist.ts`](src/main/persist.ts) | `writeFileAtomic()`（临时文件 + fsync + `.bak` + rename） |
 | [`src/main/shortcutsStore.ts`](src/main/shortcutsStore.ts) | `shortcuts.json` 读写/清洗/损坏恢复 + 三个持久化 IPC |
 | [`src/main/iconStore.ts`](src/main/iconStore.ts) | 图标外置（`icons/`）、`ql-icon://` 协议、`normalizeIcon()` |
@@ -428,7 +428,7 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
   | 状态 | 含义 | 动作 |
   |---|---|---|
   | `running` | 有可见/最小化窗口 | 已置前 → 藏起 Dock，返回 `true` |
-  | `tray` | 进程在、窗口隐藏（收托盘） | **点它自己的托盘图标唤出**（UIA）；不启动新进程、不强行 `ShowWindow` |
+  | `tray` | 进程在、窗口隐藏（收托盘） | **按正常流程启动**（v1.21.2：不再点托盘图标、不再显示任务栏） |
   | `absent` | **确认没这个进程**（唯一允许启动的一态） | 继续走启动流程 |
   | `failed` | 进程在、但 3 次都没探到带标题的窗口 | **照旧启动**（fail-open，v1.13.8）→ 不再有 `'probe-failed'` |
   - ⚠️⚠️ **四个码必须来自 C# 的 `QLActivate.Probe`，不许再把两种结果挤进一个返回值（v1.13.8 修）**：
@@ -493,6 +493,32 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
        「UIA 描述的是存在的 UI 对象，隐藏的图标没有 UI」；
     3. `Shell_NotifyIconGetRect` 对溢出区里的图标拿不到可用矩形。
     结论：**要么让应用自己恢复（任务栏得在屏幕上），要么什么都不做**，没有第三条路。
+  - 🚫🚫 **不要再用「点它自己的托盘图标」这条路（v1.21.2 删除，用户明确否决）**：
+    用户原话：「为什么点击 WeGame 这类软件，都要看系统托盘有没有打，还要点一下系统托盘？」
+    于是 `clickTrayIconFor` / `TRAY_CLICK_CS` / `waitForWindowShown` / `'in-tray'` 返回值
+    **全部删除**。`run-app` 现在只有两条规则：
+    ① `Probe` 说 `running`（有可见/最小化窗口，Edge/微信/绝大多数应用）→ **激活已有窗口，
+       绝不 spawn**（实测连点三次 Edge，`Probe=1` 且进程数 20→20）；
+    ② 其余（没在跑 / 只在托盘没有窗口 / 探不出结论）→ **按正常流程启动**（= 以前的节奏）。
+    ⚠️ 已知代价（用户接受）：微信**完全收在托盘**（窗口被隐藏）时点图标会走 ②，
+    也就是启动新实例（可能弹登录窗）。要它复用实例，得让它保持有窗口（最小化到任务栏）。
+  - ✅ **微信是唯一例外：走「点它自己的托盘图标」（v1.21.6，用户定的分工）**。
+    `run-app` 的 `tray` 分支里 `WECHAT_EXES`（`weixin.exe` / `wechat.exe`）命中时调
+    `clickTrayIconFor()` —— UIA `Invoke` 点微信自己的托盘图标，等价于用户手动点一下，
+    应用走自己的恢复流程。实测：隐藏→`ClickTrayIcon=1`→`vis=True`，恢复后可用。
+    点完必须 `waitForWechatWindow()` 轮询（6×400ms）确认窗口真出现，否则记 warn 并退回正常启动。
+    ⚠️ 其余应用**一律**按正常流程启动，不要扩这个名单（理由见下一条）。
+    ⚠️ 写那份临时 .ps1 必须带 **BOM**：PowerShell 5.1 按 ANSI 读脚本，中文字面量会坏（踩过两次）。
+  - 🚫 **但外部操纵窗口的手段全部禁止**（v1.21.5 三次实测定案）：
+    - ① `ShowWindow(SW_SHOW)`（v1.21）：微信得到「可见但点不动」的假窗口。
+    - ② `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` 全量启用（v1.21.3）：Electron/Chromium 应用
+      **黑屏**（Listen1：窗口壳可见、子窗口 `Intermediate D3D Window` 不可见）、WeGame 卡死，
+      随后微信/WeGame 进程退出。
+    - ③ 同一手段**只对微信白名单启用**（v1.21.4）：**微信照样卡**。判据骗了我 ——
+      「`MMUIRenderSubWindowHW` 1219×998 可见」只说明渲染表面存在，**不代表界面能响应**。
+      这就是本文档反复强调的「消息层/渲染层活着 ≠ 界面活着」，我第二次踩了同一个坑。
+    - `QLActivate.Restore` / 助手指令 `RESTORE` / `restoreHiddenWindow` / `RESTORE_SAFE`
+      已全部删除，`SC_RESTORE` 在产物里命中数 0。**别再写第四次。**
   - ⚠️⚠️ **选窗必须按「像不像主窗」分档，不能只看可见度（v1.21.1 修，WeGame 实测）**：
     WeGame 同时有两个窗口 —— `#32770` `no_active_wnd`（**可见**、0×0、`WS_EX_TOOLWINDOW|NOACTIVATE`，
     是占位窗）和 `TWINCONTROL` `Wegame`（**隐藏**、1438×900，才是真主窗）。

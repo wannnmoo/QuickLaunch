@@ -1476,8 +1476,7 @@ function App(): React.ReactElement {
         const ok = await window.api
           .runApp(opener.targetPath, args, opener.workingDirectory)
           .catch(() => false as const)
-        if (ok === 'in-tray') showDropHint(`「${label}」收在托盘里，先点开它再试`)
-        else if (ok === false) showDropHint(`「${label}」没能运行，文件未打开`)
+        if (ok === false) showDropHint(`「${label}」没能运行，文件未打开`)
         return
       }
     }
@@ -1860,21 +1859,11 @@ function App(): React.ReactElement {
 
     // 失败时给一句提示：主进程会把 Dock 显示回来（见 restoreDockAfterFailedLaunch），
     // 用户看到 Dock 回来却没有任何说明，会以为是「点了没反应」。
-    // 'in-tray'：目标已在运行但窗口收在托盘里（微信/QQ 关到托盘就是这种），而且主进程
-    //   没能用 UIA 点开它的托盘图标。主进程**故意不新开进程**、也不强行显示它的窗口
-    //   （强行显示有概率让它失去响应），所以这里必须明确告诉用户「去点托盘图标」。
-    //   ⚠️ v1.13.8 起不再有 'probe-failed' 分支：探不出结论时主进程改为**直接启动**
-    //   （fail-open）—— 原来那条分支会把「进程在但连窗口都没有」的目标永久挡在门外。
     window.api.runApp(app.targetPath, app.arguments, app.workingDirectory)
       .then((ok) => {
         if (ok === false) {
           flagLaunchFailed()
           showDropHint('启动失败：目标不存在或无法运行')
-        } else if (ok === 'in-tray') {
-          // 两种可能：① 任务栏上找不到它的托盘图标；② 图标点中了但应用自己不建窗
-          // （WeGame 实测会卡成这种「进程在、窗口不出」的状态，外面用什么办法都唤不出来）。
-          // 所以除了「点托盘」，再给一条一定能自救的路。
-          showDropHint('已在运行但窗口打不开：点托盘图标，或右键退出后重开')
         }
       })
       .catch(() => {

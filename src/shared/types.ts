@@ -75,12 +75,11 @@ export interface LoadShortcutsResult {
 }
 
 /** `run-app` 的返回值。
- *  - `true`       已启动，或「已在运行且窗口已激活/置前」
- *  - `false`      启动失败（目标不存在 / 无法运行 / UAC 被取消）
- *  - `'in-tray'`  目标已在运行、窗口收在托盘里，且没能用 UI Automation 点开托盘图标
- *  ⚠️ 不要简化回 boolean：`'in-tray'` 必须能和「失败」区分，否则用户看到的是「点了没反应」。
- *  ⚠️ `'probe-failed'` 已在 v1.13.8 删除（探不出结论时 fail-open 直接启动）。 */
-export type RunAppResult = true | false | 'in-tray'
+ *  - `true`   已启动，或「已在运行且有窗口 → 激活了那个窗口」（没有新开实例）
+ *  - `false`  启动失败（目标不存在 / 无法运行 / UAC 被取消）
+ *  ⚠️ v1.21.2 起是纯 boolean：原来的 `'in-tray'`（点系统托盘唤出）整条路已删除 ——
+ *  用户要求「点图标要么复用已有窗口，要么按正常节奏启动」，不要中间态。 */
+export type RunAppResult = boolean
 
 /** 文件夹子项（悬停预览卡片用） */
 export interface FolderChild {
@@ -207,7 +206,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   panelCloseDelay: 180,
   // v1.19.3：默认改成「让位沉底」——点开应用后 Dock 退到所有窗口后面，而不是整条藏进托盘。
   // 用户要的语义就是「别挡着我刚打开的东西」；沉底后 Alt+Space / 托盘仍可唤回（dockAutoSunk）。
-  afterLaunch: 'sink',
+  afterLaunch: 'hide',
   probeBeforeLaunch: true,
   searchEnabled: true,
   followSystemTheme: false

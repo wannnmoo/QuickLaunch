@@ -707,6 +707,7 @@ public static class QLActivate
 }
 `
 
+// 点系统托盘图标的 UIA 层（v1.21.6 恢复：**只给微信用**，见 index.ts 的 WECHAT_TRAY_HINT）。
 export const TRAY_CLICK_CS = `
 using System;
 using System.Collections.Generic;
@@ -877,3 +878,4 @@ public static class QLTray
     }
 }
 `
+

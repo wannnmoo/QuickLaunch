@@ -2,6 +2,129 @@
 
 基于 **React 19 + TypeScript 7 + Electron 43 + Vite 7** 构建的 Windows 桌面应用——透明毛玻璃 Dock 栏悬浮桌面，一键启动程序、文件夹和系统位置。
 
+## 微信专用：点它自己的托盘图标（v1.21.6，未发版）
+
+按用户要求定的最终分工：**只有微信**走「打开系统托盘那条路」（点它自己的托盘图标），
+**其他软件一律保持正常启动**。
+
+### 为什么这个手段是安全的
+
+调 UIA `Invoke` 点**微信自己的托盘图标**，等价于用户手动点一下 —— 应用走它自己的恢复流程，
+渲染表面与内部状态一起就位。这与前三次失败的「外部操纵窗口」有本质区别：
+
+| 手段 | 范围 | 结果 |
+|---|---|---|
+| `ShowWindow(SW_SHOW)` | 全量（v1.21） | 微信可见但点哪都没反应 |
+| `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` | 全量（v1.21.3） | Electron 黑屏、WeGame 卡死、进程退出 |
+| 同一手段 | 只微信（v1.21.4） | 微信卡 |
+| **点它自己的托盘图标** | **只微信（本版）** | **✅ 恢复后可用** |
+
+### 实测
+
+```
+先隐藏成托盘态        → vis=False
+候选名：微信 / Weixin / …
+ClickTrayIcon => 1
+恢复后                → vis=True
+```
+
+链路：`run-app` 的 `tray` 分支 → `WECHAT_EXES`（`weixin.exe` / `wechat.exe`）判定 →
+`clickTrayIconFor()`（写一份带 BOM 的临时 .ps1，异步 `execFile` 跑 UIA，8s 超时，绝不阻塞主进程）
+→ `waitForWechatWindow()` 轮询 6×400ms 确认窗口真的出现 → 出现才算成功。
+点不中 / 没出窗口 → 记一条 warn，**退回正常启动**（不会让用户点了没反应）。
+
+其他应用（WeGame、Listen1、Clash 等）：`tray` 分支只记一行日志，然后按以前的节奏启动。
+
+## 微信专用恢复也失败：这条思路彻底放弃（v1.21.5，未发版）
+
+v1.21.4 我把 `SC_RESTORE` 收窄成**只对微信**（`RESTORE_SAFE = { weixin.exe, wechat.exe }`），
+当时用「渲染子窗口 `MMUIRenderSubWindowHW` 1219×998 可见」判定成功。用户实测：**微信打开就卡**。
+
+**判据是错的**：渲染表面存在 ≠ 界面能响应。这正是本项目反复记录的那条
+「消息层/渲染层活着 ≠ 界面活着」，我第二次踩在同一个坑里（第一次是 v1.21 的假窗口）。
+
+### 三次尝试的完整记录
+
+| 版本 | 手段 | 范围 | 结果 |
+|---|---|---|---|
+| v1.21 | `ShowWindow(SW_SHOW)` | 全量 | 微信可见但点哪都没反应 |
+| v1.21.3 | `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` | 全量 | Electron 黑屏（Listen1）、WeGame 卡死、微信/WeGame 进程退出 |
+| v1.21.4 | 同一手段，**只对微信**启用 | 微信 | 微信卡（用户实测） |
+
+**结论：Qt+CEF（微信 4）和 Electron 应用，从外部恢复隐藏窗口必然得到「渲染表面与内部状态脱节」的窗口。**
+唯一安全的恢复方式是它自己的托盘图标（用户已否决），所以托盘态一律走正常启动。
+
+### 本次改动
+
+`QLActivate.Restore`、助手指令 `RESTORE <b64>`、`helperRestoreOnce()`、`restoreHiddenWindow()`、
+`RESTORE_SAFE` 全部删除；构建产物里 `SC_RESTORE` / `RESTORED=` 命中数为 **0**。
+`run-app` 的 `tray` 分支现在只剩一行日志，然后落到正常启动流程。
+
+## 🚨 撤回 v1.21.3 的「托盘态 SC_RESTORE」（v1.21.4，未发版）
+
+v1.21.3 想用 `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` 让托盘里的应用自己恢复窗口。
+在微信（Qt）上实测成功，**但在 Electron/Chromium 应用上会造成黑屏**：
+
+| 应用 | 结果 |
+|---|---|
+| 微信 4（`Qt51514QWindowIcon` + `MMUIRenderSubWindowHW`） | 子窗口重建、画面正常 |
+| **Listen1（Electron，`Chrome_WidgetWin_1`）** | 窗口壳变可见，但子窗口 **`Intermediate D3D Window` 仍不可见** → **黑屏** |
+| **WeGame** | 直接卡死；随后 WeChat / WeGame 进程都退出了 |
+
+用户报障原话：「启动的软件不是卡就是黑屏，启动不起来」。
+
+**结论：这条路对 Chromium 系应用不安全，已整条删除**（`QLActivate.Restore`、助手指令
+`RESTORE <b64>`、`helperRestoreOnce()`、`restoreHiddenWindow()` 全部移除，
+`SC_RESTORE` / `WM_SYSCOMMAND` 在构建产物里命中数为 0）。
+
+现在的规则（回归「简单 + 安全」）：
+
+```
+正在运行 + 有可见/最小化窗口 → 激活那个窗口（绝不开新实例）
+其他任何情况               → 按正常节奏启动
+```
+
+⚠️ 所以托盘里的应用会按正常启动处理（微信可能多开一个实例/弹登录窗）——
+这是「不去碰别人的窗口」的必然代价，已记录在 CLAUDE.md，别再试图用
+`ShowWindow` 或 `SC_RESTORE` 去强行唤出。
+
+## 托盘态复用已有实例 + 启动后 Dock 直接收进托盘（v1.21.3，未发版）
+
+### ① 收在托盘里的应用，点图标也不再新开实例（不碰系统托盘、不强显窗口）
+
+用户要求：像微信这种完全收在托盘里的应用，点 Dock 图标也要用**已有实例**，
+而「点它自己的托盘图标」那条路已经被否掉。解法是让**应用自己**恢复窗口：
+
+```
+PostMessage(hiddenWindow, WM_SYSCOMMAND, SC_RESTORE, 0)
+```
+
+`SC_RESTORE` 走的是应用自己的消息循环（等同于用户右键选「还原」），Chromium/Qt 会**重新创建渲染表面**。
+这与 v1.21 那次事故里的 `ShowWindow(SW_SHOW)` 有本质区别 —— 后者只把窗口壳显示出来，渲染表面已经销毁，
+得到的是「可见但点哪都没反应」的假窗口。
+
+**实测（微信 4，`hwnd=22744042` `Qt51514QWindowIcon` 1237×1007）**：
+
+| 步骤 | 结果 |
+|---|---|
+| 初始（收在托盘） | `vis=0`，`Probe=-1` |
+| `[QLActivate]::Restore()` | 返回 1 |
+| 之后 | `vis=1`、`Probe=1`、拿到前台 |
+| 子窗口 | `MMUIRenderSubWindowHW` **可见、1219×998 = 整个客户区**（渲染表面已重建） |
+| 截图 | 会话列表 / 聊天记录 / 文件卡片 / 输入框全部正常，是活画面 |
+
+实现：`ps.ts` 的 `QLActivate.Restore(exePath)` + 助手指令 `RESTORE <b64>`（返回 `RESTORED=1`）
+→ `index.ts` 的 `helperRestoreOnce()` / `restoreHiddenWindow()`；`run-app` 的 `tray` 分支先试这条，
+**恢复不回来就退回正常启动**（WeGame 那种「进程在、窗口永不出现」的只能这样）。
+
+`settings.afterLaunch` 的 `hide` 三态照旧，**没有任何托盘枚举 / UIA / 任务栏操作**。
+
+### ② 启动软件后 Dock 直接收进系统托盘
+
+`DEFAULT_SETTINGS.afterLaunch` 从 `sink`（让位沉底、窗口仍可见）改为 **`hide`（整条收进托盘）** ——
+用户要求「点击打开软件之后 Dock 自动退回系统托盘，不要再在软件上面或下面浮现」。
+用户现有 `settings.json` 里的 `afterLaunch` 也已一并改掉（该值持久化，改默认值不会覆盖已有配置）。
+
 ## 修「点了没反应」：占位窗口被当成主窗 + 点完托盘不复核（v1.21.1，未发版）
 
 **用户报障**：WeGame 收在系统托盘时，点 Dock 图标打不开（既不出窗，也没有任何提示）。

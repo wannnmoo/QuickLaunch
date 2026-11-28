@@ -294,7 +294,7 @@ Write-Output $b64`
       // ⚠️ 只取**最后一行**：这个脚本里 `Add-Type` 编译、`[Console]::OutputEncoding`
       //    赋值以及将来任何新增的语句都可能往 stdout 漏一行（v1.13.8 就因为
       //    「未抑制的方法返回值」把桌面图标开关整条特性搞哑了）。base64 是最后写的，
-      //    取最后一行即可，比「整段 trim 当载荷」稳得多（与 clickTrayIconFor 一致）。
+      //    取最后一行即可，比「整段 trim 当载荷」稳得多。
       const lines = String(stdout ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
       const b64 = lines.length > 0 ? lines[lines.length - 1] : ''
       if (err || !b64) { resolve(''); return }
@@ -1181,18 +1181,20 @@ function splitArgs(input: string): string[] {
   return result
 }
 
-/** 点图标前是否先探询「目标是不是已经在运行」。
+/** 点图标前是否先探询「这个进程是不是已经在跑、而且有窗口」。
  *
- *  ✅ **v1.19.2 起改为 `true`**：用户报障「微信已经登录了，点图标又弹登录窗；Edge 也开不出已有窗口」——
- *  那正是这里为 `false` 的代价（直接 spawn → 单实例应用多开一个进程 → 微信弹登录窗）。
- *  配套做了两件事，避免回到当年「点了要等 1 秒 / Dock 卡住」：
- *    ① `probeTargetState()` 先花 ~60ms 用 `tasklist` 问一句「这个 exe 的进程在不在」，
- *       **没在运行就直接启动**（绝大多数点击都是这条快路），不再为它付 PowerShell 冷启动；
- *    ② 探询从 `execFileSync` 改成**异步** `execFile` —— 原来那版会在主进程里同步等
- *       ~0.9s（最坏 3.5s），期间 Dock 整个假死（悬停放大、光标动画全停）。
+ *  ✅ 规则就两条（用户 2026-11-28 定，别再扩）：
+ *    ① **有可见/最小化窗口**（Edge、微信、绝大多数应用）→ 直接激活那个窗口，
+ *       **绝不 spawn 新实例**；
+ *    ② 其余情况（没在跑 / 只在托盘里没有窗口 / 探不出结论）→ 按**以前的节奏**正常启动。
  *
- *  == true== ：先探询（running→激活；tray→点托盘图标唤出；其余→启动）
- *  == false== ：不探询，直接 spawn——微信/QQ 已登录时再点会多开一个实例（弹登录窗） */
+ *  🚫 **绝不碰系统托盘**（v1.21.2 起）：不枚举托盘、不 UIA 点托盘图标、不显示任务栏。
+ *  用户原话：「为什么点击 WeGame 这类软件，都要看系统托盘有没有打，还要点一下系统托盘？」——
+ *  那条路已整段删除（`clickTrayIconFor` / `TRAY_CLICK_CS` / `waitForWindowShown` 全没了），
+ *  `runApp` 也不再返回 `'in-tray'`。
+ *
+ *  探询本身用 ~60ms 的 `tasklist` 快路先判进程在不在，异步执行，不会卡住 Dock；
+ *  常驻助手可用时一次往返 ~20ms。 */
 const PROBE_BEFORE_LAUNCH = true
 
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
@@ -1206,43 +1208,29 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // 只对「无启动参数的本地 exe」这么做：带参数时用户要的多半是明确的新行为
   // （例如某些工具用参数开新窗口），不能替他改语义。
   if (PROBE_BEFORE_LAUNCH && !args) {
-    // 探询/激活走**常驻助手**（预热后每次 ~20ms，见 ensureActivateHelper）。
-    // 它内部就是原来那套 C# 判定：running → 激活；tray → UIA 点托盘图标；
-    // absent → 启动；failed → fail-open 启动。助手没起来时 probeTargetState 自己退回慢路。
+    // 探询走**常驻助手**（预热后每次 ~20ms，见 ensureActivateHelper）；助手没起来时
+    // probeTargetState 自己退回一次性 PowerShell。
+    // running（有可见/最小化窗口）→ 激活它，绝不开新实例；
+    // **其余一律落到下面的启动流程**（tray 托盘态也不做任何唤出尝试，v1.21.4 定案）。
     const state = await probeTargetState(targetPath)
     if (state === 'running') {
-      // 已经是用户想要的那个窗口在前台了。按「启动后行为」让出桌面（默认与启动成功一致）
+      // 已经有窗口了：激活它，绝不再开一个实例。按「启动后行为」让出桌面（与启动成功一致）
       hideDockAfterLaunch()
       return true
     }
     if (state === 'tray') {
-      // 程序在运行、但窗口收在托盘里（微信/QQ 关到托盘就是这种状态）。
-      // ⚠️ **绝不能启动新进程**：那会多开一个实例，微信会弹登录窗口 —— 用户报的正是这个。
-      // ✅ 正确做法：用 UI Automation 点**它自己的**托盘图标，让应用走自己的恢复流程
-      //    （见 clickTrayIconFor；等价于用户自己点托盘图标，不碰它的窗口、不动鼠标）。
-      // ⚠️ 也**不要试图直接 `ShowWindow` 把隐藏窗口显示出来**（v1.21 实测踩过）：
-      //    微信 4 是 Chromium 应用，躲进托盘时渲染表面已销毁，强行显示只会得到一个
-      //    「窗口可见、点哪都没反应」的假窗口。细节见 CLAUDE.md 同名条目。
-      const clicked = await clickTrayIconFor(targetPath)
-      if (clicked) {
-        // ⚠️ 「点到了图标」≠「应用真的把窗口显示出来了」（v1.21.1 修，WeGame 实测）：
-        //    WeGame 的托盘图标能点中（`ClickTrayIcon` 返回 1），但它的窗口不会出现 ——
-        //    单点 / 真实鼠标单击 / 真实双击 / 再启一次 exe 全都试过，一律无效（进程数保持 1，
-        //    说明单实例接管了，只是它自己不建窗）。那种状态下 `clicked === true` 会让上层
-        //    以为成功、什么都不提示，用户看到的就是「点了没反应」。
-        //    所以这里**复核**：确实出现了可见/最小化窗口才算成功（微信约 1s 才出窗，要轮询）。
-        const shown = await waitForWindowShown(targetPath)
-        if (shown) {
+      // 托盘态（窗口隐藏）：**只有微信**走「点它自己的托盘图标」，其余应用一律按正常流程启动。
+      // 这条分工是用户 2026-11-28 定的：「只对微信进行打开系统托盘那条路，其他软件保持正常」。
+      if (WECHAT_EXES.has(basename(targetPath).toLowerCase())) {
+        const clicked = await clickTrayIconFor(targetPath)
+        if (clicked && (await waitForWechatWindow(targetPath))) {
           hideDockAfterLaunch()
-          return true // 已唤出，等同于启动成功
+          return true
         }
-        logWarn('launcher', `已点中托盘图标但目标仍未显示窗口: ${targetPath}`)
-        return 'in-tray'
+        logWarn('launcher', `微信托盘点击未唤出窗口，按正常流程启动: ${targetPath}`)
+      } else {
+        logInfo('launcher', `托盘态按正常流程启动: ${targetPath}`)
       }
-      // UIA 不可用 / 没找到它的托盘图标：退回「提示用户自己点托盘图标」，
-      // **依然不启动新进程**（多开出来的是登录窗口，比让用户多点一下糟得多）
-      console.log('[launcher] 托盘图标未能点击，提示用户自行点击:', targetPath)
-      return 'in-tray'
     }
     if (state === 'failed') {
       // ⚠️⚠️ v1.13.8 修：这里**不再拦**（fail-open），直接落到下面的启动流程。
@@ -2798,19 +2786,36 @@ Write-Output "STATE=$r"`],
 // 托盘相关的中文名（UIA 元素的 Name 是中文）。放 TS 侧，C# 保持纯 ASCII。
 // 溢出面板用**类名** TopLevelWindowForOverflowXamlIsland 定位（C# 里），它的中文 Name
 // 在不同系统语言下会变，所以不靠名字。这个按钮的名字是稳定的。
-const TRAY_SHOW_HIDDEN_NAME = '显示隐藏的图标'
-
-/** 目标程序收在托盘时，用 UIA 点它的托盘图标把它唤出来。
- *  返回 true = 已点击（调用方按「已唤出」处理）。
+/** 允许走「点它自己的托盘图标」恢复窗口的应用 —— **只有微信**。
  *
- *  ⚠️⚠️ 脚本必须写成**带 UTF-8 BOM 的 .ps1 再 `-File` 执行，不能用 `-Command` 传文本**
- *  （这条是踩出来的，非常隐蔽）：`-Command` 的文本要经过**系统 ANSI 代码页**解码，
- *  脚本里的中文会被截成半个字符 —— 实测报
- *  `[QLTray]::ClickTrayIcon('显示隐藏的图�?, …) 字符串缺少终止符`，
- *  整条 PowerShell 解析失败、又因为 stdout 已被消费而**看不到任何输出**，
- *  表现就是「调用方静默死住」。带 BOM 的 .ps1 由 PowerShell 按 UTF-8 读，编码有确定保证，
- *  也不再依赖系统区域设置（中文 Win 是 GBK，其它语言机器会直接坏掉）。
- *  实测：`-Command` 失败 / BOM+.ps1 `-File` 连续两次成功。 */
+ *  为什么只有它：这是唯一实测能让微信恢复且**界面能动**的方式（用户手动点托盘图标 = 同一条路）。
+ *  外部手段全部失败并已记账：`ShowWindow(SW_SHOW)` 得到点不动的假窗口；`SC_RESTORE` 让
+ *  Electron 应用黑屏、微信卡死（v1.21 / v1.21.3 / v1.21.4 三次实测）。
+ *  为什么不给别的应用：点了托盘图标也不一定唤得出（WeGame 点了没反应），而那条路要开溢出面板、
+ *  屏幕上会闪一下 —— 没必要为没验证过的应用付这个代价。 */
+const WECHAT_EXES = new Set(['weixin.exe', 'wechat.exe'])
+
+/** 微信点完托盘图标之后，确认窗口真的出现了（最多 ~2.4s）。
+ *
+ *  只信「`Probe` 说 running」：它命中可见/最小化窗口时顺手置前，正是我们要的。
+ *  一次性检查不够 —— 微信点完约 1s 才出窗。 */
+async function waitForWechatWindow(targetPath: string): Promise<boolean> {
+  for (let i = 0; i < 6; i++) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, 400))
+    if ((await helperProbeOnce(targetPath)) === 'running') return true
+  }
+  return false
+}
+
+/** 点**它自己的**系统托盘图标，让应用走自己的恢复流程（= 用户手动点托盘图标）。
+ *
+ *  ⚠️ 这是唯一安全的重建方式：微信 4 被外部 `ShowWindow` / `SC_RESTORE` 唤出来后都是
+ *  「表面在、界面不动」的假窗口（v1.21 / v1.21.3 / v1.21.4 三次实测），点它自己的托盘图标则
+ *  等于用户操作，渲染表面与内部状态一起就位（实测 `托盘点击输出: 1` 后微信正常可用）。
+ *
+ *  🚫 只给**微信**用（`WECHAT_TRAY_HINT`）：其他应用一律按正常流程启动，不碰它们的窗口。
+ *  🚫 不要改成 execFileSync：UIA 的 Invoke 在完整应用里会卡住，同步调用会冻住整个 Dock。
+ *  ⚠️ 脚本文件名必须每次唯一，`rmSync` 才不会删掉另一次还没读到的脚本。 */
 function clickTrayIconFor(targetPath: string): Promise<boolean> {
   const exeName = basename(targetPath).replace(/\.[^.]+$/, '') // Weixin.exe → Weixin
   // ⚠️ 文件名必须**每次唯一**（原来只带 pid）：600ms 内点两个不同的托盘型应用时，
@@ -2890,6 +2895,20 @@ try {
     return Promise.resolve(false)
   }
 }
+
+const TRAY_SHOW_HIDDEN_NAME = '显示隐藏的图标'
+
+/** 目标程序收在托盘时，用 UIA 点它的托盘图标把它唤出来。
+ *  返回 true = 已点击（调用方按「已唤出」处理）。
+ *
+ *  ⚠️⚠️ 脚本必须写成**带 UTF-8 BOM 的 .ps1 再 `-File` 执行，不能用 `-Command` 传文本**
+ *  （这条是踩出来的，非常隐蔽）：`-Command` 的文本要经过**系统 ANSI 代码页**解码，
+ *  脚本里的中文会被截成半个字符 —— 实测报
+ *  `[QLTray]::ClickTrayIcon('显示隐藏的图�?, …) 字符串缺少终止符`，
+ *  整条 PowerShell 解析失败、又因为 stdout 已被消费而**看不到任何输出**，
+ *  表现就是「调用方静默死住」。带 BOM 的 .ps1 由 PowerShell 按 UTF-8 读，编码有确定保证，
+ *  也不再依赖系统区域设置（中文 Win 是 GBK，其它语言机器会直接坏掉）。
+ *  实测：`-Command` 失败 / BOM+.ps1 `-File` 连续两次成功。 */
 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
 // 只能通过 SetWindowPos 调 Windows API 实现真正沉底。
@@ -3601,15 +3620,6 @@ app.on('will-quit', () => {
  *  ⚠️ 必须**轮询**，不能只查一次：微信点完托盘约 1s 才出窗，一次性检查会把它误判成失败。
  *  这里的探询同时充当「把窗口抬到前台」的动作（`Probe` 命中可见窗口时会置前）。
  *  最多等 `tries × 400ms`（默认 ~2.5s）：真的不建窗的应用（WeGame 实测）只能认。 */
-async function waitForWindowShown(targetPath: string, tries = 6): Promise<boolean> {
-  for (let i = 0; i < tries; i++) {
-    const s = await helperProbeOnce(targetPath)
-    if (s === 'running') return true
-    if (s === 'absent') return false // 进程都退出了，再等也没意义
-    await new Promise((resolve) => setTimeout(resolve, 400))
-  }
-  return false
-}
 
 app.on('window-all-closed', () => {
   // 切换停靠边时会 destroy 旧窗口再建新的：这一瞬间没有窗口，不能当成「用户关掉了应用」
