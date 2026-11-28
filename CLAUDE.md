@@ -493,8 +493,20 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
        「UIA 描述的是存在的 UI 对象，隐藏的图标没有 UI」；
     3. `Shell_NotifyIconGetRect` 对溢出区里的图标拿不到可用矩形。
     结论：**要么让应用自己恢复（任务栏得在屏幕上），要么什么都不做**，没有第三条路。
-  - `SetForegroundWindow` 会被 Windows 前台锁拒绝（实测 `False`），
-    **必须配 `AttachThreadInput`** 挂到当前前台线程才成功（这条实测有效）
+  - ⚠️⚠️ **选窗必须按「像不像主窗」分档，不能只看可见度（v1.21.1 修，WeGame 实测）**：
+    WeGame 同时有两个窗口 —— `#32770` `no_active_wnd`（**可见**、0×0、`WS_EX_TOOLWINDOW|NOACTIVATE`，
+    是占位窗）和 `TWINCONTROL` `Wegame`（**隐藏**、1438×900，才是真主窗）。
+    原来的排序只把「是否 tool window」当作同档位内的 +1，于是**可见的占位窗压过隐藏的真主窗**
+    → `Probe` 返回 1「已激活」→ 上层 `return true`，Dock 让位、什么也没发生（用户看到的「点了没反应」）。
+    现在 `MainWindowScore()` 先判可信度再看可见度：
+    `2 = 有标题 + 非 tool/owned + 非 WS_EX_NOACTIVATE + 尺寸 ≥ 100×100`，`1 = 其余可疑窗`（仍可选，
+    照顾只有工具窗的托盘应用），`total = score*100 + rank*10` —— 可信窗**永远**压过可疑窗。
+  - ⚠️⚠️ **`clickTrayIconFor` 返回 1 只代表「点到了图标」，不代表「窗口出来了」**：
+    WeGame 的托盘图标 UIA `Invoke` / 真实鼠标单击 / 真实双击都返回 1，但它的窗口**不会出现**
+    （它自己卡在「进程在、窗口不建」，连再启一次 exe 都只被单实例接管、仍不建窗）。
+    所以点完必须 `waitForWindowShown()` **轮询复核**（6 × 400ms）——微信点完约 1s 才出窗，
+    只查一次会把**它**误判成失败；确认出现可见/最小化窗口才 `return true`，否则 `'in-tray'`
+    并提示「点托盘图标，或右键退出后重开」。**别改回 `if (clicked) return true`。**
   - 匹配**优先用可执行文件路径**（大小写不敏感），读不到路径时按**进程名**兜底（v1.13.8，见上）；跳过无标题窗口与 IME 辅助窗口；
     **只对「无启动参数的本地 exe」生效**（带参数时用户要的多半是明确的新行为，别替他改语义）
   - 返回值是**联合类型** `true | false | 'in-tray'`（`src/preload` 的 `RunAppResult`，`env.d.ts` 同步）。

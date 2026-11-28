@@ -1871,7 +1871,10 @@ function App(): React.ReactElement {
           flagLaunchFailed()
           showDropHint('启动失败：目标不存在或无法运行')
         } else if (ok === 'in-tray') {
-          showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
+          // 两种可能：① 任务栏上找不到它的托盘图标；② 图标点中了但应用自己不建窗
+          // （WeGame 实测会卡成这种「进程在、窗口不出」的状态，外面用什么办法都唤不出来）。
+          // 所以除了「点托盘」，再给一条一定能自救的路。
+          showDropHint('已在运行但窗口打不开：点托盘图标，或右键退出后重开')
         }
       })
       .catch(() => {

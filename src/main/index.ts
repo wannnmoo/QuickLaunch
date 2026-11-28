@@ -1225,8 +1225,19 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       //    「窗口可见、点哪都没反应」的假窗口。细节见 CLAUDE.md 同名条目。
       const clicked = await clickTrayIconFor(targetPath)
       if (clicked) {
-        hideDockAfterLaunch()
-        return true // 已唤出，等同于启动成功
+        // ⚠️ 「点到了图标」≠「应用真的把窗口显示出来了」（v1.21.1 修，WeGame 实测）：
+        //    WeGame 的托盘图标能点中（`ClickTrayIcon` 返回 1），但它的窗口不会出现 ——
+        //    单点 / 真实鼠标单击 / 真实双击 / 再启一次 exe 全都试过，一律无效（进程数保持 1，
+        //    说明单实例接管了，只是它自己不建窗）。那种状态下 `clicked === true` 会让上层
+        //    以为成功、什么都不提示，用户看到的就是「点了没反应」。
+        //    所以这里**复核**：确实出现了可见/最小化窗口才算成功（微信约 1s 才出窗，要轮询）。
+        const shown = await waitForWindowShown(targetPath)
+        if (shown) {
+          hideDockAfterLaunch()
+          return true // 已唤出，等同于启动成功
+        }
+        logWarn('launcher', `已点中托盘图标但目标仍未显示窗口: ${targetPath}`)
+        return 'in-tray'
       }
       // UIA 不可用 / 没找到它的托盘图标：退回「提示用户自己点托盘图标」，
       // **依然不启动新进程**（多开出来的是登录窗口，比让用户多点一下糟得多）
@@ -3584,6 +3595,21 @@ app.on('will-quit', () => {
   // 否则「刚改完就退出」那一下会跟着进程一起消失。
   flushSettingsWrite()
 })
+
+/** 点完托盘图标之后，等应用把窗口真的显示出来。
+ *
+ *  ⚠️ 必须**轮询**，不能只查一次：微信点完托盘约 1s 才出窗，一次性检查会把它误判成失败。
+ *  这里的探询同时充当「把窗口抬到前台」的动作（`Probe` 命中可见窗口时会置前）。
+ *  最多等 `tries × 400ms`（默认 ~2.5s）：真的不建窗的应用（WeGame 实测）只能认。 */
+async function waitForWindowShown(targetPath: string, tries = 6): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    const s = await helperProbeOnce(targetPath)
+    if (s === 'running') return true
+    if (s === 'absent') return false // 进程都退出了，再等也没意义
+    await new Promise((resolve) => setTimeout(resolve, 400))
+  }
+  return false
+}
 
 app.on('window-all-closed', () => {
   // 切换停靠边时会 destroy 旧窗口再建新的：这一瞬间没有窗口，不能当成「用户关掉了应用」

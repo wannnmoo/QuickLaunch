@@ -460,6 +460,8 @@ public static class QLActivate
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
@@ -544,6 +546,34 @@ public static class QLActivate
         return 1;
     }
 
+    /// How much does this window look like the app's real main window?
+    ///   2 = plausible main window: titled, not a tool/owned window, activatable, real size
+    ///   1 = titled but suspicious: tool window / owned / WS_EX_NOACTIVATE / tiny or zero size
+    ///       (only used when nothing better exists -- some tray utilities only have one of these)
+    ///   0 = not a candidate at all (untitled / IME helper)
+    ///
+    /// Why the "suspicious" tier exists (WeGame, measured 2026-11-28): its process owns BOTH
+    ///   hwnd=329972  #32770     no_active_wnd  vis=1  0x0     WS_EX_TOOLWINDOW|NOACTIVATE
+    ///   hwnd=328198  TWINCONTROL "Wegame"      vis=0  1438x900  (the real window, in the tray)
+    /// The old ranking only used "is tool window" as a tie-breaker INSIDE the same visibility
+    /// rank, so the visible 0x0 placeholder won -> Probe reported "already visible/activated"
+    /// -> clicking the Dock icon only hid the Dock and nothing else ever happened.
+    static int MainWindowScore(IntPtr h)
+    {
+        var t = new StringBuilder(256); GetWindowText(h, t, 256);
+        if (t.Length == 0) return 0;
+        var c = new StringBuilder(256); GetClassName(h, c, 256);
+        if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return 0;
+        long ex = GetWindowLong(h, -20 /* GWL_EXSTYLE */);
+        bool noActivate = (ex & 0x08000000 /* WS_EX_NOACTIVATE */) != 0;
+        RECT r;
+        int w = 0, hh = 0;
+        if (GetWindowRect(h, out r)) { w = r.R - r.L; hh = r.B - r.T; }
+        bool realSize = w >= 100 && hh >= 100;
+        if (IsHelperWindow(h) || noActivate || !realSize) return 1;
+        return 2;
+    }
+
     static IntPtr FindWindowIn(HashSet<int> pids)
     {
         IntPtr found = IntPtr.Zero;
@@ -552,16 +582,13 @@ public static class QLActivate
         {
             uint pid; GetWindowThreadProcessId(h, out pid);
             if (!pids.Contains((int)pid)) return true;
-            var t = new StringBuilder(256); GetWindowText(h, t, 256);
-            var c = new StringBuilder(256); GetClassName(h, c, 256);
-            if (t.Length == 0) return true;
-            if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            // Keep scanning: the best (most visible) candidate may come later.
-            // Same rank: prefer a real main window over a tool/owned helper. WeChat 4 keeps
-            // several hidden titled windows (e.g. "Weixin" = Qt QWindowToolSaveBits); picking
-            // one of those by enumeration order would restore a tooltip instead of the app.
-            int rank = RankWindow(h) * 10 + (IsHelperWindow(h) ? 0 : 1);
-            if (rank > best) { best = rank; found = h; }
+            int score = MainWindowScore(h);
+            if (score == 0) return true;
+            // Plausibility dominates visibility: a real (even hidden) main window must win over
+            // a visible placeholder. Among equally plausible windows, the old rule still holds:
+            // 3 = on screen, 2 = minimized, 1 = hidden (tray).
+            int total = score * 100 + RankWindow(h) * 10;
+            if (total > best) { best = total; found = h; }
             return true;
         }, IntPtr.Zero);
         return found;
@@ -796,6 +823,11 @@ public static class QLTray
     // Click the tray icon whose tooltip contains any candidate name.
     // Returns 1 = clicked, 0 = no matching icon (nothing clicked), -1 = tray panel unavailable.
     // The flyout is closed again afterwards so it is never left sitting on screen.
+    // Only the OVERFLOW flyout is searched on purpose. A "visible tray area" search was tried
+    // and reverted (v1.21): that area is a single XAML island whose buttons include the
+    // taskbar's own entries and the IME indicator -- their names contain the same words as our
+    // candidates ("微信 已固定" / "任务栏输入指示 ... 微信输入法"), so a substring match would
+    // click the wrong thing. Both WeChat and WeGame keep their icon in the overflow anyway.
     public static int ClickTrayIcon(string showHiddenName, string[] candidates)
     {
         var btn = FindButton(showHiddenName);
