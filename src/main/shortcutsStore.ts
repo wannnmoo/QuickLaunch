@@ -110,6 +110,31 @@ export function writeShortcuts(data: unknown[]): void {
 /** 批量把条目上的内联图标外置成 iconFile（A1）。renderer 在保存前调它，
  *  这样内存里的 React state 也不再持有 base64 —— 之后每次保存只有几十字节/条。 */
 
+/** `shortcuts.json` 的两份旁路副本里引用到的图标文件名。
+ *
+ *  用途只有一个：保存后清理孤儿图标时，这两份文件引用的图标**不能删**。
+ *  `writeFileAtomic` 会在写新内容之前把旧文件复制成 `.bak`，所以此时 `.bak` 里是
+ *  **上一代**条目 —— 换一次图标之后，上一代那个 `iconFile` 就不再被当前条目引用；
+ *  不把它并进保留集，`.bak` 会立刻变成「引用了已删除文件的备份」，而
+ *  「主文件损坏 → 从 .bak 恢复」正是它存在的唯一意义。 */
+function preservedIconNames(): string[] {
+  const names: string[] = []
+  for (const file of [`${shortcutsPath}.bak`, `${shortcutsPath}.recovery`]) {
+    try {
+      const raw: unknown = JSON.parse(readFileSync(file, 'utf-8'))
+      if (!Array.isArray(raw)) continue
+      for (const item of raw) {
+        if (!item || typeof item !== 'object') continue
+        const name = (item as Record<string, unknown>).iconFile
+        if (typeof name === 'string' && name) names.push(name)
+      }
+    } catch {
+      // 文件不存在 / 不可解析：跳过（这本就是 best-effort）
+    }
+  }
+  return names
+}
+
 /** 注册 shortcuts 读写相关的 IPC（load / save / externalize-icons）。
  *  handler 必须在 app ready 前后都能安全调用，所以这里只做注册、不做 IO。 */
 export function registerShortcutsIpc(): void {
@@ -155,9 +180,6 @@ export function registerShortcutsIpc(): void {
     }
     try {
       writeShortcuts(entries)
-      // 不再被引用的图标文件顺手清掉（改图标、删条目都会留下孤儿文件）
-      pruneIcons(entries)
-      return true
     } catch (err) {
       // 不能静默吞掉：renderer 据此提示「保存失败」，否则用户以为已经写盘
       logError('persist', 'save-shortcuts 写盘失败', err)
@@ -173,6 +195,17 @@ export function registerShortcutsIpc(): void {
       }
       return false
     }
+    // ⚠️ 清孤儿图标必须在写盘的 try **之外**：它只是顺手回收，抛错（目录被删 / 权限）
+    //    不该让一次**已经写成功**的保存对外报 false —— 那会让用户看到「保存失败」
+    //    而反复重试，同时多落一份没必要的 .recovery。
+    try {
+      // 传 preservedIconNames()：`.bak` / `.recovery` 引用的图标不能当孤儿删掉，
+      // 否则「主文件损坏 → 从 .bak 恢复」会恢复出一堆破图（见该函数注释）
+      pruneIcons(entries, preservedIconNames())
+    } catch (err) {
+      logWarn('icons', '保存后清理孤儿图标失败（忽略）', err)
+    }
+    return true
   })
 
   ipcMain.handle('externalize-icons', (_event, entries: unknown) => {

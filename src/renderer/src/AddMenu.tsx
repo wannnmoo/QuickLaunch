@@ -15,6 +15,7 @@
  * 卡里再进完整窗口）。菜单从此只有**动作**，没有任何配置入口。
  * 再加菜单项前先问：它是不是「配置」？是就进设置卡/设置窗口。
  */
+import { useLayoutEffect, useState } from 'react'
 import type { CSSProperties, RefObject } from 'react'
 
 type Props = {
@@ -35,6 +36,31 @@ type Props = {
 
 export default function AddMenu(p: Props): React.JSX.Element | null {
   const { menuPos } = p
+
+  // ⚠️ **早退必须放在所有 hook 之后**：原来 `if (!menuPos) return null` 写在这两个 hook
+  //    上面，于是「菜单关着」= 0 个 hook、「菜单打开」= 2 个 hook —— 这是条件 hooks，
+  //    违反 Hook 规则。实测 React 19 在打包版里侥幸不崩（dev 构建每次首开会往 main.log
+  //    抛一句 `Expected static flag was missing`），但它只依赖 React 实现细节活着：
+  //    任何一个补丁版本收紧检查、或者以后在早退之前再加一个 hook，就会立刻变成
+  //    「点「+」直接进崩溃屏」。这里把 hook 提前，渲染结果逐像素不变。
+
+  // 水平位置：以「+」按钮中心居中，但必须按**实测菜单宽度**钳制。
+  // ⚠️ 旧写法用的是固定 100px（`Math.min(Math.max(cx, 100), innerWidth - 100)`）：
+  //    菜单加了几行后实测宽 ~200px，右边缘只剩 innerWidth-5，而 `--sf-shadow` 的
+  //    blur 是 30px —— 阴影整个被窗口边界裁掉，右侧看上去「没有阴影」（用户 2026-11-28 截图）。
+  //    现在按 半宽 + 阴影余量 钳制，四边都留出投影空间。
+  const [left, setLeft] = useState(menuPos?.cx ?? 0)
+  useLayoutEffect(() => {
+    if (!menuPos) return
+    const w = p.menuRef.current?.offsetWidth ?? 200
+    const half = w / 2
+    const pad = 26 // 阴影横向外扩（blur 30 / 2 = 15，再留 11px 余量，覆盖 125%/150% 缩放）
+    const min = half + pad
+    const max = window.innerWidth - half - pad
+    const next = min > max ? window.innerWidth / 2 : Math.min(Math.max(menuPos.cx, min), max)
+    setLeft(next)
+  }, [menuPos, p.menuRef])
+
   if (!menuPos) return null
 
   return (
@@ -42,9 +68,7 @@ export default function AddMenu(p: Props): React.JSX.Element | null {
       ref={p.menuRef}
       className="dropdown-menu"
       style={{
-        // 水平钳制在窗口内：菜单以按钮中心为锚点居中，若按钮靠近窗口右缘，
-        // 菜单会伸出窗口被裁掉右角（圆角变直角）。钳到距边缘 100px 内保证完整
-        left: Math.min(Math.max(menuPos.cx, 100), window.innerWidth - 100),
+        left,
         // 贴边锚点与右键菜单一致（Dock 毛玻璃条外侧 8px）——若锚在「+」按钮内侧，
         // 菜单边会正好贴在玻璃条边上，看起来完全没有间距
         ...p.overlayAnchor,

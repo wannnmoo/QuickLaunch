@@ -120,10 +120,29 @@ async function barRect(client) {
   )
 }
 
-// 与 src/main/index.ts 的 DOCK_HIT_INSET 保持一致：玻璃条靠内容那侧的 82px 透明放大区里，
-// 只有靠近玻璃条的那 20px 还要留住（悬浮标签顶边在 barTop+24.6、放大图标顶边在 barTop+54.8），
+// 与 src/main/index.ts 的 DOCK_HIT_INSET 保持一致：玻璃条靠内容那侧的透明放大区里，
+// 只有靠近玻璃条的那一段还要留住（悬浮标签顶边、放大图标顶边都在这条钢带之内），
 // 剩下的空白内缩掉、让给下层窗口。
-const INSET = 20
+// ⚠️ **内缩量随图标档位缩放**（renderer: `round(20 * iconSize / 60)`）：48 档 = 16、
+//    60 档 = 20、72 档 = 24。原来这里写死 20，于是**只要用户把图标调成 48 或 72 档，
+//    窗口高/内缩量就整体变一档，5 项断言就全体红**（实测 48 档：bar 高 134、region 顶
+//    = bar.y + 16，而断言按 +20 算 → 差 4px，超出 TOL=2）。这里改成在连接后从渲染进程
+//    读实际 `--dock-icon` 再算，与产品侧同一套公式。
+const INSET_BASE = 20
+let INSET = INSET_BASE
+/** 透明放大区高度（`.dock-inner` 的 padding-top）= 图标 + 22（App.tsx 的 DOCK_PAD_EXTRA）。
+ *  60 档 = 82，与 CLAUDE.md 里那组硬数字一致；48/72 档按同一公式派生。 */
+let PAD_PX = 82
+
+/** 按当前图标档位算出本次应使用的内缩量（60 档 = 20）与放大区高度（60 档 = 82） */
+async function syncInset(client) {
+  const iconSize = await client.eval(
+    "parseFloat(getComputedStyle(document.querySelector('.app')).getPropertyValue('--dock-icon')) || 60"
+  )
+  INSET = Math.round((INSET_BASE * iconSize) / 60)
+  PAD_PX = iconSize + 22
+  console.log(`  … 图标档位 ${iconSize}px → 内缩量 ${INSET}px、放大区 ${PAD_PX}px（60 档为 20 / 82）`)
+}
 
 function expectBarRegion(label, rect, region, { clipBottom = true } = {}) {
   if (!region) {
@@ -139,7 +158,7 @@ function expectBarRegion(label, rect, region, { clipBottom = true } = {}) {
     : Math.min(rect.ih, Math.round(rect.y + rect.h - INSET))
   check(`${label}: region left = bar.x - 8`, Math.abs(region.x - Math.max(0, Math.round(rect.x - 8))) <= TOL, JSON.stringify(region))
   check(
-    `${label}: region top = bar.y ${growUp ? '+ 20 (放大区空白内缩)' : '- 8'}`,
+    `${label}: region top = bar.y ${growUp ? `+ ${INSET} (放大区空白内缩)` : '- 8'}`,
     Math.abs(region.y - wantTop) <= TOL,
     JSON.stringify(region)
   )
@@ -149,14 +168,14 @@ function expectBarRegion(label, rect, region, { clipBottom = true } = {}) {
     JSON.stringify(region)
   )
   check(
-    `${label}: region bottom = bar.bottom ${growUp ? '+ 8' : '- 20'}`,
+    `${label}: region bottom = bar.bottom ${growUp ? '+ 8' : `- ${INSET}`}`,
     Math.abs(region.bottom - wantBottom) <= TOL && (clipBottom ? region.bottom <= rect.ih + 4 : true),
     JSON.stringify(region)
   )
-  // 关键不变量：内缩只能吃透明空白，玻璃条本体（bar 里 82px 之后的 76px）必须整块在 region 内，
-  // 否则 SetWindowRgn 会把玻璃条本身裁掉一截。改 INSET 时这一条会先红。
-  const glassTop = growUp ? rect.y + 82 : rect.y
-  const glassBottom = growUp ? rect.y + rect.h : rect.y + rect.h - 82
+  // 关键不变量：内缩只能吃透明空白，玻璃条本体（bar 里 PAD_PX 之后的部分）必须整块在
+  // region 内，否则 SetWindowRgn 会把玻璃条本身裁掉一截。改 INSET 时这一条会先红。
+  const glassTop = growUp ? rect.y + PAD_PX : rect.y
+  const glassBottom = growUp ? rect.y + rect.h : rect.y + rect.h - PAD_PX
   check(
     `${label}: region covers the glass bar itself`,
     region.y <= Math.round(glassTop) + TOL && region.bottom >= Math.round(glassBottom) - TOL,
@@ -229,6 +248,7 @@ function expectBarRegion(label, rect, region, { clipBottom = true } = {}) {
     const page = await waitForCdp()
     client = await connect(page.webSocketDebuggerUrl)
     await sleep(1200)
+    await syncInset(client)
 
     console.log('scenario 1: default (glass bar only)')
     // ⚠️ 不能只靠固定 sleep 就断言：`npm run verify` 先在同一个仓库里跑 build，

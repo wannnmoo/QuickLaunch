@@ -99,9 +99,14 @@ export function logLine(level: LogLevel, tag: string, message: string, extra?: u
   else console.log(line.trimEnd())
   if (!ready || degraded) return
   try {
-    rotateIfNeeded(line.length)
+    // ⚠️ 必须是**字节数**：`line.length` 是 UTF-16 码元数，而本文件里的日志绝大多数是
+    //    中文（UTF-8 下 3 字节/字），用它累加会把实际大小低估 2~3 倍（main.log 会长到
+    //    400~600KB 才轮转）；而且 `written` 的初值来自 statSync().size（字节），
+    //    两种口径混用会让「同一天里轮转时机前后不一致」。
+    const bytes = Buffer.byteLength(line, 'utf8')
+    rotateIfNeeded(bytes)
     appendFileSync(logPath, line, 'utf-8')
-    written += line.length
+    written += bytes
   } catch (err) {
     degraded = true
     console.error('[log] 写盘失败，后续只走控制台:', err instanceof Error ? err.message : String(err))

@@ -202,8 +202,14 @@ export function externalizeIcons(entries: unknown[]): { entries: unknown[]; chan
 }
 
 /** 删除没有被任何条目引用的图标文件（保存后调用；best-effort，失败只记日志）。
- *  只动 `icons` 目录里的普通文件，且只认扩展名白名单。 */
-export function pruneIcons(entries: unknown[]): void {
+ *  只动 `icons` 目录里的普通文件，且只认扩展名白名单。
+ *
+ *  `extraKeep`：**除了当前条目之外还要保留的文件名**。用场景是 `shortcuts.json` 的
+ *  `.bak` / `.recovery` —— 它们是「用上一代条目」的备份，而保存流程是
+ *  「写新 shortcuts.json（顺手把旧的复制成 .bak）→ 按**当前**条目清孤儿」：
+ *  换一次图标就会让 `.bak` 引用的旧图标变成孤儿被删掉，于是「主文件损坏 → 从 .bak
+ *  恢复」这条路恢复出来的条目 `iconFile` 全部 404（图标永久缺失，且没有补图路径）。 */
+export function pruneIcons(entries: unknown[], extraKeep?: Iterable<string>): void {
   const dir = iconDir()
   if (!existsSync(dir)) return
   const used = new Set<string>()
@@ -212,6 +218,7 @@ export function pruneIcons(entries: unknown[]): void {
     const name = (raw as Record<string, unknown>).iconFile
     if (typeof name === 'string' && name) used.add(name)
   }
+  if (extraKeep) for (const name of extraKeep) if (name) used.add(name)
   let removed = 0
   for (const name of readdirSync(dir)) {
     if (used.has(name)) continue

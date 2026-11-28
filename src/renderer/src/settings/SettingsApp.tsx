@@ -481,9 +481,9 @@ export default function SettingsApp() {
                   ariaLabel="点击图标后 Dock 的行为"
                   value={settings.afterLaunch}
                   options={[
+                    { v: 'sink', label: '让位沉底' },
                     { v: 'hide', label: '隐藏到托盘' },
-                    { v: 'keep', label: '保持显示' },
-                    { v: 'sink', label: '让位沉底' }
+                    { v: 'keep', label: '保持显示' }
                   ]}
                   onPick={(v) => patch({ afterLaunch: v })}
                 />

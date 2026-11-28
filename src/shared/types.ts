@@ -148,6 +148,12 @@ export interface AudioSnapshot {
   capture: AudioDevice[]
 }
 
+/** 当前默认输出设备的音量状态（0-100 整数 + 静音） */
+export interface AudioVolume {
+  level: number
+  mute: boolean
+}
+
 /** renderer 上报给主进程的命中区矩形（DIP，相对窗口内容区） */
 export interface DockHitRegionRect {
   x: number
@@ -179,7 +185,9 @@ export interface AppSettings {
   panelCloseDelay: number
   /** 启动目标后的行为 */
   afterLaunch: 'hide' | 'keep' | 'sink'
-  /** 点图标前先探询是否已在运行（微信/QQ 收托盘时点图标不重复开实例） */
+  /** ⚠️ 已废弃（v1.19.2 起开关由 `src/main/index.ts` 的 `PROBE_BEFORE_LAUNCH` 常量决定，
+   *  界面上也不再暴露）。字段只留着兼容老 `settings.json`，**不要**改成从它读开关：
+   *  老配置里遗留的 `false` 会把「点已运行的应用不再多开」这条修复静默关掉。 */
   probeBeforeLaunch: boolean
   /** 键盘唤出后可直接输入，进入搜索 */
   searchEnabled: boolean
@@ -197,8 +205,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   glassSaturate: 1.7,
   folderCardDelay: 300,
   panelCloseDelay: 180,
-  afterLaunch: 'hide',
-  probeBeforeLaunch: false,
+  // v1.19.3：默认改成「让位沉底」——点开应用后 Dock 退到所有窗口后面，而不是整条藏进托盘。
+  // 用户要的语义就是「别挡着我刚打开的东西」；沉底后 Alt+Space / 托盘仍可唤回（dockAutoSunk）。
+  afterLaunch: 'sink',
+  probeBeforeLaunch: true,
   searchEnabled: true,
   followSystemTheme: false
 }

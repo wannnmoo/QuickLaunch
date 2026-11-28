@@ -66,9 +66,43 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
 
 - `transparent: true` + `frame: false` 透明无边框窗口（300px 高，85% 屏宽 ≤ 1200px）——水平方向**恒为主显示器工作区居中**，垂直方向由停靠位置预设决定
 - `alwaysOnTop: true` + `skipTaskbar: true` — 常驻桌面，不在任务栏显示
-- **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。**只有点击其他软件（`blur`）才让位**——鼠标移出 Dock、或在其他软件上滚动滚轮都不沉底，用户可自由移动鼠标：
-  1. `blur` 事件（点击其他窗口失去焦点）→ **延迟 120ms 复核**再 `setAlwaysOnTop(false)` + `sendToBottom()`：这一拍是为了滤掉启动/重建窗口等场景的焦点抖动，期间若焦点已回到 Dock、窗口被隐藏或 `sinkSeq` 代际变了就整条取消（点击其他窗口后焦点不会在 120ms 内回来，正常让位不受影响）；**窗口已隐藏（`isVisible()` 为 false）或已收在托盘（`dockTrayHidden`）时直接跳过**——不为一次由隐藏引起的 blur 白跑一个 PowerShell 进程
-  2. `run-app` 启动目标后**自动隐藏到托盘**（`mainWindow.hide()`，不退出进程）——用户点开图标后 Dock 彻底让出桌面；托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回（`toggleWindow` 按 `isVisible()` 判断，隐藏状态下任一唤回路径均显示并恢复置顶）
+- **自动让位**：Dock 沉到 z-order 最底不遮挡，鼠标移回 / 点击 Dock / Alt+Space / 托盘唤出恢复置顶。让位有**两条**触发路径：
+  1. `blur`（点击其他窗口失去焦点）→ **延迟 120ms 复核**再 `setAlwaysOnTop(false)` + `sendToBottom()`：这一拍是为了滤掉启动/重建窗口等场景的焦点抖动，期间若焦点已回到 Dock、窗口被隐藏或 `sinkSeq` 代际变了就整条取消；**窗口已隐藏或已收在托盘时直接跳过**——不为一次由隐藏引起的 blur 白跑一个 PowerShell 进程
+  2. **退场看门狗 `sinkWatchdogTick()`（v1.19.1 新增，路径 1 在这台机器上根本不触发）**：每 500ms 一拍，判定「可见 + 没收托盘 + 没对话框 + 还在置顶层 + 光标不在玻璃条上 + 没有浮层 + 用户 2.5s 没在 Dock 上动过」→ 沉底一次。沉完 `isAlwaysOnTop()` 变 false，下一拍跳过，不会反复起 PowerShell
+     - 🚫🚫 **不要改回用 `blur` / `isFocused()` / `powerMonitor.getSystemIdleTime()` 判定**（用户报障「点击其他区域 Dock 不退到后台」，已实测）：
+       - 这扇窗的焦点状态会**卡死在 true** —— 系统前台已经是 Edge/抖音（`GetForegroundWindow` 也指向它），但 `win.isFocused()` / `document.hasFocus()` 一直是 true，Windows 也不再发 WM_KILLFOCUS。成因是窗口被前台锁拒绝激活时 `show()/focus()` 只拿到**线程内键盘焦点**；后果是 blur 永不触发（用户实机日志里整段会话 `sendToBottom` 一次都没有）
+       - `powerMonitor.getSystemIdleTime()` 在本机**恒返回 0**（实测系统已空闲 3s）
+       - ⚠️ 所以 `dock-pointer` 里**不再调 `mainWindow.focus()`**（v1.19.1 删）：悬停时抢焦点正是制造上面那种「半激活」状态的元凶；真实点击图标时系统会自己给焦点，纯悬停本来也不该抢
+     - 「用户在用 Dock」的判据：`pointerOverBar()`（主进程直接量：`screen.getCursorScreenPoint()` + `getContentBounds()` + renderer 上报的 `dockBarRect`，含 6px 容差）+ `dockOverlayOpen` + `dock-activity` 心跳（renderer 节流 400ms 上报 mousemove/keydown/wheel/pointerdown）
+     - ⚠️ **不要用 renderer 的 `dock-pointer` 事件判「指针在不在」**：它只在 enter/leave 时报一次，实测会被莫名的 mouseleave 提前清掉，静止悬停（恰恰是「正在看 Dock」的典型状态）判不出来
+     - 沉底之后 `dockAutoSunk` 置真：`toggleWindow` 多一个分支 —— 窗口「可见但被压到底」时，Alt+Space / 托盘点击是**唤回**而不是隐藏（否则用户要按两次才见得着）
+  3. `run-app` / `run-as-admin` / `open-sound-settings` 启动目标后按 `settings.afterLaunch` 三态让位，**默认 `sink`（让位沉底，v1.19.3 起）**：
+     窗口**保持可见**但退到所有窗口后面，用户随时能在桌面看到它、Alt+Space 拉回来；`hide` 才是整条收进托盘。
+     ⚠️⚠️ **`sink` 分支必须 `setAlwaysOnTop(false)` + `sendToBottom()` 两步**：`SetWindowPos(HWND_BOTTOM)`
+     对**置顶窗口**只是把它沉到「置顶层内部的最底」，照样盖着普通窗口 —— 只调 `sendToBottom` 的话
+     「让位沉底」看起来毫无效果（v1.19.3 修的就是这个）。沉底后置 `dockAutoSunk = true`，
+     让 Alt+Space / 托盘那一下是**唤回**而不是隐藏。
+     ⚠️⚠️ **启动路径必须传 `sendToBottom(win, true)`（strict，v1.19.4 修）**：收尾里的
+     「用户又抓回 Dock 了」判定包含「指针停在玻璃条上 / 刚在 Dock 上动过」，而**点图标必然**让
+     这两条成立 —— 不传 strict 的话每次启动后的沉底都会在几十毫秒内被 `recoverDock()` 撤销，
+     表现就是「打开应用时 Dock 闪一下，过一会儿（等看门狗）才退到后台」。
+     ⚠️ **沉底走常驻助手**（`helperSink` → `QLActivate.Sink`，~20ms）：一次性 PowerShell 要 ~700ms，
+     新窗口早就弹出来了 Dock 还挂着 —— 这也是「闪一下」的一部分。助手不可用时才退回 PowerShell。
+- 🚫 **「隐藏任务栏」功能已整体移除（v1.21，别再实现一遍）**：
+  它把整条任务栏 `ShowWindow(SW_HIDE)` + 切 `ABS_AUTOHIDE` 来抢那 48px 工作区，副作用一串：
+  隐藏后**我们自己的托盘图标也跟着没了**（入口只能塞在「+」菜单里）、最大化窗口底部留空带、
+  贴边 2px 感应条会让它滑回来（要贴边不唤出就只能纯隐藏、于是工作区抢不回来 —— 两者不可兼得，
+  实测 2048×1104 vs 2048×1152），而且 **Explorer 重启/巡检/崩溃还原** 需要一整套补偿（标记文件、
+  5s 巡检、`will-quit` 里同步还原）。最要命的是它把托盘型应用（微信/QQ）的唤出变成了「先把任务栏
+  请回来才能点它的托盘图标」，而这一步**没有安全替代**：Win11 托盘已无 `ToolbarWindow32`、
+  溢出区图标不展开无法用 UIA 枚举、直接 `ShowWindow` 隐藏窗口会得到「可见但点不动」的假窗口。
+  用户结论（2026-11-28）：「还是不太实用，暂时实现不了全部去除」→ 整条功能删除，
+  `trayClickReveal` 设置项、`TB?`/`TB`/`TBI`/`TBO` 助手指令、`taskbar-hidden.json` 标记、
+  `restoreTaskbarOnQuit()` 前的 `execFileSync`（全项目唯一一处同步调用）一并清掉。
+  ⚠️ 用户目录里可能还留着旧的 `taskbar-hidden.json`（已无代码读它，删不删都无影响）。
+- **音量（v1.19.5）**：并进「音频」条目卡片顶部（静音键 + 滑块 + 数值），作用对象是
+  **当前默认输出设备**（`IAudioEndpointVolume`，`AUDIO_CS` 里新增；vtable 顺序必须与 native 一致，
+  事件上下文参数用 `IntPtr` 不是 `Guid`）。滑块本地乐观、松手回读；卡片可见行数因此 5 → 4。
 - **对话框期间不沉底**：`dialogOpen` 标志（模块级 `let`），三个弹对话框的 IPC（`parse-lnk` / `select-folder` / `pick-icon`）统一走 **`showOpenDialogSafe()`**：置 `dialogOpen`、把 Dock 顶到最前，并传 `disabled: mainWindow` 让对话框成为**真模态子窗口**（挡住 Dock 输入，避免用户在对话框开着时又点开菜单把弹层状态搞乱；Windows 也会把对话框排进父窗口的 z-order 组）。`blur` 沉底逻辑检查该标志——模态对话框是 Dock 的子窗口，跟随父窗口层级，若对话框抢焦点触发沉底会把选择器连带压到其他软件下面
 - **恢复置顶（v1.11.0 起统一走 `recoverDock()`）**：`focus` 事件（点击 Dock / Alt+Space / 托盘唤出）、renderer `mouseenter`（`dock-pointer(true)`）、`toggleWindow` 显示分支、启动失败恢复、`second-instance` 都调它——置顶 + `moveTop` + 120ms 后再补一次，末尾接 `verifyDockOnTop()` 自愈巡检
 - **沉底与恢复的竞态防护（v1.11.0 起，v1.13.1 修过一次严重回归，改这块必须先读）**：沉底是**异步**的（新起 `powershell.exe` + `Add-Type` 编译 C#，实测滞后 200ms~1s），这段时间里任何「拉回」操作都会与它打架。防护分四层：① 单调递增的 `sinkSeq`——`toggleWindow` 的**显示与隐藏两条分支**、`dock-pointer`、`focus`、启动失败恢复、`second-instance`、托盘「显示窗口」、close 到托盘全部 `++`，在途沉底在启动前与回调里各比对一次，代际不符即整条放弃；② 同一窗口的沉底任务**串行化**（已有任务在跑时 180ms 后重试，不再起第二个进程）——**重试的守卫必须是「意图是否仍成立」**（`sinkSeq` / 可见 / 焦点 / 托盘 / 宽限期），不能写 `sinkState?.win === win`：前一次任务完成时已把 `sinkState` 置回 `null`，那个守卫恒假、重试永远空转；③ 迟到的 `SetWindowPos(HWND_BOTTOM)` 补偿**不能再用 `isAlwaysOnTop()` 判断**——恢复路径会把它设回 `true`，原写法恒真、形同虚设；④ `verifyDockOnTop()` 自愈巡检：`moveTop()` 只把窗口提到「同一组内的顶部」、并不重新断言置顶位（实测恢复后 `WS_EX_TOPMOST` 有约 300ms 为 `False`），所以「窗口可见 + 未收托盘 + `sinkSeq` 未变」却没拿到焦点时补一次置顶断言，最多 4 次
@@ -360,24 +394,41 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     （旧定时器代际不符自动作废，永远只有一个待执行）。**别改成「只在状态变化时才 ++」**
   - ⚠️ 已知取舍：`run-app` 是**先隐藏再 spawn**，所以「目标不存在」时会有 ~0.4s 消失再回来 + 提示。
     要消除闪烁得在隐藏前做存在性预检，但对 `shell:` / URL / 裸命令名会误判，风险大于收益，故保留
-- **点图标时「已在运行就绝不重复启动」（v1.13.5 引入，v1.13.6 改成四态，v1.13.8 修好「absent 不可达」，随后按用户要求整段关闭）**：
-  🚫🚫 **默认是关的（改这里先读这一段）**：`src/main/index.ts` 里那行
-  `const PROBE_BEFORE_LAUNCH = false` 就是总开关。**用户明确要求「点图标一律直接启动」**
-  （= v1.13.4 的行为），所以整套探询被这个常量短路，打包器会把它**整段静态消除**
-  （实测 `out/main/index.js` 里 `ACTIVATE_CS` / `probeTargetState` / `clickTrayIconFor` 命中数都是 **0**）。
+- **点图标时「已在运行就绝不重复启动」（v1.13.5 引入 → v1.13.8 关闭 → **v1.19.2 重新打开**）**：
+  ✅ **现行默认是开着的**：`src/main/index.ts` 里 `const PROBE_BEFORE_LAUNCH = true`。
+  关掉的那段时间（v1.13.8~v1.19.1）的代价在 2026-11-28 爆发：**微信已经登录，点图标又弹一个登录窗；
+  Edge 也开不出已有窗口** —— 直接 spawn 对单实例应用就是多开一个进程。
   | 开关 | 点图标的行为 | 代价 |
   |---|---|---|
-  | `false`（**现行默认**） | 直接 spawn（约 4~10ms） | 微信/QQ 收托盘时再点会**多开一个实例（弹登录窗）** |
-  | `true` | 先探询约 0.9s：running→激活、tray→点托盘图标唤出、其余→启动 | 「进程在但没窗口」的目标要靠 fail-open 兜；点击有 ~0.9s 等待 |
-  ⚠️ 开关只对**源码**有效（`false` 时相关代码已不在产物里，改 `out/main/index.js` 没用）——
-  想切回去：改那一行 + `npm run build`。
+  | `true`（**现行默认**） | 没在运行→直接启动（~60ms 快路）；在运行→探询并激活（~0.9s） | 已运行的目标要等 ~0.9s |
+  | `false` | 一律直接 spawn（4~10ms） | 微信/QQ 已登录时再点会**多开一个实例（弹登录窗）** |
+  - **v1.19.2 为重新打开做的四处改造**（缺一个都会退回老毛病，改这块先读）：
+    1. **常驻激活助手**（`ensureActivateHelper` / `helperProbeOnce`，**这是「秒开」的关键**）：
+       应用启动 5s 后预热一个 PowerShell 进程，用 `-Command -` 从 stdin 逐行收请求：
+       `RUN <base64(路径)>` → `STATE=<码>`，`ACTIVATE_CS` 只在这里编译一次。
+       之后每次点图标只剩一次管道往返，实测 **8~30ms**（Edge 17ms / 微信第二次 9ms）。
+       ⚠️ 别再改回「每次点击 spawn 一个 powershell」：冷启动 604ms、加 `Add-Type` 869ms，
+       用户感受就是「点了要等一下才出来」（2026-11-28 报障原话）。也**不要**换成
+       cscript/WSH 的 `AppActivate`：它内部就是 `SetForegroundWindow`，窗口不是前台时
+       被前台锁直接拒（实测微信退化成 3s），且不认最小化/托盘。助手空闲 10 分钟自退、
+       父进程消失时 stdin EOF 自动退出、`will-quit` 里也会 `stopActivateHelper()`。
+    2. **`tasklist` 快路只在助手没预热时用**：助手预热后连「没在运行」也只要 ~20ms，
+       比 `tasklist` 的 ~70ms 还快；冷启动头几秒才用 `tasklist` 排除「没在运行」
+       （未运行时整体 **50ms** 左右，实测）。
+    3. **探询改异步**：`oneShotProbe` 原来用 `execFileSync`，在主进程里同步等 ~0.9s
+       （最坏 3 次重试 ≈ 3.5s），期间 Dock 整个假死。现在全链路 `await`。
+    4. **窗口挑选按「可见度」打分**（`RankWindow`：3 正常 / 2 最小化 / 1 隐藏）：原来取枚举到的
+       **第一个**有标题窗口，而微信 4.x / Chromium 应用会造一堆**带标题的隐藏辅助窗口**，
+       于是明明开着主窗口却被判成「收在托盘」→ 弹「请点托盘图标」什么都不开。
+       实测修前微信返回 `in-tray`、修后返回 `true` 且**进程数 5→5**（不多开）。
+  - 开关只对**源码**有效（`false` 时这段代码会被打包器整段静态消除，改 `out/main/index.js` 没用）。
   下面的四态说明在开关为 `true` 时才生效：
 
   按四态分派（`run-app` 在**隐藏 Dock 之前**先调 `probeTargetState(targetPath)`）：
   | 状态 | 含义 | 动作 |
   |---|---|---|
   | `running` | 有可见/最小化窗口 | 已置前 → 藏起 Dock，返回 `true` |
-  | `tray` | 进程在、窗口隐藏（收托盘） | **不启动、不强行显示** → 返回 `'in-tray'`，renderer 提示点托盘图标 |
+  | `tray` | 进程在、窗口隐藏（收托盘） | **点它自己的托盘图标唤出**（UIA）；不启动新进程、不强行 `ShowWindow` |
   | `absent` | **确认没这个进程**（唯一允许启动的一态） | 继续走启动流程 |
   | `failed` | 进程在、但 3 次都没探到带标题的窗口 | **照旧启动**（fail-open，v1.13.8）→ 不再有 `'probe-failed'` |
   - ⚠️⚠️ **四个码必须来自 C# 的 `QLActivate.Probe`，不许再把两种结果挤进一个返回值（v1.13.8 修）**：
@@ -412,15 +463,36 @@ Renderer 通过 preload 脚本的 contextBridge 安全隔离，**不能**直接�
     今天的 `Probe = 0`、`FindWindow = 0`，而昨天的 `Activate` 用的是**同一套「只认有标题窗口」的判定**
     （路径匹配那层也正常，`pids=1`）→ 同样 `0` → 同样 failed。**两版行为一致** ⇒ 不是当天那次改动引入的，
     而是这条「拦」的约束本身不对
-  - ✅ 真正要守的底线挪到了这两态上：`running`（有窗口 → 置前，**绝不新开**）与
-    `tray`（窗口隐藏 → 点托盘图标唤出，**绝不强行 `ShowWindow`**）。
+  - ✅ 真正要守的底线：`running`（有窗口 → 置前，**绝不新开**）与
+    `tray`（窗口隐藏 → 显示它，**绝不新开进程**）。
     微信/QQ 收托盘时窗口**是存在的**（只是隐藏）→ 命中 `-1`，所以「多点一下开了个登录窗」不会回来
   - 回归验证：`node devtools/probe/runapp-open-always.cjs`
     （重点用例就是 Clash Verge 这种「进程在、窗口为空」的目标：必须返回 `true` 且**窗口真的出现**、进程数不爆炸）
-  - 🚫🚫 **不要对隐藏窗口调 `ShowWindow` 强行显示（v1.13.5 的错误做法，已废弃）**：
-    把一个本该隐藏的窗口强行显示出来，有概率让它**可见但失去响应**（看起来像卡死）。
-    实测复现过一次用户报的「微信界面卡住」。现在只对**已经可见/最小化**的窗口做
-    `SetForegroundWindow`（最小化的用 `SW_RESTORE`）；隐藏的返回 `-1` 交给上层提示用户点托盘
+  - 🚫🚫 **不要对隐藏窗口调 `ShowWindow` 强行显示（v1.21 重新验证：会留下「假活窗口」）**：
+    托盘最小化 ≠ 销毁窗口，窗口句柄确实还在（实测微信收托盘时
+    `hwnd=526470 cls=Qt51514QWindowIcon title=[微信] vis=0`），但**显示它并不等于点托盘图标**。
+    微信 4 是基于 Chromium 的（进程里 `wechatappex`、窗口线程挂 `Chrome_SystemMessageWindow`），
+    躲进托盘时它**销毁了自己的渲染表面**；从外部 `ShowWindow(SW_SHOW)` 只把「窗口壳」露出来，
+    表面没重建 → **窗口出现、画面是残影、点哪都没反应**（用户原话：「微信显示之后就卡死了，点不动」）。
+    ⚠️ 当时的「不卡死」验证**看错了层次**：`WM_NULL` 有回应、`IsHungAppWindow=false`、
+    `enabled=True`、`GUI flags=0` —— 消息层一切正常，但界面是死的。
+    **消息层活着 ≠ 界面活着**；判「能不能点」不能只看这些，否则会得到一个非常有说服力的错误结论。
+    → 这条路**已整段删除**（v1.21 清理）：`ShowHidden` / `helperShowHidden` /
+    `DIRECT_SHOW_TRAY_WINDOW` 都不在了，**别再实现一遍**。
+  - 🚫 **也不要「再启一次 exe 让单实例逻辑去唤出主窗」**（v1.21 实测）：微信直接**多开了一个实例**
+    （进程数 5→6，多出一个 `微信` 主窗）—— 正是这套探询机制存在的原因，别绕回来。
+  - ✅ **唯一可靠的恢复方式：点它自己的托盘图标**（`clickTrayIconFor`）。
+    ⚠️ 这条路要求任务栏在屏幕上，但**不要为了它再去动任务栏**（隐藏任务栏功能已整体删除，见上文）。
+    任务栏被用户自己隐藏时，这条会失败 → 返回 `'in-tray'` 提示用户自己点，不做任何系统级改动。
+  - 🚫 **为什么不能「不展开就点托盘图标」**（三条都实测/官方确认过，别再试）：
+    1. Windows 11 的托盘**已经没有 `ToolbarWindow32` 子窗口**（本机实测 `Shell_TrayWnd` 下只有
+       `TrayNotifyWnd` / `ReBarWindow32` / XAML `DesktopWindowContentBridge`），
+       所以「读工具栏按钮坐标 + `PostMessage` 点击」这套 Win10 时代的技巧**不存在落点**；
+    2. 溢出区的图标是 XAML flyout（`TopLevelWindowForOverflowXamlIsland`），
+       微软官方答复（The Old New Thing, 2025-09）明确：**不把它显示出来就无法用 UIA 枚举** ——
+       「UIA 描述的是存在的 UI 对象，隐藏的图标没有 UI」；
+    3. `Shell_NotifyIconGetRect` 对溢出区里的图标拿不到可用矩形。
+    结论：**要么让应用自己恢复（任务栏得在屏幕上），要么什么都不做**，没有第三条路。
   - `SetForegroundWindow` 会被 Windows 前台锁拒绝（实测 `False`），
     **必须配 `AttachThreadInput`** 挂到当前前台线程才成功（这条实测有效）
   - 匹配**优先用可执行文件路径**（大小写不敏感），读不到路径时按**进程名**兜底（v1.13.8，见上）；跳过无标题窗口与 IME 辅助窗口；

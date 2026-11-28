@@ -102,9 +102,17 @@ export default function SettingsCard(p: Props): React.JSX.Element {
       onMouseEnter={p.onEnter}
       onMouseLeave={p.onLeave}
       onKeyDown={(e) => {
+        // 与 AudioCard 同一条理由：卡片持有焦点时，导航键不许冒泡到 document 级的
+        // Dock 键盘导航（否则会在卡片背后点亮选中框，关掉卡片后 Enter 还能启动它）
+        if (
+          e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' ||
+          e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End' ||
+          e.key === 'Escape' || e.key === 'Enter' || e.key === 'Tab'
+        ) {
+          e.stopPropagation()
+        }
         if (e.key === 'Escape') {
           e.preventDefault()
-          e.stopPropagation()
           p.onClose()
         }
       }}

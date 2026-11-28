@@ -35,6 +35,14 @@ type Props = {
 
 /** Win11 的 PKEY_Device_FriendlyName 通常已带 ` (适配器名)` 后缀；卡片里适配器单独一行，
  *  所以把重复的后缀剥掉（只剥与 adapter 完全一致的那个括号，别误伤 "扬声器 (USB)" 这种名字）。 */
+/** 上次读到的音量（跨卡片开关复用）；null = 本次会话还没读到过 */
+let lastVolume: { level: number; mute: boolean } | null = null
+
+/** 预热用：App 启动 8s 后读到的音量塞进来，卡片第一次打开就已经有真值 */
+export function primeVolume(v: { level: number; mute: boolean } | null): void {
+  if (v) lastVolume = v
+}
+
 export function audioDisplayName(device: { name: string; adapter: string }): string {
   const { name, adapter } = device
   if (!adapter) return name
@@ -138,6 +146,73 @@ export default function AudioCard(p: Props): React.JSX.Element {
   const cursorTouched = useRef(false)
   const listRef = useRef<HTMLDivElement>(null)
 
+  // ─── 音量 / 静音（v1.19.5）─────────────────────────────────────────────
+  // 作用对象是当前默认输出设备。滑块**本地乐观**：拖的时候不等 PowerShell（~0.9s），
+  // 松手后再回读一次真值（设备可能被系统限幅）。
+  // ⚠️ 不要把初始值写死成 50（v1.19.6 修）：PowerShell 读一次要 ~0.9s，写死会在那 1 秒里
+  // 先显示 50 再跳到真值（用户报障「刚显示是 50，然后才显示真实大小」）。
+  // 现在的做法：模块级记住**上次读到的真值**（跨卡片开关），一格都没读到就显示「—」+ 禁用滑块。
+  const [level, setLevel] = useState(lastVolume?.level ?? 0)
+  const [mute, setMute] = useState(lastVolume?.mute ?? false)
+  const [volKnown, setVolKnown] = useState(lastVolume !== null)
+  const volTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const dragging = useRef(false)
+  /** 组件是否还活着：卸载后（拖完滑块立刻让卡片自动收起是最常见的路径）那两个定时器
+   *  仍会到点，`loadVolume` 里的 setState 会打到已卸载的组件上 —— 白跑一趟，
+   *  而且它还要为此再起一次 ~0.9s 的 PowerShell 读音量。 */
+  const aliveRef = useRef(true)
+  useEffect(() => {
+    // ⚠️ 必须在 effect 体里置真，不能只靠 useRef 的初始值：StrictMode 的双挂载会把
+    //    「跑一次 → cleanup → 再跑一次」走完整，cleanup 把标记打成 false 之后
+    //    不会有人再帮它复位 —— 那样开发模式下音量回读就永远不生效了。
+    aliveRef.current = true
+    return () => {
+      aliveRef.current = false
+      if (volTimer.current) { clearTimeout(volTimer.current); volTimer.current = null }
+    }
+  }, [])
+
+  const loadVolume = (): void => {
+    void window.api.getAudioVolume(true).then((v) => {
+      if (!aliveRef.current || !v || dragging.current) return
+      lastVolume = v
+      setLevel(v.level)
+      setMute(v.mute)
+      setVolKnown(true)
+    }).catch(() => {})
+  }
+
+  // 打开卡片时读一次（不让它跟设备列表抢：列表走缓存，音量要真值）
+  useEffect(() => {
+    if (p.hidden) return
+    loadVolume()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p.hidden])
+
+  /** 拖动中：只更新本地显示，节流 140ms 再落到系统；松手（onPointerUp）再回读 */
+  const onSlide = (next: number): void => {
+    dragging.current = true
+    setLevel(next)
+    if (volTimer.current) clearTimeout(volTimer.current)
+    volTimer.current = setTimeout(() => {
+      void window.api.setAudioVolume(next).catch(() => {})
+    }, 140)
+  }
+
+  const commitSlide = (): void => {
+    if (volTimer.current) { clearTimeout(volTimer.current); volTimer.current = null }
+    void window.api.setAudioVolume(level).catch(() => {})
+    dragging.current = false
+    // 稍等一拍再回读：SetMasterVolumeLevelScalar 是异步生效的
+    setTimeout(loadVolume, 260)
+  }
+
+  const toggleMute = (): void => {
+    const next = !mute
+    setMute(next)
+    void window.api.setAudioMute(next).then((ok) => { if (!ok) setMute(!next) }).catch(() => setMute(!next))
+  }
+
   // 扁平列表：输出在前、输入在后（键盘 ↑↓ 跨两列走）
   const flat = useMemo(
     () => [...(p.snapshot?.render ?? []), ...(p.snapshot?.capture ?? [])],
@@ -163,10 +238,23 @@ export default function AudioCard(p: Props): React.JSX.Element {
   }, [flat])
 
   const onKeyDown = (e: React.KeyboardEvent): void => {
+    // ⚠️ 卡片打开期间，方向键 / Home / End / Tab 一律**不许冒泡**到 document 级的
+    //    Dock 键盘导航（`useDockKeyboard` 的唤醒分支只看 contextMenu/menuPos，不看卡片）。
+    //    否则在卡片里按 ←/→ 会在卡片**背后**点亮 Dock 的选中框；关掉卡片后 5s 内
+    //    按 Enter 会启动那个看不见的选中项。滑块也是同理（它要用 ←→/↑↓ 调音量）——
+    //    所以这里只 stopPropagation，**不** preventDefault，滑块的原生行为不受影响。
+    if (
+      e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' ||
+      e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End' ||
+      e.key === 'Escape' || e.key === 'Enter' || e.key === 'Tab'
+    ) {
+      e.stopPropagation()
+    }
+    // 滑块自己要用 ←→ / ↑↓，别被下面的列表导航抢走（Esc 仍然归卡片）
+    if (e.key !== 'Escape' && (e.target as HTMLElement).classList?.contains('audio-slider')) return
     // 卡片是浮层里唯一可交互的东西：所有键都在这里消费，避免 document 级导航双开
     if (e.key === 'Escape') {
       e.preventDefault()
-      e.stopPropagation()
       p.onClose()
       return
     }
@@ -237,6 +325,38 @@ export default function AudioCard(p: Props): React.JSX.Element {
       onMouseEnter={p.onEnter}
       onMouseLeave={p.onLeave}
     >
+      <div className="audio-vol">
+        <button
+          type="button"
+          className={'audio-mute' + (mute ? ' on' : '')}
+          aria-label={mute ? '取消静音' : '静音'}
+          title={mute ? '取消静音' : '静音'}
+          onClick={toggleMute}
+        >
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M3.2 6.2h2.1L8.4 3.6v8.8L5.3 9.8H3.2z" />
+            {mute
+              ? <path d="M11 6.2l3 3.6M14 6.2l-3 3.6" />
+              : <path d="M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.4 4a5.6 5.6 0 0 1 0 8" />}
+          </svg>
+        </button>
+        <input
+          className="audio-slider"
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={level}
+          disabled={!volKnown}
+          aria-label="输出音量"
+          onChange={(e) => onSlide(Number(e.target.value))}
+          onPointerUp={commitSlide}
+          onKeyUp={(e) => { if (e.key.startsWith('Arrow')) commitSlide() }}
+          // 拖到一半指针离开卡片也不能把最后一段丢了
+          onBlur={commitSlide}
+        />
+        <span className="audio-vol-num">{!volKnown ? '—' : mute ? '静音' : level}</span>
+      </div>
       <div ref={listRef} className="audio-cols">
         {renderCol('输出', p.snapshot?.render ?? [])}
         {renderCol('输入', p.snapshot?.capture ?? [])}

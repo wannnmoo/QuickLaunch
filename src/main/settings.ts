@@ -81,6 +81,41 @@ export function initSettings(): void {
 /** 当前设置（不含真实 dockEdge —— 由调用方补上） */
 export const getSettingsCache = (): AppSettings => cache
 
+/** 写盘合并窗口：拖一次滑块约 60 个 set-settings，150ms 足以把它们合成 1~2 次写盘，
+ *  又不会让「改完立刻退出」有可见延迟（退出前还有一次强制 flush）。 */
+const SETTINGS_WRITE_DEBOUNCE_MS = 150
+let writeTimer: NodeJS.Timeout | null = null
+let pendingText: string | null = null
+
+/** 把 settings.json 的写盘合并到一拍里。
+ *
+ *  ⚠️ 为什么必须合并（实测）：设置窗的滑块是「每个 input 事件一次 set-settings」，
+ *  拖一次「玻璃模糊」约 60 个事件，每个都要 normalize + `writeFileAtomic`
+ *  （open → write → **fsync** → 读旧文件 → JSON.parse → copy 成 .bak → rename）
+ *  + 广播给所有 WebContents。**实测 60 次 ≈ 310ms 的主进程同步阻塞** —— 期间
+ *  `setShape`、托盘、音频 IPC 全部排队，手感就是「拖滑块发涩、Dock 整体迟滞」。
+ *  内存里的 cache 仍然**立即**更新（读永远拿到最新值），只是落盘延后。 */
+function scheduleWrite(text: string): void {
+  pendingText = text
+  if (writeTimer) return
+  writeTimer = setTimeout(() => { flushSettingsWrite() }, SETTINGS_WRITE_DEBOUNCE_MS)
+  writeTimer.unref?.()
+}
+
+/** 立刻把待写的设置落盘。退出前（`will-quit`）必须调一次 —— 否则合并窗口里的
+ *  最后一次改动会跟着进程一起消失（用户看到的是「退出前改的那一下没保存」）。 */
+export function flushSettingsWrite(): void {
+  if (writeTimer) { clearTimeout(writeTimer); writeTimer = null }
+  const text = pendingText
+  pendingText = null
+  if (text === null || !settingsPath) return
+  try {
+    writeFileAtomic(settingsPath, text)
+  } catch (err) {
+    logWarn('settings', 'settings.json 写盘失败（本次会话仍生效）', err)
+  }
+}
+
 function broadcast(settings: AppSettings): void {
   for (const wc of webContents.getAllWebContents()) {
     if (wc.isDestroyed()) continue
@@ -120,11 +155,9 @@ export function registerSettingsIpc(hooks: {
 
     const merged = normalizeSettings({ ...toStored(cache), ...p })
     cache = merged
-    try {
-      writeFileAtomic(settingsPath, JSON.stringify(toStored(merged), null, 2))
-    } catch (err) {
-      logWarn('settings', 'settings.json 写盘失败（本次会话仍生效）', err)
-    }
+    // 落盘合并到 150ms 之后（见 scheduleWrite 的注释）；内存 cache 已经是最新值，
+    // 所以紧接着的 broadcast / get-settings 拿到的都是本次结果，不会读到旧值。
+    scheduleWrite(JSON.stringify(toStored(merged), null, 2))
     const next = withEdge()
     broadcast(next)
     return next

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, globalShortcut, nativeImage, screen, clipboard } from 'electron'
 import { join, basename, extname, dirname, parse } from 'path'
 import { readFileSync, writeFileSync, rmSync, existsSync, statSync, watch, copyFileSync, promises as fsp, type FSWatcher, type Dirent } from 'fs'
-import { execFile, execFileSync } from 'child_process'
+import { execFile, spawn, type ChildProcess } from 'child_process'
 import type {
   AppEntry,
   AppSettings,
@@ -12,7 +12,7 @@ import type {
 } from '../shared/types'
 import { initLogger, logError, logInfo, logWarn, getLogDir, readRecentLog } from './logger'
 import { writeFileAtomic } from './persist'
-import { initSettings, registerSettingsIpc, getSettingsCache } from './settings'
+import { initSettings, registerSettingsIpc, getSettingsCache, flushSettingsWrite } from './settings'
 import { externalizeIcons, pruneIcons, registerIconProtocol, registerIconScheme } from './iconStore'
 // PowerShell 层（D2 拆分）：所有 C# 常量和统一调用入口都在 ps.ts —— 那里的注释说明了
 // 「C# 必须纯 ASCII」的原因，改脚本前先读。
@@ -30,7 +30,7 @@ import {
 // 都在那里，这里只需要在启动时注册一次。
 import { registerShortcutsIpc } from './shortcutsStore'
 // 音频设备（Core Audio）：枚举 / 切默认。C# 互操作在 ps.ts 的 AUDIO_CS。
-import { getAudioSnapshot, setDefaultAudioDevice } from './audio'
+import { getAudioSnapshot, setDefaultAudioDevice, getAudioVolume, setAudioVolume, setAudioMute } from './audio'
 import { registerSettingsWindowIpc } from './settingsWindow'
 import { checkForUpdates, openUpdatePage, scheduleSilentUpdateCheck } from './updater'
 
@@ -40,6 +40,25 @@ registerIconScheme()
 
 
 let mainWindow: BrowserWindow | null = null
+
+/** 向渲染端发一条事件，**任何一步不成立都静默跳过**。
+ *
+ *  ⚠️ 「窗口还活着」不等于「webContents 还能 send」：渲染进程崩溃后（
+ *  `render-process-gone`）窗口对象还在、`mainWindow` 也非 null，但 webContents 已经废了，
+ *  对它调 `send()` 会抛错。而崩溃看门狗在限流到上限后会**放弃重建**（crashGaveUp），
+ *  这种「窗口在、渲染没了」的状态会一直留到用户重启 —— 期间任何一次改分辨率
+ *  （`display-metrics-changed` → `applyDockEdge`）、桌面增删（fs.watch → desktop-changed）
+ *  都会撞上它。项目里 `list-folder` 那侧早就为同一类调用写过这道防线，这里补齐。 */
+function safeSend(win: BrowserWindow | null, channel: string, ...args: unknown[]): void {
+  if (!win || win.isDestroyed()) return
+  const wc = win.webContents
+  if (!wc || wc.isDestroyed()) return
+  try {
+    wc.send(channel, ...args)
+  } catch (err) {
+    logWarn('ipc', `发送 ${channel} 失败（窗口正在销毁）`, err instanceof Error ? err.message : String(err))
+  }
+}
 let forceQuit = false
 /** second-instance 到达时窗口还没建好（启动中 / 重建窗口的间隙）：记下来，建好窗口后补一次唤回，
  *  否则用户双击图标启动第二个实例时，这个请求会被静默丢掉（看起来像点了没反应）。 */
@@ -128,7 +147,30 @@ function canSinkNow(): boolean {
 // 沉底任务在启动前与回调里各比对一次，并对同一目标串行化。
 let sinkSeq = 0
 /** 目标窗口当前是否有沉底任务在跑（用于串行化，避免一次 blur 起一个 powershell.exe） */
-let sinkState: { win: BrowserWindow; seq: number } | null = null
+let sinkState: { win: BrowserWindow; seq: number; strict: boolean } | null = null
+/** 最近一次「发起沉底」的时间戳（不论成功失败）。
+ *  `verifyDockOnTop()` 的那条置顶巡检链要靠它让路：巡检每 250ms 断言一次置顶、最长 1.25s，
+ *  而沉底要走一个 ~700ms 的 PowerShell —— 巡检晚到一拍就会把刚沉下去的窗口又拉回顶部。
+ *  以前靠 `canSinkNow()` 的 2.5s 宽限期错开（巡检链必然早结束），但 watchdog 与
+ *  「悬停过 Dock 之后立刻点别的软件」这两条路都不一定在宽限期外，所以再加这条硬闸。 */
+let lastSinkAt = 0
+/** 最近一次沉底**失败**的时间戳：失败后窗口会被恢复置顶，而 watchdog 下一拍就会再次
+ *  判定「该沉底」→ 每 500ms 起一个 powershell.exe 的死循环（每次 ~700ms CPU 时间）。
+ *  失败即退避，见 finishSink / sinkWatchdogTick。 */
+let lastSinkFailAt = 0
+
+/** 指针是否停在 Dock 窗口上（renderer 的 `dock-pointer` 上报，true/false 都要记）。
+ *  ⚠️ 沉底 watchdog 必须看它：悬浮在「中间」档的 Dock 不会因为鼠标移上去就拿到焦点
+ *  （前台锁会拒绝），只按 `isFocused()` 判断会把用户正在操作的 Dock 自己沉下去。 */
+let dockPointerInside = false
+/** 是否是 watchdog 自己把 Dock 沉下去的（不是用户点别的软件触发的 blur）。
+ *  只在「可见但被我们压到底」时需要特殊处理：Alt+Space / 托盘再按一次应当是**唤回**，
+ *  而不是「隐藏到托盘」——否则用户得按两次才见得着（见 toggleWindow）。 */
+let dockAutoSunk = false
+/** 用户最后一次在 Dock 窗口里动手（mousemove / keydown / wheel / 按下），renderer 侧节流上报。
+ *  只给 `sendToBottom` 的迟到补偿用：PS 要跑 ~700ms，这期间用户若已经把鼠标移回 Dock，
+ *  那次沉底就该作废（不能用 `isFocused()` 判：本机焦点状态不可信，见 sinkWatchdogTick）。 */
+let lastDockActivityAt = 0
 
 // ─── 启动反馈（V6，v1.18）────────────────────────────────────────────────
 // 点图标后先把「起跳」动画播完再把 Dock 收进托盘，否则窗口在 4~10ms 后就消失，
@@ -182,6 +224,9 @@ function verifyDockOnTop(win: BrowserWindow, startSeq: number, attempt: number):
     if (win.isDestroyed() || win !== mainWindow) return
     if (dockTrayHidden || !win.isVisible()) return
     if (sinkSeq !== startSeq) return // 期间有更新的让位/唤回意图，交给那条路径
+    // 刚发起过沉底：巡检链（250ms/次）比沉底的 PowerShell（~700ms）快，再断言置顶就等于
+    // 把刚沉下去的窗口重新拉回来。这条守卫只在「沉底后 3s 内」生效，不影响正常自愈。
+    if (Date.now() - lastSinkAt < 3000) return
     if (win.isFocused() && win.isAlwaysOnTop()) return // 已经正常，收工
     win.setAlwaysOnTop(true)
     win.moveTop()
@@ -201,6 +246,7 @@ function toggleWindow(fromKeyboard = false): void {
     // 隐藏到托盘 / 不可见 → 唤回置顶显示
     clearLaunchHide() // 刚刚点了别的图标还没收起：用户要把它叫回来，取消那次延迟隐藏
     dockTrayHidden = false
+    dockAutoSunk = false
     sinkSeq++ // 声明意图：立刻作废在途的沉底（否则它迟到执行会把这扇刚显示的窗钉到底部）
     markDockShown() // 刚开始显示：接下来 2.5s 内的 blur 都是焦点抖动，不沉底
     mainWindow.show()
@@ -209,9 +255,26 @@ function toggleWindow(fromKeyboard = false): void {
     if (fromKeyboard && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('nav-enter')
     }
+  } else if (dockAutoSunk) {
+    // watchdog 把它压到底之后（可见，但被视频/编辑器盖住）：
+    // 这一次 Alt+Space / 托盘点击应当是**唤回**，而不是「隐藏到托盘」——
+    // 否则窗口明明看不见，用户还要按两次才见得着。
+    // ⚠️ 只在 `dockAutoSunk` 时有这个分支：普通「置顶但被沉底」仍按老规则隐藏，
+    //    否则会重新落进 v1.7.1 那个「显示→被压底→再显示」的死循环。
+    clearLaunchHide()
+    dockAutoSunk = false
+    sinkSeq++
+    markDockShown()
+    mainWindow.setAlwaysOnTop(true)
+    recoverDock(mainWindow)
+    mainWindow.focus()
+    if (fromKeyboard && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('nav-enter')
+    }
   } else {
     // 可见（置顶或被沉底）→ 隐藏到托盘
     clearLaunchHide() // 用户自己按下隐藏：不需要那条延迟隐藏再来收一次
+    dockAutoSunk = false
     dockTrayHidden = true
     sinkSeq++ // 隐藏同样作废在途沉底：不能让它去操作一扇已隐藏的窗口
     mainWindow.hide()
@@ -577,7 +640,7 @@ function applyDockEdge(next: DockEdge): boolean {
   }
   const pos = positionForEdge(next, { w: b.w, h: b.h })
   mainWindow.setBounds({ x: pos.x, y: pos.y, width: b.w, height: b.h })
-  mainWindow.webContents.send('dock-edge-changed', next)
+  safeSend(mainWindow, 'dock-edge-changed', next)
   return true
 }
 
@@ -589,7 +652,7 @@ function setDockEdge(next: DockEdge): boolean {
     const b = mainWindow.getBounds()
     if (Math.abs(b.x - preset.x) <= 2 && Math.abs(b.y - preset.y) <= 2) {
       // 位置已经对了：只需要把当前停靠位置同步给渲染端
-      mainWindow.webContents.send('dock-edge-changed', next)
+      safeSend(mainWindow, 'dock-edge-changed', next)
       return true
     }
   }
@@ -826,7 +889,7 @@ function startDesktopWatch(): void {
       desktopWatchTimer = setTimeout(() => {
         desktopWatchTimer = null
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('desktop-changed')
+          safeSend(mainWindow, 'desktop-changed')
         }
       }, 1000)
     })
@@ -921,7 +984,11 @@ function parseDesktopIconsHidden(stdout: string): boolean | null {
 function probeDesktopIconsHidden(): Promise<boolean | null> {
   return new Promise((resolve) => {
     const psScript = `${DESKTOP_ICONS_CS}${DESKTOP_ICONS_READ_PS}`
-    runPowerShell(psScript, 5000, ({ stdout }) => {
+    // ⚠️ 超时不能给 5s：这个探测在 `createWindow` **之前**被 await（见 whenReady），
+    //    超时多长，用户双击图标后就多久看不到任何东西（窗口、托盘、Alt+Space 都还没建）。
+    //    正常冷启动 50~200ms，2s 已经是「慢得离谱」的量级；探测失败时缓存留 null，
+    //    渲染端本来就有「不翻转文案」的兜底。
+    runPowerShell(psScript, 2000, ({ stdout }) => {
       // 只认标记，不因为 err 就丢弃已经拿到的结果（PS 的非终止错误也会让退出码非零）
       const v = parseDesktopIconsHidden(stdout)
       if (v === null) {
@@ -1116,20 +1183,17 @@ function splitArgs(input: string): string[] {
 
 /** 点图标前是否先探询「目标是不是已经在运行」。
  *
- *  ⚠️⚠️ **v1.13.8 起默认 `false`（= 回到 v1.13.4 的启动逻辑：点图标一律直接启动）**。
- *  用户明确要求：今天新增的这套探询（v1.13.5 引入 / v1.13.6 扩成四态）在遇到
- *  「进程在、但连主窗口都还没有」的目标（Clash Verge 这类 Tauri 托盘应用）时会判成
- *  `failed`，而 `failed` 又拒绝启动 —— 结果就是**点了永远打不开**。改成 fail-open 之后
- *  仍然会先花 ~0.9s 探一次，用户要求干脆彻底回到「直接启动」。
+ *  ✅ **v1.19.2 起改为 `true`**：用户报障「微信已经登录了，点图标又弹登录窗；Edge 也开不出已有窗口」——
+ *  那正是这里为 `false` 的代价（直接 spawn → 单实例应用多开一个进程 → 微信弹登录窗）。
+ *  配套做了两件事，避免回到当年「点了要等 1 秒 / Dock 卡住」：
+ *    ① `probeTargetState()` 先花 ~60ms 用 `tasklist` 问一句「这个 exe 的进程在不在」，
+ *       **没在运行就直接启动**（绝大多数点击都是这条快路），不再为它付 PowerShell 冷启动；
+ *    ② 探询从 `execFileSync` 改成**异步** `execFile` —— 原来那版会在主进程里同步等
+ *       ~0.9s（最坏 3.5s），期间 Dock 整个假死（悬停放大、光标动画全停）。
  *
- *  == true== ：先探询（running→激活；tray→点托盘图标唤出；其余→启动）——
- *              好处是**不会**对已在运行的单实例应用（微信/QQ）多开一个进程，
- *              代价是点了要等约 1 秒、且极少数探不到窗口的目标要靠 fail-open 兜。
- *  == false== ：不探询，直接 spawn（v1.13.4 的行为）——点下去就是打开；
- *              代价是**微信/QQ 收在托盘时再点会多开一个实例（弹登录窗）**。
- *
- *  想切回去只改这一行；下面的探询代码与提示分支都完整保留着。 */
-const PROBE_BEFORE_LAUNCH = false
+ *  == true== ：先探询（running→激活；tray→点托盘图标唤出；其余→启动）
+ *  == false== ：不探询，直接 spawn——微信/QQ 已登录时再点会多开一个实例（弹登录窗） */
+const PROBE_BEFORE_LAUNCH = true
 
 ipcMain.handle('run-app', async (_event, targetPath: string, args: string, workingDir: string) => {
   if (!targetPath) return false
@@ -1142,6 +1206,9 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
   // 只对「无启动参数的本地 exe」这么做：带参数时用户要的多半是明确的新行为
   // （例如某些工具用参数开新窗口），不能替他改语义。
   if (PROBE_BEFORE_LAUNCH && !args) {
+    // 探询/激活走**常驻助手**（预热后每次 ~20ms，见 ensureActivateHelper）。
+    // 它内部就是原来那套 C# 判定：running → 激活；tray → UIA 点托盘图标；
+    // absent → 启动；failed → fail-open 启动。助手没起来时 probeTargetState 自己退回慢路。
     const state = await probeTargetState(targetPath)
     if (state === 'running') {
       // 已经是用户想要的那个窗口在前台了。按「启动后行为」让出桌面（默认与启动成功一致）
@@ -1151,9 +1218,11 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
     if (state === 'tray') {
       // 程序在运行、但窗口收在托盘里（微信/QQ 关到托盘就是这种状态）。
       // ⚠️ **绝不能启动新进程**：那会多开一个实例，微信会弹登录窗口 —— 用户报的正是这个。
-      // ⚠️ 也**不能对隐藏窗口 ShowWindow 强行显示**：实测会「可见但失去响应」（卡死，踩过）。
-      // 正确做法：用 UI Automation 点它的托盘图标，让应用自己走「从托盘恢复」的流程
-      // （见 clickTrayIconFor；等价于用户自己点托盘图标，不碰它的窗口、不动鼠标）。
+      // ✅ 正确做法：用 UI Automation 点**它自己的**托盘图标，让应用走自己的恢复流程
+      //    （见 clickTrayIconFor；等价于用户自己点托盘图标，不碰它的窗口、不动鼠标）。
+      // ⚠️ 也**不要试图直接 `ShowWindow` 把隐藏窗口显示出来**（v1.21 实测踩过）：
+      //    微信 4 是 Chromium 应用，躲进托盘时渲染表面已销毁，强行显示只会得到一个
+      //    「窗口可见、点哪都没反应」的假窗口。细节见 CLAUDE.md 同名条目。
       const clicked = await clickTrayIconFor(targetPath)
       if (clicked) {
         hideDockAfterLaunch()
@@ -1183,8 +1252,8 @@ ipcMain.handle('run-app', async (_event, targetPath: string, args: string, worki
       // （窗口隐藏 → 点托盘图标唤出，绝不强行 ShowWindow）两条依旧照旧。
       console.log('[launcher] 进程在但探不到带标题的窗口，按「直接启动」处理（fail-open）:', targetPath)
     }
-    // 'absent' = 确认没在运行（或探询给不出结论）→ 继续走下面的启动流程
   }
+  // 'absent' / 进程查询失败 → 继续走下面的启动流程（直接 spawn）
 
   // 启动目标后按设置里的「启动后行为」让出桌面（默认：隐藏到托盘）：
   // 托盘左键 / Alt+Space / 托盘菜单「显示窗口」随时唤回——toggleWindow 按 dockTrayHidden
@@ -1418,7 +1487,16 @@ function hideDockAfterLaunch(): LaunchHideState {
   }
   if (mode === 'sink') {
     sinkSeq++
-    sendToBottom(win)
+    // ⚠️ 必须先 `setAlwaysOnTop(false)` 再 `sendToBottom()`（v1.19.3 修）：
+    // `SetWindowPos(HWND_BOTTOM)` 对**置顶窗口**只是把它沉到「置顶层内部的最底」，
+    // 依然盖在所有普通窗口上面 —— 于是「让位沉底」看起来毫无效果（用户报障：
+    // 「点了应用 Dock 还挡着，不会退到后台」）。降级置顶 + 真正沉底两步缺一不可，
+    // 与 blur / watchdog 两条让位路径保持一致。
+    win.setAlwaysOnTop(false)
+    // strict：这一次沉底不许被「指针还在玻璃条上」撤销（点图标必然如此，见 sendToBottom 的注释）
+    sendToBottom(win, true)
+    // 被我们主动压到底之后，Alt+Space / 托盘按一次应当是「唤回」而不是「隐藏到托盘」
+    dockAutoSunk = true
     return { mode: 'sink', seq: sinkSeq }
   }
   dockTrayHidden = true
@@ -1459,6 +1537,10 @@ function restoreDockAfterFailedLaunch(state: LaunchHideState): void {
   clearLaunchHide()
   if (state.mode === 'sink') {
     sinkSeq++ // 作废在途沉底
+    // 启动后那次沉底会把 dockAutoSunk 置真（「可见但压在底下」）。失败恢复已经把窗口
+    // 拉回置顶层了，标记必须一起清 —— 否则下一次 Alt+Space / 托盘点击命中
+    // toggleWindow 的「唤回」分支（位置本来就在顶上）→ 按一下**毫无反应**。
+    dockAutoSunk = false
     recoverDock(mainWindow)
     return
   }
@@ -1624,8 +1706,23 @@ ipcMain.handle('describe-paths', async (_e, paths: unknown) => {
 // ─── IPC: 枚举驱动器（「此电脑」悬停卡片 + 图标用量条） ────────────────────
 // GetDrives() 本身不产生 I/O；容量与卷标只对固定盘/移动盘查询——断开的网络盘上
 // AvailableFreeSpace 会阻塞数秒，所以网络盘/光驱只列盘符不查容量。
-ipcMain.handle('list-drives', () => new Promise((resolve) => {
-  const psScript = `
+type DriveRow = {
+  name: string; label: string; type: string; format: string
+  total: number; free: number; ready: boolean
+}
+
+/** 盘符列表的缓存与请求合并。
+ *  ⚠️ 为什么必须加：`openDrivesCard` 每次悬停「此电脑」都会刷新一次，而这个调用要起一个
+ *  `powershell.exe`（冷启动 0.3~0.6s）。鼠标在图标上来回划几下就是好几个进程并发，
+ *  与音频枚举、桌面扫描抢同一个 CPU。3s TTL 够「拔掉 U 盘后重开卡片就能看到」，
+ *  又不会反复起进程；在途请求合并成一次，不会因为两次悬停叠出两个进程。 */
+const DRIVES_TTL_MS = 3000
+let drivesCache: { at: number; data: DriveRow[] } | null = null
+let drivesInflight: Promise<DriveRow[]> | null = null
+
+function runListDrives(): Promise<DriveRow[]> {
+  return new Promise((resolve) => {
+    const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $out = @()
 foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
@@ -1649,25 +1746,38 @@ foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
   $out += @{ name = $d.Name.TrimEnd('\\'); label = $label; type = $type; format = $format; total = $total; free = $free; ready = $ready }
 }
 if ($out.Count -gt 0) { $out | ConvertTo-Json -Compress -Depth 3 }`
-  runPowerShell(psScript, 8000, ({ err, stdout }) => {
-    if (err || !stdout.trim()) { resolve([]); return }
-    try {
-      const parsed = JSON.parse(stdout.trim())
-      // 只有一个驱动器时 ConvertTo-Json 输出对象而非数组
-      const items: { name: string; label: string; type: string; format: string; total: number; free: number; ready: boolean }[] =
-        Array.isArray(parsed) ? parsed : [parsed]
-      resolve(items.map((d) => ({
-        name: String(d.name || ''),
-        label: String(d.label || ''),
-        type: String(d.type || ''),
-        format: String(d.format || ''),
-        total: Number(d.total) || 0,
-        free: Number(d.free) || 0,
-        ready: d.ready !== false
-      })))
-    } catch { resolve([]) }
+    runPowerShell(psScript, 8000, ({ err, stdout }) => {
+      if (err || !stdout.trim()) { resolve([]); return }
+      try {
+        const parsed = JSON.parse(stdout.trim())
+        // 只有一个驱动器时 ConvertTo-Json 输出对象而非数组
+        const items: DriveRow[] = Array.isArray(parsed) ? parsed : [parsed]
+        resolve(items.map((d) => ({
+          name: String(d.name || ''),
+          label: String(d.label || ''),
+          type: String(d.type || ''),
+          format: String(d.format || ''),
+          total: Number(d.total) || 0,
+          free: Number(d.free) || 0,
+          ready: d.ready !== false
+        })))
+      } catch { resolve([]) }
+    })
   })
-}))
+}
+
+ipcMain.handle('list-drives', (): DriveRow[] | Promise<DriveRow[]> => {
+  if (drivesCache && Date.now() - drivesCache.at < DRIVES_TTL_MS) return drivesCache.data
+  if (drivesInflight) return drivesInflight
+  drivesInflight = runListDrives()
+    .then((data) => {
+      // 空表不缓存：枚举失败时不要把「没有驱动器」记 3 秒
+      if (data.length > 0) drivesCache = { at: Date.now(), data }
+      return data
+    })
+    .finally(() => { drivesInflight = null })
+  return drivesInflight
+})
 
 // 打开系统「声音」设置页：`ms-settings:sound` 是 URI 不是文件路径，不能走 open-path
 // （shell.openPath 走 ShellExecute 的路径语义，对 URI 会失败）。
@@ -1698,6 +1808,17 @@ ipcMain.handle('set-default-audio-device', async (_e, id: unknown, roles: unknow
   // [] = 全部成功；非空 = 有角色失败（例如设备刚被拔掉，ID 已失效）
   return failed !== null && failed.length === 0
 })
+
+// ─── IPC: 音量 / 静音（v1.19.5，UI 在「音频」卡片的顶部） ────────────────────
+// 作用对象是**当前默认输出设备**（eMultimedia 角色），与上面切默认设备同一套 Core Audio。
+// 数值范围 0-100 整数；renderer 是乐观更新（拖滑块立刻回显），失败再回滚。
+ipcMain.handle('get-audio-volume', (_e, force: unknown) => getAudioVolume(force === true))
+ipcMain.handle('set-audio-volume', (_e, level: unknown) => {
+  const n = Number(level)
+  if (!Number.isFinite(n)) return false
+  return setAudioVolume(n)
+})
+ipcMain.handle('set-audio-mute', (_e, mute: unknown) => setAudioMute(mute === true))
 
 // ─── IPC: 列出文件夹子项（文件夹条目悬停预览卡片） ────────────────────────
 // 枚举走 fs、图标走 Electron 内置的 app.getFileIcon（进程内 shell 图标查询）——
@@ -2061,11 +2182,26 @@ function resolveResource(filename: string): string {
 // 鼠标进入 Dock 窗口：恢复置顶并抢回焦点。必须 focus——否则 Dock 保持「置顶但无焦点」，
 // 之后点击其他软件不会触发 blur，Dock 无法沉底（违背「只有点击其他软件才让位」的设计）。
 ipcMain.on('dock-pointer', (_e, inside: boolean) => {
-  if (!mainWindow || mainWindow.isDestroyed() || !inside) return
+  // 两个方向都要记：false 是「鼠标离开」，沉底 watchdog 靠它判断「用户已经去别处了」
+  dockPointerInside = inside === true
+  if (!inside) return
+  if (!mainWindow || mainWindow.isDestroyed()) return
   dockTrayHidden = false
   sinkSeq++ // 作废在途沉底：鼠标已经回到 Dock 上，不该再被压到底部
+  dockAutoSunk = false
   recoverDock(mainWindow)
-  mainWindow.focus()
+  // ⚠️ 这里**不要**再调 `mainWindow.focus()`（v1.19.1 删掉，改这块先读）。
+  // 旧注释说「不 focus 就永远收不到 blur」，实测恰恰相反：悬停时 `focus()` 会被前台锁
+  // 拒绝激活、却仍然把键盘焦点拿到本线程（`GetFocus()==hwnd`），于是
+  // `win.isFocused()` / `document.hasFocus()` **永久卡在 true**，而 Windows 之后再也不会
+  // 发 WM_KILLFOCUS → blur 永不触发 → 点别的软件不让位（用户 2026-11-28 报障）。
+  // 真实点击图标时系统会自己给焦点，那时 blur 是正常的；纯悬停本来也不该抢焦点。
+})
+
+// 用户在这扇窗里动手了（mousemove / keydown / wheel / pointerdown，renderer 侧已节流）。
+// ⚠️ 这条通道是「Dock 正在被使用」的唯一可靠证据 —— 见 sinkWatchdogTick 的注释。
+ipcMain.on('dock-activity', () => {
+  lastDockActivityAt = Date.now()
 })
 
 // ─── 透明窗口命中区（方案 B：setShape 静态矩形）─────────────────────────────
@@ -2235,19 +2371,319 @@ ipcMain.on('dock-hit-region', (_e, payload: unknown) => {
  *  为什么要重试：实测应用刚启动时**第一次调用会返回 0**（进程/窗口枚举尚未就绪），
  *  重试能把这种「正在启动」与「真的没有窗口」区分开一部分。 */
 async function probeTargetState(targetPath: string): Promise<'running' | 'tray' | 'absent' | 'failed'> {
+  // ① 助手**已预热**（应用启动 5s 后就是）→ 直接问它：连「没在运行」也只要 ~20ms，
+  //    比 `tasklist` 的 ~70ms 还快，所以这一档不再查进程。
+  // ② 助手还没起来（刚启动的头几秒 / 被策略拦 / 没有 PowerShell）→ 先用 `tasklist` 快路
+  //    排除「没在运行」这一最常见的情况，免得为它付一次 PowerShell 冷启动（604ms 起）。
+  if (!activateHelperReady) {
+    const pids = await imagePids(targetPath)
+    if (pids && pids.length === 0) return 'absent'
+  }
+
   for (let attempt = 0; attempt < 3; attempt++) {
-    const r = activateRunningInstance(targetPath, 3000)
+    const r = await activateRunningInstance(targetPath, 3000)
     if (r !== 'retry') return r
     if (attempt < 2) {
       // 小睡 260ms 再试：应用刚启动时第一次枚举常常还没就绪，立刻判「没在运行」就会多开。
-      // ⚠️ 必须是 **await**，不能写成 `while (Date.now() < until) {}` 那种同步忙等：
-      //    忙等会**阻塞主进程事件循环** 520ms（本项目「execFileSync 卡死整个 Dock」同族问题），
-      //    而且这段探询一旦被开关打开（PROBE_BEFORE_LAUNCH=true），
-      //    最坏路径 = 3×(execFileSync ~0.9s + 忙等 0.26s) ≈ 3.5s 主进程假死。
+      // ⚠️ 必须是 **await**：同步忙等会阻塞主进程事件循环（Dock 假死）。
       await new Promise((resolve) => setTimeout(resolve, 260))
     }
   }
   return 'failed'
+}
+
+/** 查「这个 exe 现在有哪些 pid」——`tasklist` 一次约 70ms（**异步**，不阻塞主进程）。
+ *
+ *  这是点图标主路径上的第一跳：返回空数组就说明没在运行，可以立刻去 spawn，
+ *  不必为一次 PowerShell 冷启动（实测 **604ms**，加上 `Add-Type` 是 **869ms**）付钱。
+ *
+ *  返回 `null` = 查询本身失败（tasklist 缺失 / 超时）→ 上层按「可能在运行」处理，
+ *  宁可多走一次慢路，也不要因为查询失败就多开一个实例。 */
+async function imagePids(targetPath: string): Promise<number[] | null> {
+  if (!/\.(exe|com)$/i.test(targetPath)) return [] // 不是本地 exe，没有进程可匹配
+  const image = targetPath.split(/[\\/]/).pop() ?? ''
+  if (!image) return null
+  return new Promise<number[] | null>((resolve) => {
+    execFile(
+      'tasklist',
+      ['/FI', `IMAGENAME eq ${image}`, '/NH', '/FO', 'CSV'],
+      { windowsHide: true, timeout: 3000 },
+      (err, stdout) => {
+        if (err) {
+          resolve(null) // 查不了 → 上层走慢路
+          return
+        }
+        // 命中行形如 `"Weixin.exe","35884","Console","1","300,000 K"`；
+        // 没命中是本地化提示行（中文系统上「信息: 没有运行的任务…」），不含文件名。
+        const pids: number[] = []
+        for (const line of String(stdout).split(/\r?\n/)) {
+          if (!line.toLowerCase().includes(image.toLowerCase())) continue
+          const m = /"(\d+)"/g
+          let hit: RegExpExecArray | null
+          while ((hit = m.exec(line)) !== null) {
+            const n = Number(hit[1])
+            if (Number.isFinite(n) && n > 0) pids.push(n)
+          }
+        }
+        resolve(Array.from(new Set(pids)))
+      }
+    )
+  })
+}
+
+// ─── 常驻激活助手（v1.19.3：把「已在运行 → 激活」从 ~0.9s 压到 ~20ms）──────────
+// 问题：每次点图标都起一个 powershell.exe 做探询 —— 冷启动 604ms、加 Add-Type 编译 869ms，
+// 用户感受就是「点了要等一下才出来」。而 cscript/WSH 的 AppActivate 虽然只要 44ms，
+// 但它内部就是 SetForegroundWindow：窗口不是前台时直接被前台锁拒（实测微信退化成 3s），
+// 而且它不认最小化窗口、不认托盘。
+//
+// 解法：**开一个常驻的 PowerShell**，用 `-Command` 把 ACTIVATE_CS 编译一次，然后循环读 stdin：
+//   `RUN <base64(目标路径)>` → `STATE=<码>`
+// 之后每次点图标只剩一次管道往返（实测请求-响应 ~10-30ms），而判定逻辑仍是那套
+// 「按可见度挑窗口 / SW_RESTORE / 前台锁兜底抬升」的原生代码，语义一点没退。
+//
+// 生命周期：应用启动后 5s 预热（不占启动时间）；10 分钟没人用就退出（省内存）；
+// 退出/崩溃时下一次请求会重新拉起；应用退出时 kill 掉。
+const ACTIVATE_IDLE_MS = 10 * 60 * 1000
+
+/** 助手脚本：先编译 C#、打一行 READY，再逐行处理请求。路径走 base64，避免 stdin 编码踩坑。 */
+function activateHelperScript(): string {
+  return `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+${ACTIVATE_CS}
+'@
+Write-Output 'READY'
+[Console]::Out.Flush()
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  if ($line -eq 'EXIT') { break }
+  if ($line.StartsWith('SINK ')) {
+    try { $r = [QLActivate]::Sink($line.Substring(5)) } catch { $r = 0 }
+    Write-Output "SINKED=$r"
+    [Console]::Out.Flush()
+    continue
+  }
+  if (-not $line.StartsWith('RUN ')) { continue }
+  try {
+    $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line.Substring(4)))
+    $r = [QLActivate]::Probe($path)
+  } catch {
+    $r = 0
+  }
+  Write-Output "STATE=$r"
+  [Console]::Out.Flush()
+}
+`
+}
+
+let activateHelper: ChildProcess | null = null
+let activateHelperReady = false
+let activateHelperStarting: Promise<boolean> | null = null
+let activateHelperIdleTimer: NodeJS.Timeout | null = null
+/** 请求串行化：stdout 是一条流，两个请求并发会读串行（互抢 STATE 行）。 */
+let activateQueue: Promise<unknown> = Promise.resolve()
+
+function stopActivateHelper(): void {
+  if (activateHelperIdleTimer) {
+    clearTimeout(activateHelperIdleTimer)
+    activateHelperIdleTimer = null
+  }
+  const child = activateHelper
+  activateHelper = null
+  activateHelperReady = false
+  activateHelperStarting = null
+  if (child) {
+    try {
+      child.stdin?.write('EXIT\n')
+      child.kill()
+    } catch {
+      /* 已经退了 */
+    }
+  }
+}
+
+function touchActivateHelperIdle(): void {
+  if (activateHelperIdleTimer) clearTimeout(activateHelperIdleTimer)
+  activateHelperIdleTimer = setTimeout(() => stopActivateHelper(), ACTIVATE_IDLE_MS)
+  activateHelperIdleTimer.unref?.()
+}
+
+/** 起助手并等它把 C# 编译完（首行 READY）。失败返回 false，调用方退回一次性 PowerShell。 */
+function ensureActivateHelper(): Promise<boolean> {
+  if (activateHelperReady && activateHelper) return Promise.resolve(true)
+  if (activateHelperStarting) return activateHelperStarting
+  activateHelperStarting = new Promise<boolean>((resolve) => {
+    let settled = false
+    const done = (ok: boolean): void => {
+      if (settled) return
+      settled = true
+      resolve(ok)
+    }
+    let child: ChildProcess
+    try {
+      child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-'], {
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'ignore']
+      })
+    } catch (err) {
+      logWarn('launcher', '激活助手启动失败', err instanceof Error ? err.message : String(err))
+      done(false)
+      // ⚠️ 不能在 executor 里直接写 `activateHelperStarting = null`：
+      //    外层那句 `activateHelperStarting = new Promise(...)` 要等 executor **返回之后**
+      //    才执行，同步置空会被它覆盖掉 → 留下一个永久失效的 Promise。
+      //    排到微任务里（本轮同步执行之后）才安全。
+      queueMicrotask(() => { if (!activateHelperReady) activateHelperStarting = null })
+      return
+    }
+    activateHelper = child
+    let buf = ''
+    const onData = (d: Buffer): void => {
+      // ⚠️ 拿到 READY 之后这条监听器就该摘掉：旧写法在 ready 之后仍然无条件
+      //    `buf += …`，助手活多久这份字符串就长多久（每次请求的响应 10~20B 永久堆积，
+      //    而且 `buf.includes()` 是 O(n)）。它只是「等 READY」用的，不参与请求应答。
+      if (activateHelperReady) return
+      buf += String(d)
+      if (!buf.includes('READY')) return
+      activateHelperReady = true
+      child.stdout?.off('data', onData)
+      buf = ''
+      touchActivateHelperIdle()
+      done(true)
+    }
+    child.stdout?.on('data', onData)
+    child.on('error', () => {
+      if (activateHelper === child) stopActivateHelper()
+      done(false)
+    })
+    child.on('exit', () => {
+      if (activateHelper === child) {
+        activateHelper = null
+        activateHelperReady = false
+        // ⚠️ 必须连「正在启动」的那个 Promise 一起复位。它是**已 resolve(true) 的旧值**，
+        //    留着会让 ensureActivateHelper() 的 `if (activateHelperStarting) return ...`
+        //    永远返回它 → 助手死后再也拉不起来：之后每次点图标都退回 ~0.9s 的一次性
+        //    PowerShell（探询恒 retry，连「已在运行就不多开」都失效，微信会被开出第二个
+        //    登录窗），「隐藏/显示任务栏」也会全部静默失败。
+        activateHelperStarting = null
+      }
+      done(false) // 还没 READY 就退 → 这次算失败，下次重试
+    })
+    child.stdin?.write(activateHelperScript())
+    child.stdin?.write('\n')
+    // 编译 + 冷启动一般 <1.2s；4s 还没 READY 就认为这条路不可用。
+    // ⚠️ 超时未就绪时必须**把子进程收掉**并复位 starting：否则那个没编译完的
+    //    powershell.exe 会作为孤儿常驻内存，而 starting 停在已 resolve 的 false 上，
+    //    助手路径从此永久失效。
+    setTimeout(() => {
+      const ok = activateHelperReady
+      if (!ok) stopActivateHelper() // 内部会复位 starting / ready / handle
+      done(ok)
+    }, 4000)
+  })
+  return activateHelperStarting
+}
+
+/** 让助手对目标做一次「探询 / 激活」，返回与 `probeTargetState` 相同的四态。 */
+function helperProbeOnce(targetPath: string): Promise<'running' | 'tray' | 'absent' | 'retry'> {
+  const run = async (): Promise<'running' | 'tray' | 'absent' | 'retry'> => {
+    const ok = await ensureActivateHelper()
+    const child = activateHelper
+    if (!ok || !child || !child.stdin || !child.stdout) return 'retry'
+
+    return new Promise<'running' | 'tray' | 'absent' | 'retry'>((resolve) => {
+      const b64 = Buffer.from(targetPath, 'utf8').toString('base64')
+      let acc = ''
+      let finished = false
+      const finish = (v: 'running' | 'tray' | 'absent' | 'retry'): void => {
+        if (finished) return
+        finished = true
+        child.stdout?.off('data', onData)
+        clearTimeout(timer)
+        resolve(v)
+      }
+      const onData = (d: Buffer): void => {
+        acc += String(d)
+        const m = /STATE=(-?\d+)/.exec(acc)
+        if (!m) return
+        acc = ''
+        switch (Number(m[1])) {
+          case 1: finish('running'); return
+          case -1: finish('tray'); return
+          case 2: finish('absent'); return
+          case 0: finish('retry'); return
+          default: finish('retry')
+        }
+      }
+      const timer = setTimeout(() => finish('retry'), 3000)
+      const out = child.stdout
+      const stdin = child.stdin
+      if (!out || !stdin) {
+        finish('retry')
+        return
+      }
+      touchActivateHelperIdle() // 每次真正用到都续命，别在「正用着」的时候被空闲计时收走
+      out.on('data', onData)
+      try {
+        stdin.write(`RUN ${b64}\n`)
+      } catch {
+        finish('retry')
+      }
+    })
+  }
+  const queued = activateQueue.then(run, run)
+  activateQueue = queued.catch(() => undefined)
+  return queued
+}
+
+/** 让常驻助手把**我们自己的 Dock 窗口**压到 z-order 最底（实测 ~20ms，见 ps.ts 的 `QLActivate.Sink`）。
+ *
+ *  为什么必须走助手：`sendToBottom` 原来每次起一个 powershell，落地要 ~700ms。点开应用后
+ *  新窗口早就弹出来了、Dock 还挂在上面的观感就是「闪一下、过一会儿才退到后台」。
+ *  助手已预热时这里只剩一次管道往返，Dock 基本在应用窗口出现前就退开了。
+ *  助手不可用 → 返回 false，调用方退回一次性 PowerShell。 */
+
+function helperSink(hwnd: string): Promise<boolean> {
+  const run = async (): Promise<boolean> => {
+    const ok = await ensureActivateHelper()
+    const child = activateHelper
+    if (!ok || !child || !child.stdin || !child.stdout) return false
+    return new Promise<boolean>((resolve) => {
+      const out = child.stdout
+      const stdin = child.stdin
+      if (!out || !stdin) {
+        resolve(false)
+        return
+      }
+      let acc = ''
+      let finished = false
+      const finish = (v: boolean): void => {
+        if (finished) return
+        finished = true
+        out.off('data', onData)
+        clearTimeout(timer)
+        resolve(v)
+      }
+      const onData = (d: Buffer): void => {
+        acc += String(d)
+        const m = /SINKED=(\d)/.exec(acc)
+        if (m) finish(m[1] === '1')
+      }
+      const timer = setTimeout(() => finish(false), 2000)
+      touchActivateHelperIdle()
+      out.on('data', onData)
+      try {
+        stdin.write(`SINK ${hwnd}\n`)
+      } catch {
+        finish(false)
+      }
+    })
+  }
+  const queued = activateQueue.then(run, run)
+  activateQueue = queued.catch(() => undefined)
+  return queued
 }
 
 /** 解析探询脚本的 `STATE=<code>` 标记（**只认标记**，不要对整段 stdout 做等值判断 ——
@@ -2262,14 +2698,39 @@ function parseProbeState(stdout: string): number {
   return NaN
 }
 
-/** 单次探测/激活。'retry' 表示这次没能得到结论、值得重试。 */
-function activateRunningInstance(targetPath: string, timeoutMs: number): 'running' | 'tray' | 'absent' | 'retry' {
+/** 单次探测/激活：**优先走常驻助手**（预热后每次 ~20ms），助手起不来才退回一次性 PowerShell。
+ *
+ *  ⚠️ 别再改回「每次 spawn 一个 powershell 做探询」：冷启动 604ms + `Add-Type` 编译 869ms，
+ *  点图标就会一直有 ~1s 的延迟（用户 2026-11-28 报障：「点击要有延迟，能不能秒启动」）。
+ *  助手在一开始就把 C# 编译好，之后只做 stdin/stdout 往返。 */
+async function activateRunningInstance(
+  targetPath: string,
+  timeoutMs: number
+): Promise<'running' | 'tray' | 'absent' | 'retry'> {
   // 非本地可执行文件（shell: / URL / 无扩展名）没有进程可匹配，直接走启动流程
   if (!/\.(exe|com)$/i.test(targetPath)) return 'absent'
   if (!existsSync(targetPath)) return 'absent'
-  try {
-    const escaped = targetPath.replace(/'/g, "''")
-    const out = execFileSync(
+
+  const viaHelper = await helperProbeOnce(targetPath)
+  if (viaHelper !== 'retry') {
+    const label = viaHelper === 'running' ? '已激活运行中的实例' : viaHelper === 'tray' ? '目标在运行但窗口收在托盘里' : '确认为未运行'
+    logInfo('launcher', `${label}（助手）: ${targetPath}`)
+    return viaHelper
+  }
+  return oneShotProbe(targetPath, timeoutMs)
+}
+
+/** 兜底：一次性 PowerShell 探询（~0.9s）。只在常驻助手起不来时才会走到。 */
+function oneShotProbe(
+  targetPath: string,
+  timeoutMs: number
+): Promise<'running' | 'tray' | 'absent' | 'retry'> {
+  if (!/\.(exe|com)$/i.test(targetPath)) return Promise.resolve('absent')
+  if (!existsSync(targetPath)) return Promise.resolve('absent')
+
+  const escaped = targetPath.replace(/'/g, "''")
+  return new Promise((resolve) => {
+    execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -2278,27 +2739,31 @@ ${ACTIVATE_CS}
 '@
 $r = [QLActivate]::Probe('${escaped}')
 Write-Output "STATE=$r"`],
-      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }
+      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true },
+      (err, stdout) => {
+        if (err && !stdout) {
+          console.log('[launcher] 探询进程失败（按 retry 处理，不启动）:', err.message)
+          resolve('retry')
+          return
+        }
+        switch (parseProbeState(String(stdout))) {
+          case 1: console.log('[launcher] 已激活运行中的实例:', targetPath); resolve('running'); return
+          case -1: console.log('[launcher] 目标在运行但窗口收在托盘里:', targetPath); resolve('tray'); return
+          // ⚠️⚠️ 2 = **根本没有这个进程** —— 这是唯一允许去启动新实例的返回值。
+          //    在此之前 `absent` 对「exe 存在但没在运行」是**不可达**的：C# 把
+          //    「没这个进程」和「进程在但没建窗」都返回 0，上层一律当 retry，
+          //    3 次之后判 failed → **一个没在运行的程序永远点不开**，只弹
+          //    「没能确认是否已在运行…请再点一次」。用户报的「有的图标点开就这样」即此。
+          case 2: resolve('absent'); return
+          // 0 = 进程在、但还没找到带标题的窗口（多半是刚启动还没建窗）→ 值得重试
+          case 0: resolve('retry'); return
+          default:
+            console.log('[launcher] 探询输出无法解析（按 retry 处理，不启动）:', JSON.stringify(String(stdout ?? '').trim().slice(0, 120)))
+            resolve('retry')
+        }
+      }
     )
-    switch (parseProbeState(String(out))) {
-      case 1: console.log('[launcher] 已激活运行中的实例:', targetPath); return 'running'
-      case -1: console.log('[launcher] 目标在运行但窗口收在托盘里:', targetPath); return 'tray'
-      // ⚠️⚠️ 2 = **根本没有这个进程** —— 这是唯一允许去启动新实例的返回值。
-      //    在此之前 `absent` 对「exe 存在但没在运行」是**不可达**的：C# 把
-      //    「没这个进程」和「进程在但没建窗」都返回 0，上层一律当 retry，
-      //    3 次之后判 failed → **一个没在运行的程序永远点不开**，只弹
-      //    「没能确认是否已在运行…请再点一次」。用户报的「有的图标点开就这样」即此。
-      case 2: return 'absent'
-      // 0 = 进程在、但还没找到带标题的窗口（多半是刚启动还没建窗）→ 值得重试
-      case 0: return 'retry'
-      default:
-        console.log('[launcher] 探询输出无法解析（按 retry 处理，不启动）:', JSON.stringify(String(out).trim().slice(0, 120)))
-        return 'retry'
-    }
-  } catch (err) {
-    console.log('[launcher] activate probe failed:', err instanceof Error ? err.message : String(err))
-    return 'retry'
-  }
+  })
 }
 
 // ─── 用 UI Automation 点托盘图标，把「收在托盘里」的窗口唤出来（v1.13.7）──────
@@ -2337,7 +2802,12 @@ const TRAY_SHOW_HIDDEN_NAME = '显示隐藏的图标'
  *  实测：`-Command` 失败 / BOM+.ps1 `-File` 连续两次成功。 */
 function clickTrayIconFor(targetPath: string): Promise<boolean> {
   const exeName = basename(targetPath).replace(/\.[^.]+$/, '') // Weixin.exe → Weixin
-  const scriptPath = join(app.getPath('temp'), `ql-tray-${process.pid}.ps1`)
+  // ⚠️ 文件名必须**每次唯一**（原来只带 pid）：600ms 内点两个不同的托盘型应用时，
+  //    第二次 writeFileSync 会覆盖同一路径，而第一次结束时 `rmSync` 删掉的正是第二次
+  //    还没被 PowerShell 读到的脚本 → 第二次静默失败（只留一行日志）。
+  //    渲染端的防连点是按 targetPath 分别计时的，拦不住这种「连点两个不同图标」。
+  const uniq = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const scriptPath = join(app.getPath('temp'), `ql-tray-${process.pid}-${uniq}.ps1`)
   try {
     const escaped = targetPath.replace(/'/g, "''")
     const script = `
@@ -2351,6 +2821,15 @@ ${TRAY_CLICK_CS}
 $cands = New-Object System.Collections.Generic.List[string]
 foreach ($t in ([QLTray]::WindowTitles('${escaped}') -split '\\|')) { if ($t) { [void]$cands.Add($t) } }
 [void]$cands.Add('${exeName}')
+# ⚠️ 只有「窗口标题 + exe 名」不够：微信 4 的托盘图标 UIA 名是 **WeChat-CN**，
+#    跟「微信」「Weixin」互不包含 → 永远匹配不上，点托盘必然失败（用户报障「微信打不开」）。
+#    再从 exe 版本信息里取产品名（WeChat / 微信 …）进候选；匹配是「包含」判断，后缀 -CN 无所谓。
+try {
+  $vi = (Get-Item -LiteralPath '${escaped}').VersionInfo
+  foreach ($v in @($vi.FileDescription, $vi.ProductName, $vi.InternalName)) {
+    if ($v) { [void]$cands.Add($v); [void]$cands.Add(($v -replace '\\s', '')) }
+  }
+} catch { }
 [QLTray]::ClickTrayIcon('${TRAY_SHOW_HIDDEN_NAME}', $cands.ToArray())`
     // BOM 不能省：没有它 PowerShell 5.1 会按 ANSI 代码页读文件，中文同样会坏
     writeFileSync(scriptPath, '\ufeff' + script, 'utf8')
@@ -2361,9 +2840,11 @@ foreach ($t in ([QLTray]::WindowTitles('${escaped}') -split '\\|')) { if ($t) { 
     //   改成子进程 + 回调，卡住也只是一个 8s 超时的后台任务，主进程始终活着。
     return new Promise<boolean>((resolve) => {
       let settled = false
+      let killTimer: ReturnType<typeof setTimeout> | null = null
       const finish = (v: boolean): void => {
         if (settled) return
         settled = true
+        if (killTimer) { clearTimeout(killTimer); killTimer = null }
         try { rmSync(scriptPath, { force: true }) } catch { /* ignore */ }
         resolve(v)
       }
@@ -2371,19 +2852,21 @@ foreach ($t in ([QLTray]::WindowTitles('${escaped}') -split '\\|')) { if ($t) { 
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
         { timeout: 8000, windowsHide: true, maxBuffer: 1 << 20 },
-        (err, stdout) => {
+        (err, stdout, stderr) => {
           if (err) {
             console.log('[launcher] tray click failed:', err.message)
+            logWarn('launcher', `托盘点击子进程失败: ${err.message} | stderr=${String(stderr ?? '').trim().slice(0, 300)}`)
             finish(false)
             return
           }
+          logInfo('launcher', `托盘点击输出: ${String(stdout ?? '').trim().replace(/[\r\n]+/g, ' ').slice(0, 200)}`)
           const n = Number(String(stdout).trim().split(/\r?\n/).pop())
           if (n === 1) { console.log('[launcher] 已通过托盘图标唤出:', targetPath); finish(true) }
           else { console.log('[launcher] 托盘图标未点击（返回值 ' + String(stdout).trim() + '）:', targetPath); finish(false) }
         }
       )
       // 兜底：execFile 的 timeout 只杀子进程，回调理论上会来；但万一子进程杀不掉也不拖着 run-app
-      setTimeout(() => {
+      killTimer = setTimeout(() => {
         if (settled) return
         console.log('[launcher] tray click 超时，按未点击处理:', targetPath)
         try { child.kill() } catch { /* ignore */ }
@@ -2400,10 +2883,15 @@ foreach ($t in ([QLTray]::WindowTitles('${escaped}') -split '\\|')) { if ($t) { 
 // 把 Dock 窗口压到 z-order 最底（HWND_BOTTOM）。Electron 没有 moveBottom()，
 // 只能通过 SetWindowPos 调 Windows API 实现真正沉底。
 //
-// 注意这条路径的**时间尺度**：每次都要起一个新的 powershell.exe，加上
-// `-TypeDefinition` 触发的一次性 C# 编译（首次约 200ms~1s），真正落地的
-// SetWindowPos 往往在 blur 之后近一秒才执行。这就是下面整套代数校验存在的原因。
-function sendToBottom(win: BrowserWindow): void {
+// 两条落地通道：常驻助手（~20ms，默认）与一次性 PowerShell（~700ms，助手没起来时兜底）。
+// 无论走哪条，收尾都要经过 `finishSink()` 的代数校验 —— 见那里的注释。
+//
+// ⚠️ `strict`（v1.19.4）：**点图标启动后**这一次沉底必须是「无条件生效」的。
+// 收尾里的「用户又抓回 Dock 了」判定包含「指针停在玻璃条上」和「刚在 Dock 上动过」，
+// 而点图标这个动作**必然**让这两条成立 —— 于是启动后的沉底每次都被自己撤销：
+// 表现就是「打开微信，Dock 闪一下、过一会儿（等看门狗）才退到后台」（用户 2026-11-28 报障）。
+// 启动路径传 strict=true，只认「sinkSeq 变了 / 窗口被藏了」这两种真正的反悔信号。
+function sendToBottom(win: BrowserWindow, strict = false): void {
   if (win.isDestroyed()) return
   const startSeq = sinkSeq
   // 同一扇窗口已有沉底任务在跑：不重复起进程（每次都是一个新的 powershell.exe）。
@@ -2415,9 +2903,13 @@ function sendToBottom(win: BrowserWindow): void {
   if (sinkState && sinkState.win === win) {
     setTimeout(() => {
       if (sinkSeq !== startSeq) return // 期间有更新的意图，交给那条路径
-      if (!win.isDestroyed() && win.isVisible() && !win.isFocused() && !dockTrayHidden && canSinkNow()) {
-        sendToBottom(win)
-      }
+      // ⚠️ `strict` 必须**透传**下去：启动路径那次沉底一旦退化成非 strict，
+      //    finishSink 里的「用户又抓回 Dock 了」判定就会因为「点图标必然把指针
+      //    留在玻璃条上」而撤销掉它 —— 正是 v1.19.4 修过的那个症状。
+      //    同理 strict 时不看 isFocused / canSinkNow（初始那次调用本来也不看）。
+      const stillWanted = win.isVisible() && !dockTrayHidden &&
+        (strict || (!win.isFocused() && canSinkNow()))
+      if (!win.isDestroyed() && stillWanted) sendToBottom(win, strict)
     }, 180)
     return
   }
@@ -2426,6 +2918,21 @@ function sendToBottom(win: BrowserWindow): void {
   const hwnd = buf.length >= 8
     ? `0x${buf.readBigUInt64LE(0).toString(16)}`
     : `0x${buf.readUInt32LE(0).toString(16)}`
+  sinkState = { win, seq: startSeq, strict }
+  lastSinkAt = Date.now()
+
+  // 快路：常驻助手在（应用启动 5s 后就是）→ 一次管道往返，实测 ~20ms。
+  // 这是「点开应用后 Dock **立刻**退开」的关键：慢路要起一个 powershell（~700ms），
+  // 那期间新窗口已经弹出来了、Dock 还挂在上面的观感就是用户报的
+  // 「闪一下、过一会儿才退到后台」（2026-11-28）。
+  if (activateHelperReady && activateHelper) {
+    logInfo('dock', `sendToBottom(助手) seq=${startSeq} hwnd=${hwnd}`)
+    void helperSink(hwnd).then((ok) => {
+      finishSink(win, startSeq, strict, ok ? null : new Error('助手沉底失败'))
+    })
+    return
+  }
+
   const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -TypeDefinition @'
@@ -2439,36 +2946,145 @@ public static class WinZ {
 # HWND_BOTTOM=1, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
 [WinZ]::SetWindowPos([IntPtr]::new(${hwnd}), [IntPtr]::new(1), 0, 0, 0, 0, 0x0002 -bor 0x0001 -bor 0x0010) | Out-Null`
 
-  sinkState = { win, seq: startSeq }
-  logInfo('dock', `sendToBottom 开始 seq=${startSeq} hwnd=${hwnd}`)
+  logInfo('dock', `sendToBottom(PS 兜底) seq=${startSeq} hwnd=${hwnd}`)
+  runPowerShell(psScript, 4000, ({ err }) => finishSink(win, startSeq, strict, err))
+}
 
-  runPowerShell(psScript, 4000, ({ err }) => {
-    // ⚠️ 必须先捕获「这次沉底是不是我们自己的、还是否仍然成立」，**再**清 sinkState。
-    // 原实现先清 sinkState 再调 stillWanted()，而 stillWanted() 的第一个条件正是
-    // `sinkState?.win === win` —— 于是它恒为 false，紧跟的 `if (!visible) recoverDock()`
-    // 在**每一次成功的沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶
-    // （并顺带 markDockShown() 重置 2.5s 宽限期，让下一次 blur 也被吞掉）。
-    // 表现：「点击别的软件后 Dock 让位」100% 被撤销。
-    const ours = sinkState?.win === win && sinkState.seq === startSeq
-    if (sinkState?.win === win) sinkState = null
-    if (err) {
-      logError('dock', 'sendToBottom 失败', err)
-      // 失败时 blur 已经把窗口从置顶层降级（setAlwaysOnTop(false)），却没能真正沉底：
-      // 窗口会停在「非置顶、又盖在普通窗口上面」的半吊子状态，且不会再自己回来。
-      // 显式恢复置顶，把下一次让位交给下一次 blur 重新尝试。
-      if (!win.isDestroyed() && win.isVisible() && !dockTrayHidden) recoverDock(win)
-      return
+/** 沉底任务的收尾（快路 / 慢路共用）。err 非空表示这次 SetWindowPos 没落地。 */
+function finishSink(win: BrowserWindow, startSeq: number, strict: boolean, err: Error | null): void {
+  // ⚠️ 必须先捕获「这次沉底是不是我们自己的、还是否仍然成立」，**再**清 sinkState。
+  // 原实现先清 sinkState 再调 stillWanted()，而 stillWanted() 的第一个条件正是
+  // `sinkState?.win === win` —— 于是它恒为 false，紧跟的 `if (!visible) recoverDock()`
+  // 在**每一次成功的沉底之后**都会执行，把刚沉下去的 Dock 又拉回置顶
+  // （并顺带 markDockShown() 重置 2.5s 宽限期，让下一次 blur 也被吞掉）。
+  // 表现：「点击别的软件后 Dock 让位」100% 被撤销。
+  const ours = sinkState?.win === win && sinkState.seq === startSeq
+  if (sinkState?.win === win) sinkState = null
+  // ⚠️ 窗口可能在沉底途中就被销毁（托盘退出 / 切档重建 / 渲染进程崩溃后的重建）：
+  //    下面 `pointerOverBar()` 要读 `win.getContentBounds()`，对已销毁窗口必定抛
+  //    "Object has been destroyed"。慢路（一次性 PowerShell）里那是 execFile 回调，
+  //    抛错会落进 uncaughtException —— 这一次的「仍然有效 / 需要补偿」判定整条被跳过，
+  //    而且快路（助手 .then）里会变成未处理 rejection。所以存活判定要提到最前。
+  if (win.isDestroyed()) return
+  if (err) {
+    logError('dock', 'sendToBottom 失败', err)
+    // 退避：失败会让窗口停在「已降级、没沉底」的半吊子状态，看门狗下一拍（500ms）
+    // 又会认为该沉底 → 每 500ms 起一个 powershell.exe 的死循环（每个 ~700ms CPU、
+    // 几十 MB 内存）。这里记账，让 watchdog 先歇 SINK_FAIL_BACKOFF_MS 再重试。
+    lastSinkFailAt = Date.now()
+    // 失败时调用方已经把窗口从置顶层降级（setAlwaysOnTop(false)），却没能真正沉底：
+    // 窗口会停在「非置顶、又盖在普通窗口上面」的半吊子状态，且不会再自己回来。
+    // 显式恢复置顶，把下一次让位交给下一次 blur 重新尝试。
+    // 同时清掉 dockAutoSunk —— 窗口已经回到置顶层了，再留着这个标记会让下一次
+    // Alt+Space / 托盘点击走「唤回」分支（位置本来就在顶上）→ 按一下毫无反应。
+    if (win.isVisible() && !dockTrayHidden) {
+      dockAutoSunk = false
+      recoverDock(win)
     }
-    // 这次沉底仍然有效（期间没有任何更晚的「拉回/隐藏」意图，窗口也还在原位）→ 什么都不做
-    if (ours && sinkSeq === startSeq && !win.isDestroyed() && win.isVisible() &&
-        !win.isFocused() && !dockTrayHidden) {
-      return
-    }
-    // 迟到的 HWND_BOTTOM 补偿：PS 执行期间用户可能已经把 Dock 拉回来了
-    // （Alt+Space 唤回 / 托盘 / 鼠标移回 / 启动失败恢复）。这里不能再用
-    // isAlwaysOnTop() 判断——恢复路径会把它设回 true，原写法恒真、形同虚设。
-    if (!win.isDestroyed() && win.isVisible()) recoverDock(win)
-  })
+    return
+  }
+  // 这次沉底仍然有效（期间没有任何更晚的「拉回/隐藏」意图，窗口也还在原位）→ 什么都不做
+  // ⚠️ 这里**不能**再用 `!win.isFocused()`：本机的焦点状态会卡在 true（见 sinkWatchdogTick
+  //    的注释），那样每一次成功沉底都会被这行判成「已被拉回」→ 紧接着 recoverDock 撤销掉，
+  //    表现就是「沉一下又弹回来」，还会每 500ms 白起一个 PowerShell。
+  //    换成「期间用户有没有重新抓住 Dock」：指针回到玻璃条上 / 浮层打开 / 刚在 Dock 上动过。
+  // strict（启动路径）：不看指针/活动 —— 点图标必然把指针留在玻璃条上，看了就永远撤销。
+  const reEngaged = strict ? false
+    : (pointerOverBar(win) || dockOverlayOpen || Date.now() - lastDockActivityAt < 600)
+  if (ours && sinkSeq === startSeq && win.isVisible() && !reEngaged && !dockTrayHidden) {
+    return
+  }
+  // 迟到的 HWND_BOTTOM 补偿：执行期间用户可能已经把 Dock 拉回来了
+  // （Alt+Space 唤回 / 托盘 / 鼠标移回 / 启动失败恢复）。这里不能再用
+  // isAlwaysOnTop() 判断——恢复路径会把它设回 true，原写法恒真、形同虚设。
+  if (win.isVisible()) recoverDock(win)
+}
+
+/** 光标是不是停在玻璃条上（含 6px 容差）。
+ *
+ *  ⚠️ 不用 renderer 的 `dock-pointer` 事件：它只在 mouseenter/mouseleave 时报一次，
+ *  实测会被莫名其妙的 mouseleave 提前清掉（静止悬停时尤其不可靠），而静止悬停恰恰是
+ *  「用户正在看 Dock」的典型状态。主进程直接量：光标（`screen.getCursorScreenPoint`，
+ *  屏幕 DIP）+ 内容区原点（`getContentBounds`）+ renderer 上报的玻璃条矩形（`dockBarRect`）。 */
+function pointerOverBar(win: BrowserWindow): boolean {
+  if (!dockBarRect) return false
+  const b = win.getContentBounds()
+  const p = screen.getCursorScreenPoint()
+  const pad = 6
+  return p.x >= b.x + dockBarRect.x - pad && p.x <= b.x + dockBarRect.x + dockBarRect.width + pad &&
+         p.y >= b.y + dockBarRect.y - pad && p.y <= b.y + dockBarRect.y + dockBarRect.height + pad
+}
+
+/** 退场看门狗（v1.19.1）：用户不在用 Dock 时，让它自动退回所有窗口后面。
+ *
+ *  用户报障原话：「我希望在点击其他区域的时候，dock 栏就自动退到后台」。
+ *
+ *  ⚠️ 为什么不用 blur / isFocused()（实测结论，改这块先读）：
+ *  这扇窗的焦点状态在本机会**卡死在 true** —— 系统前台已经是 Edge/抖音
+ *  （`GetForegroundWindow` 也指向它），但 `win.isFocused()` / `document.hasFocus()`
+ *  一直是 true，Windows 也不再发 WM_KILLFOCUS。原因是窗口被前台锁拒绝激活时，
+ *  `show()/focus()` 只拿到了**线程内键盘焦点**。结果 blur 永不触发 → 点别的软件不让位
+ *  （用户实机日志里整段会话 `sendToBottom` 一次都没有）。
+ *  `powerMonitor.getSystemIdleTime()` 也同样不可用：本机恒返回 0（实测系统已空闲 3s）。
+ *
+ *  所以判据只有一个来源可靠的信号：**renderer 上报的「用户刚在 Dock 上动过」**
+ *  （mousemove / keydown / wheel / pointerdown，见 `dock-activity`）。
+ *  「没在动 + 没悬停 + 没浮层」持续 `DOCK_IDLE_SINK_MS` → 退场。
+ *  沉底之后 `isAlwaysOnTop()` 变 false，下一拍直接跳过，不会反复起 PowerShell。 */
+const SINK_WATCHDOG_MS = 500
+/** 用户离开 Dock 多久后让它退到后台。太短会在「眼睛还在看、手还没动」时消失，2.5s 够稳。 */
+const DOCK_IDLE_SINK_MS = 2500
+/** 沉底失败后的退避窗口：失败时窗口已被恢复置顶，若不退避，看门狗下一拍（500ms）
+ *  就会再次尝试 → 每 500ms 一个 powershell.exe 的死循环。5s 足够让一次性抖动自愈，
+ *  又不会让「真的失败了」永远不重试。 */
+const SINK_FAIL_BACKOFF_MS = 5000
+
+/** 上一次 watchdog 的判定结果（只在变化时落一行日志，500ms 一拍也不会刷屏）。
+ *  排查「Dock 不退场」时先看这一行：`in-use` = 指针在上面或有浮层、`busy` = 刚动过、
+ *  `grace` = 刚显示/唤回的 2.5s 宽限、`not-top` = 已经退过了。 */
+let lastWatchdogState = ''
+
+function sinkWatchdogTick(): void {
+  const win = mainWindow
+  let state: string
+  if (!win || win.isDestroyed()) state = 'no-window'
+  else if (!win.isVisible()) state = 'hidden'
+  else if (dockTrayHidden) state = 'tray'
+  else if (dialogOpen) state = 'dialog'
+  else if (!win.isAlwaysOnTop()) state = 'not-top'
+  else if (sinkState) state = 'sinking'
+  else if (pointerOverBar(win) || dockOverlayOpen) state = 'in-use'
+  else if (Date.now() - lastDockActivityAt < DOCK_IDLE_SINK_MS) state = 'busy'
+  else if (!canSinkNow()) state = 'grace'
+  else if (Date.now() - lastSinkFailAt < SINK_FAIL_BACKOFF_MS) state = 'sink-failed'
+  else state = 'sink'
+
+  if (state !== lastWatchdogState) {
+    lastWatchdogState = state
+    logInfo('dock', `watchdog state=${state}`)
+  }
+
+  if (state !== 'sink' || !win) return
+  dockAutoSunk = true
+  win.setAlwaysOnTop(false)
+  sendToBottom(win)
+}
+
+/** 看门狗定时器句柄。必须可停：`before-quit` 会 preventDefault 并最长等 800ms，
+ *  这段时间里每 500ms 的一拍仍可能在退出途中再起一个 PowerShell（沉底一次 ~700ms），
+ *  既拖慢退出又白烧一次 CPU。 */
+let sinkWatchdogTimer: NodeJS.Timeout | null = null
+
+function startSinkWatchdog(): void {
+  if (sinkWatchdogTimer) return
+  sinkWatchdogTimer = setInterval(sinkWatchdogTick, SINK_WATCHDOG_MS)
+  sinkWatchdogTimer.unref?.()
+}
+
+function stopSinkWatchdog(): void {
+  if (!sinkWatchdogTimer) return
+  clearInterval(sinkWatchdogTimer)
+  sinkWatchdogTimer = null
 }
 
 /** 创建 Dock 窗口。
@@ -2589,6 +3205,7 @@ function createWindow(edge: DockEdge, startHidden: boolean): void {
   // run-app 启动后窗口隐藏到托盘，唤回时由这里恢复置顶并拉回顶层。
   mainWindow.on('focus', () => {
     dockTrayHidden = false
+    dockAutoSunk = false // 拿到焦点就说明它不是「被 watchdog 沉掉的状态」了
     sinkSeq++ // 拿到焦点就是最明确的「我要它在上面」信号，作废在途沉底
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) recoverDock(mainWindow)
   })
@@ -2657,6 +3274,19 @@ app.whenReady().then(async () => {
   // 启动：位置取记忆里的停靠位置；是否显示由「是否开机自启」决定（--autostart 时收在托盘）
   createWindow(readDockEdge(), startHiddenAtLogin)
 
+  // 沉底看门狗（v1.19.1）：blur 是**边沿触发**，覆盖不到「Dock 从来没拿到过焦点」的情形。
+  // 1.2s 一拍、纯内存判断；只有真的要沉底时才起一次 PowerShell（与 blur 路径同量级）。
+  // 放在建窗之后：`mainWindow` 必须先存在；窗口重建时这个 interval 不重开（它读的是全局）。
+  // 退场看门狗（v1.19.1）：不依赖 blur / isFocused / 系统空闲时间（这三者在本机都不可信，
+  // 见 sinkWatchdogTick 的注释），只按「用户最近有没有在用 Dock」判定。
+  // 放在建窗之后：`mainWindow` 必须先存在；窗口重建时这个 interval 不重开（它读的是全局）。
+  startSinkWatchdog()
+
+  // 激活助手预热（v1.19.3）：点图标要「秒开」就得让那个常驻 PowerShell 提前把 C# 编译好，
+  // 否则第一次点击会自己吃一次 ~1s 的冷启动。放到 5s 之后 —— 不与启动时的图标扫描/列盘符抢资源，
+  // 也不占首帧时间；起不来（没有 PowerShell / 被策略拦）时会自动退回一次性探询。
+  setTimeout(() => { void ensureActivateHelper() }, 5000).unref()
+
   // 更新检查（F1）：打包版启动 20s 后静默看一眼 latest.yml，有新版只走托盘气泡，
   // 绝不弹窗抢焦点（Dock 是常驻桌面窗，弹窗会把用户正在干的事打断）。
   scheduleSilentUpdateCheck(notifyUser)
@@ -2691,39 +3321,56 @@ app.whenReady().then(async () => {
   // 用多尺寸 ICO 而不是 16×16 的 PNG：显示器缩放 125% 时托盘需要 20 物理像素、
   // 150% 需要 24、200% 需要 32，单尺寸 PNG 会被系统拉伸成模糊（实测原 16px 图标
   // 在 125% 下必然发虚）。ICO 里 16/20/24/32 都是原生绘制，由外壳按当前 DPI 挑。
-  const trayIcon = nativeImage.createFromPath(resolveResource('tray-icon.ico'))
-  tray = new Tray(trayIcon)
-  tray.setToolTip('快捷方式面板')
-  tray.on('click', () => toggleWindow())
+  //
+  // ⚠️ 整块必须包 try/catch：`new Tray(emptyImage)` 会抛（打包漏资源 / 绿色版被挪走后
+  //    resolveResource 回落到不存在的路径 → 空图）。原来它一抛，这个 async 回调就变成
+  //    unhandledRejection（只打一行日志），**后面所有初始化整段跳过** —— 其中就包括
+  //    在线代码之后的 `globalShortcut.register`。后果是「有 Dock、没托盘、Alt+Space 也没反应」，
+  //    而且用户没有任何 UI 入口可以退出应用。
+  try {
+    const trayIcon = nativeImage.createFromPath(resolveResource('tray-icon.ico'))
+    tray = new Tray(trayIcon)
+    tray.setToolTip('快捷方式面板')
+    tray.on('click', () => toggleWindow())
 
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: '显示窗口',
-      click: () => {
-        if (!mainWindow || mainWindow.isDestroyed()) return
-        // 与 toggleWindow 的显示分支保持一致（三个动作缺一不可）：
-        // ① sinkSeq++ 作废在途沉底——否则迟到的 SetWindowPos(HWND_BOTTOM) 会把刚显示的
-        //    窗口钉到底部；② recoverDock 统一置顶入口；③ focus 由 recoverDock 的巡检兜住。
-        // 原来只做 show()+focus()：一旦 Windows 前台锁拒绝这次激活（CLAUDE.md 里记过这个
-        // 场景），窗口就停在「可见但不置顶」，而且没有任何宽限期保护
-        clearLaunchHide()
-        dockTrayHidden = false
-        sinkSeq++
-        mainWindow.show()
-        recoverDock(mainWindow)
-        mainWindow.focus()
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: '显示窗口',
+        click: () => {
+          if (!mainWindow || mainWindow.isDestroyed()) return
+          // 与 toggleWindow 的显示分支保持一致（三个动作缺一不可）：
+          // ① sinkSeq++ 作废在途沉底——否则迟到的 SetWindowPos(HWND_BOTTOM) 会把刚显示的
+          //    窗口钉到底部；② recoverDock 统一置顶入口；③ focus 由 recoverDock 的巡检兜住。
+          // 原来只做 show()+focus()：一旦 Windows 前台锁拒绝这次激活（CLAUDE.md 里记过这个
+          // 场景），窗口就停在「可见但不置顶」，而且没有任何宽限期保护
+          clearLaunchHide()
+          dockTrayHidden = false
+          dockAutoSunk = false
+          sinkSeq++
+          // ⚠️ 必须 markDockShown()：这是「用户主动显示」，接下来 2.5s 内的 blur 都是焦点
+          //    抖动，不该让位。其它四条显示路径（toggleWindow 两个分支 / ready-to-show /
+          //    second-instance / 设置窗关闭）都有这一句，只有托盘这条漏了 —— 而
+          //    `--autostart` 起的那次启动是把 dockShownAt 显式打成 0 的，
+          //    于是从托盘唤回后点一下别的软件，Dock 会立刻被沉底。
+          markDockShown()
+          mainWindow.show()
+          recoverDock(mainWindow)
+          mainWindow.focus()
+        }
+      },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          forceQuit = true
+          app.quit()
+        }
       }
-    },
-    { type: 'separator' },
-    {
-      label: '退出',
-      click: () => {
-        forceQuit = true
-        app.quit()
-      }
-    }
-  ])
-  tray.setContextMenu(contextMenu)
+    ])
+    tray.setContextMenu(contextMenu)
+  } catch (err) {
+    logError('tray', '托盘初始化失败（快捷键与 Dock 仍可用，但只能从任务栏/Alt+Space 操作）', err)
+  }
 
   // Global shortcut to toggle window. Prefer Alt+Space (verified working);
   // fall back to Ctrl+Alt+Space only if it fails to register. Note: Ctrl+Alt
@@ -2931,6 +3578,11 @@ process.on('unhandledRejection', (reason) => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
   stopDesktopWatch()
+  stopActivateHelper() // 常驻激活助手必须一起收掉，否则退出后还挂着一个 powershell.exe
+  stopSinkWatchdog()
+  // 设置的写盘是 150ms 合并的（拖滑块会连发几十个 set-settings）：退出前必须强制落一次，
+  // 否则「刚改完就退出」那一下会跟着进程一起消失。
+  flushSettingsWrite()
 })
 
 app.on('window-all-closed', () => {

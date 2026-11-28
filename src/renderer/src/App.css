@@ -825,7 +825,9 @@ html[data-glass-fx='off'] .dock-bg::after {
   width: calc(100% - 16px);
   margin: 0 8px;
   border-radius: 10px;
-  padding: 7px 12px;
+  /* v1.20.0：菜单多了「托盘应用可唤出任务栏」一行，7px 会把「开机自启动」挤出窗口
+     （整条菜单必须塞进玻璃条上方那 ~136px 的可视区）。5px 后 6 行刚好放下。 */
+  padding: 5px 12px;
   /* 菜单项与分段选择器统一到同一档字号/字重（v1.13.3）：
      原来这里是 .84rem/400、分段按钮是 .8rem/600 —— 两者在菜单里上下相邻，
      字号差 + 字重差叠在一起就是用户说的「两种字体感觉不匹配」。
@@ -892,7 +894,7 @@ html[data-glass-fx='off'] .dock-bg::after {
 
 .dropdown-divider {
   height: 1px;
-  margin: 6px 12px;
+  margin: 4px 12px;
   background: var(--divider-bg);
 }
 
@@ -1729,13 +1731,86 @@ html[data-glass-fx='off'] .dock-bg::after {
    双栏：左输出、右输入。卡片本身不滚（列内滚），否则页脚会跟着滚出可视区。
    宽度 460 / 两列各 ~220：在 1200 窗口里左右各有富余，而 340（文件夹卡片）放两列
    会把设备名压成 8 个字，同名的「扬声器」根本分不出来。 */
+/* ─── 音量条（v1.19.5）：静音键 + 滑块 + 数值，作用对象是当前默认输出设备 ─── */
+.audio-vol {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--sf-row, 28px);
+  padding: 0 2px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--sf-line, rgba(255, 255, 255, 0.08));
+}
+
+.audio-mute {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--sf-text-dim, rgba(255, 255, 255, 0.62));
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.audio-mute:hover {
+  background: var(--sf-hover, rgba(255, 255, 255, 0.07));
+  color: var(--sf-text, #fff);
+}
+
+/* 静音是一「开」状态：用强调色淡底，不用红 —— 红在这套淡玻璃里太重 */
+.audio-mute.on {
+  color: var(--ui-accent-soft, #9cc3f5);
+  background: var(--sf-accent-hover, rgba(120, 170, 235, 0.18));
+}
+
+.audio-slider {
+  flex: 1 1 auto;
+  height: 4px;
+  margin: 0;
+  border-radius: 2px;
+  background: rgba(127, 127, 127, 0.28);
+  appearance: none;
+  cursor: pointer;
+  outline: none;
+}
+
+.audio-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--sf-text, #f2f6ff);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  transition: transform 0.1s;
+}
+
+.audio-slider:hover::-webkit-slider-thumb {
+  transform: scale(1.12);
+}
+
+.audio-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(120, 170, 235, 0.35);
+}
+
+.audio-vol-num {
+  min-width: 30px;
+  text-align: right;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--sf-text-dim, rgba(255, 255, 255, 0.62));
+}
+
 .audio-card {
   display: flex;
   flex-direction: column;
   width: 460px;
-  /* 垂直预算（窗口 300px 时卡片上限 ≈202）：上下内边距 8 + 标题 ~14 + 页脚 ~26 = 48，
-     剩 154 给列表 → 5 行 × 30px 全露（实测列表只剩 149 时第 5 行会被切 1px，
-     所以这 2px 不是凑数）。改这里任何一个数字都要重算这行账。 */
+  /* 垂直预算（窗口 300px 时卡片上限 ≈202）：
+     内边距 8 + 音量条 28 + 列标题 14 + 页脚 26 = 76，剩 ~126 给列表 → 4 行 × 28 = 112 全露。
+     v1.19.5 加音量条时把可见行数从 5 降到 4 —— 再加东西前先重算这行账。 */
   padding: 5px 8px 3px;
   overflow: hidden; /* 滚动交给 .audio-list */
 }
@@ -1779,7 +1854,8 @@ html[data-glass-fx='off'] .dock-bg::after {
 .audio-list {
   flex: 1 1 auto;
   min-height: 0;
-  max-height: calc(var(--sf-row, 28px) * 5);
+  /* v1.19.5：顶部加了 28px 的音量条 → 可见行数从 5 降到 4（垂直预算见 .audio-card） */
+  max-height: calc(var(--sf-row, 28px) * 4);
   overflow-y: auto;
   scrollbar-width: none;
 }

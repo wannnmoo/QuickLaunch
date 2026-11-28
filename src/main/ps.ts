@@ -141,6 +141,29 @@ public interface IPropertyStore
     [PreserveSig] int Commit();
 }
 
+[ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioEndpointVolume
+{
+    [PreserveSig] int RegisterControlChangeNotify(IntPtr pNotify);
+    [PreserveSig] int UnregisterControlChangeNotify(IntPtr pNotify);
+    [PreserveSig] int GetChannelCount(out uint pnChannelCount);
+    [PreserveSig] int SetMasterVolumeLevel(float fLevelDB, IntPtr pguidEventContext);
+    [PreserveSig] int SetMasterVolumeLevelScalar(float fLevel, IntPtr pguidEventContext);
+    [PreserveSig] int GetMasterVolumeLevel(out float pfLevelDB);
+    [PreserveSig] int GetMasterVolumeLevelScalar(out float pfLevel);
+    [PreserveSig] int SetChannelVolumeLevel(uint nChannel, float fLevelDB, IntPtr pguidEventContext);
+    [PreserveSig] int SetChannelVolumeLevelScalar(uint nChannel, float fLevel, IntPtr pguidEventContext);
+    [PreserveSig] int GetChannelVolumeLevel(uint nChannel, out float pfLevelDB);
+    [PreserveSig] int GetChannelVolumeLevelScalar(uint nChannel, out float pfLevel);
+    [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, IntPtr pguidEventContext);
+    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
+    [PreserveSig] int GetVolumeStepInfo(out uint pnStep, out uint pnStepCount);
+    [PreserveSig] int VolumeStepUp(IntPtr pguidEventContext);
+    [PreserveSig] int VolumeStepDown(IntPtr pguidEventContext);
+    [PreserveSig] int QueryHardwareSupport(out uint pdwHardwareSupportMask);
+    [PreserveSig] int GetVolumeRange(out float pflVolumeMindB, out float pflVolumeMaxdB, out float pflVolumeIncrementdB);
+}
+
 public struct PROPERTYKEY { public Guid fmtid; public int pid; }
 
 [StructLayout(LayoutKind.Explicit)]
@@ -282,6 +305,65 @@ public static class QLAudio
     {
         return NewPolicyConfig().SetDefaultEndpoint(deviceId, role);
     }
+
+    // ---- 音量 / 静音（v1.19.5）：IAudioEndpointVolume ----------------------------------
+    // ⚠️ vtable 顺序必须与 native 一致（缺一个 [PreserveSig] 方法就会整条错位，
+    //    表现是「一调用就 AccessViolation 或返回值全是垃圾」）。方法的先后顺序就是
+    //    IAudioEndpointVolume 的声明顺序，别调换。
+    // ⚠️ 事件上下文参数用 IntPtr 而不是 Guid：native 收的是 LPCGUID（指针），
+    //    按 Guid 传会被 marshal 成「按值」，栈上语义不对；传 IntPtr.Zero 才是 NULL。
+    static IAudioEndpointVolume GetVolume(out string err)
+    {
+        err = null;
+        try
+        {
+            var en = (IMMDeviceEnumerator)Activator.CreateInstance(
+                Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")));
+            IMMDevice dev;
+            // 0 = eRender, 1 = eMultimedia（与「切默认设备」用的主角色一致）
+            int hr = en.GetDefaultAudioEndpoint(0, 1, out dev);
+            if (hr != 0 || dev == null) { err = "nodevice"; return null; }
+            Guid iid = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+            IntPtr p;
+            hr = dev.Activate(ref iid, 23 /* CLSCTX_ALL */, IntPtr.Zero, out p);
+            if (hr != 0 || p == IntPtr.Zero) { err = "noactivate"; return null; }
+            var vol = (IAudioEndpointVolume)Marshal.GetObjectForIUnknown(p);
+            Marshal.Release(p);
+            return vol;
+        }
+        catch (Exception ex) { err = ex.Message; return null; }
+    }
+
+    /// "VOL=<0-100>;MUTE=<0|1>"；出错时 "VOLERR=<原因>"
+    public static string VolumeInfo()
+    {
+        string err;
+        var v = GetVolume(out err);
+        if (v == null) return "VOLERR=" + err;
+        float level;
+        v.GetMasterVolumeLevelScalar(out level);
+        bool mute;
+        v.GetMute(out mute);
+        return "VOL=" + (int)Math.Round(level * 100f) + ";MUTE=" + (mute ? 1 : 0);
+    }
+
+    public static int SetVolume(int percent)
+    {
+        string err;
+        var v = GetVolume(out err);
+        if (v == null) return -1;
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        return v.SetMasterVolumeLevelScalar(percent / 100f, IntPtr.Zero);
+    }
+
+    public static int SetMute(int mute)
+    {
+        string err;
+        var v = GetVolume(out err);
+        if (v == null) return -1;
+        return v.SetMute(mute != 0, IntPtr.Zero);
+    }
 }
 '@`
 
@@ -300,9 +382,19 @@ export const PS_MAX_BUFFER = 8 * 1024 * 1024
  *  整批被丢弃且只提示「已跳过 N 个（重复或格式不支持）」。给到 8 MiB 后同样的 20 个
  *  没问题（实测输出 1.6 MB）。 */
 export function runPowerShell(psScript: string, timeout: number, done: (r: PSResult) => void): void {
-  execFile('powershell', [...PS_ARGS, psScript], { timeout, maxBuffer: PS_MAX_BUFFER }, (err, stdout, stderr) => {
-    done({ err, stdout, stderr })
-  })
+  // ⚠️ `windowsHide` 必须显式给：Node 的默认值是 **false**，而本进程是 GUI 子系统
+  //    （打包后没有控制台），spawn 一个控制台程序会让 Windows 给它新建一个控制台窗口 ——
+  //    每次调用都闪一下黑框。全项目其它 5 处子进程（一次性探询 / 托盘点击 / 激活助手 /
+  //    任务栏还原）都传了它，只有这个「唯一入口」漏了。音频枚举、盘符、桌面扫描、
+  //    图标提取、沉底兜底全走这里，一次交互可能连开好几个。
+  execFile(
+    'powershell',
+    [...PS_ARGS, psScript],
+    { timeout, maxBuffer: PS_MAX_BUFFER, windowsHide: true },
+    (err, stdout, stderr) => {
+      done({ err, stdout, stderr })
+    }
+  )
 }
 
 export const DESKTOP_ICONS_CS = `
@@ -362,9 +454,12 @@ public static class QLActivate
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
     [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
@@ -401,9 +496,58 @@ public static class QLActivate
         return all;
     }
 
+    // Window rank: 3 = on screen, 2 = minimized (can restore), 1 = hidden (likely tray).
+    // Some apps (WeChat 4.x, Chromium-based) create several TITLED windows, most of them
+    // hidden helpers. Picking the first one enumerated randomly lands on a hidden window
+    // and the target gets misreported as "in tray" even though its main window is open.
+    // Animations: restoring a minimized window normally plays the "zoom out of the taskbar"
+    // animation; that looks jarring when the window was summoned from a Dock, so we switch
+    // it off for that single call and restore the caller's own setting right afterwards.
+    [StructLayout(LayoutKind.Sequential)] public struct ANIMATIONINFO { public int cbSize; public int iMinAnimate; }
+    // Needed by AnimationsOff / AnimationsRestore (SPI_GETANIMATION / SPI_SETANIMATION).
+    // The RECT overload that the removed taskbar code used is gone with it.
+    [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint action, uint param, ref ANIMATIONINFO info, uint winIni);
+
+    /// Previous "minimize animations" setting, captured on the first AnimationsOff().
+    /// -1 = not captured. Without this the app turned animations back ON for users who
+    /// had them OFF system-wide (AnimationsRestore always wrote 1).
+    static int animSaved = -1;
+
+    static int AnimationsOff()
+    {
+        ANIMATIONINFO a = new ANIMATIONINFO();
+        a.cbSize = Marshal.SizeOf(typeof(ANIMATIONINFO));
+        if (animSaved < 0)
+        {
+            ANIMATIONINFO cur = new ANIMATIONINFO();
+            cur.cbSize = a.cbSize;
+            animSaved = SystemParametersInfo(0x0048 /* SPI_GETANIMATION */, 0, ref cur, 0) ? cur.iMinAnimate : 1;
+        }
+        a.iMinAnimate = 0;
+        SystemParametersInfo(0x0049 /* SPI_SETANIMATION */, 0, ref a, 0);
+        return 1;
+    }
+
+    static int AnimationsRestore()
+    {
+        ANIMATIONINFO a = new ANIMATIONINFO();
+        a.cbSize = Marshal.SizeOf(typeof(ANIMATIONINFO));
+        a.iMinAnimate = animSaved < 0 ? 1 : animSaved;
+        SystemParametersInfo(0x0049, 0, ref a, 0);
+        animSaved = -1;
+        return 1;
+    }
+    static int RankWindow(IntPtr h)
+    {
+        if (IsIconic(h)) return 2;
+        if (IsWindowVisible(h)) return 3;
+        return 1;
+    }
+
     static IntPtr FindWindowIn(HashSet<int> pids)
     {
         IntPtr found = IntPtr.Zero;
+        int best = -1;
         EnumWindows((h, l) =>
         {
             uint pid; GetWindowThreadProcessId(h, out pid);
@@ -412,10 +556,59 @@ public static class QLActivate
             var c = new StringBuilder(256); GetClassName(h, c, 256);
             if (t.Length == 0) return true;
             if (c.ToString().IndexOf("IME", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            found = h;
-            return false;
+            // Keep scanning: the best (most visible) candidate may come later.
+            // Same rank: prefer a real main window over a tool/owned helper. WeChat 4 keeps
+            // several hidden titled windows (e.g. "Weixin" = Qt QWindowToolSaveBits); picking
+            // one of those by enumeration order would restore a tooltip instead of the app.
+            int rank = RankWindow(h) * 10 + (IsHelperWindow(h) ? 0 : 1);
+            if (rank > best) { best = rank; found = h; }
+            return true;
         }, IntPtr.Zero);
         return found;
+    }
+
+    /// Windows that must never be mistaken for "the app's main window": tool windows
+    /// (tray tooltips, IME hosts, Qt helper windows) and owned windows (dialogs/popups).
+    static bool IsHelperWindow(IntPtr h)
+    {
+        long ex = GetWindowLong(h, -20 /* GWL_EXSTYLE */);
+        if ((ex & 0x00000080 /* WS_EX_TOOLWINDOW */) != 0) return true;
+        if (GetWindow(h, 4 /* GW_OWNER */) != IntPtr.Zero) return true;
+        return false;
+    }
+
+    /// Bring a window to the front and try to give it focus, walking the usual fallbacks:
+    /// attach to the foreground thread -> synthetic Alt (satisfies the "last input" rule)
+    /// -> TOPMOST bounce -> plain raise. Focus may still be refused; callers treat the
+    /// window as successfully restored because launching again would duplicate the app.
+    static void RaiseAndFocus(IntPtr target)
+    {
+        IntPtr fg = GetForegroundWindow();
+        uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, IntPtr.Zero);
+        uint me = GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+        bool ok;
+        try { ok = SetForegroundWindow(target); }
+        finally { if (attached) AttachThreadInput(me, fgThread, false); }
+        // Foreground lock often refuses a plain SetForegroundWindow from a background process.
+        // The classic way out: bounce the window through TOPMOST (always allowed), which makes
+        // it the active window, then drop TOPMOST again so it behaves normally.
+        if (!ok)
+        {
+            keybd_event(0x12, 0, 0, IntPtr.Zero);
+            keybd_event(0x12, 0, 2 /* KEYEVENTF_KEYUP */, IntPtr.Zero);
+            SetWindowPos(target, (IntPtr)(-1) /* HWND_TOPMOST */, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            ok = SetForegroundWindow(target);
+            SetWindowPos(target, (IntPtr)(-2) /* HWND_NOTOPMOST */, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        if (!ok)
+        {
+            // Foreground lock refused the focus request. Still raise the window so the
+            // user sees it, and report 1: the app IS running, launching again would
+            // create a duplicate.
+            SetWindowPos(target, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            BringWindowToTop(target);
+        }
     }
 
     /// Find the app's main window. Returns 0 if none. Does NOT change any state.
@@ -448,24 +641,17 @@ public static class QLActivate
 
         IntPtr target = FindWindowIn(prefer.Count > 0 ? prefer : all);
         if (target == IntPtr.Zero) return 0;
-        if (!IsWindowVisible(target) && !IsIconic(target)) return -1;
+        // 1 = hidden: the app really has no visible/minimized window (tray-only state).
+        if (RankWindow(target) == 1) return -1;
 
-        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-        IntPtr fg = GetForegroundWindow();
-        uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, IntPtr.Zero);
-        uint me = GetCurrentThreadId();
-        bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
-        bool ok;
-        try { ok = SetForegroundWindow(target); }
-        finally { if (attached) AttachThreadInput(me, fgThread, false); }
-        if (!ok)
+        bool wasIconic = IsIconic(target);
+        if (wasIconic)
         {
-            // Foreground lock refused the focus request. Still raise the window so the
-            // user sees it, and report 1: the app IS running, launching again would
-            // create a duplicate.
-            SetWindowPos(target, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            BringWindowToTop(target);
+            AnimationsOff();                      // no "fly out of the taskbar" animation
+            ShowWindow(target, SW_RESTORE);
         }
+        RaiseAndFocus(target);
+        if (wasIconic) AnimationsRestore();
         return 1;
     }
 
@@ -475,6 +661,22 @@ public static class QLActivate
         int r = Probe(exePath);
         return r == 2 ? 0 : (r == 0 ? 0 : r);
     }
+
+    /// Push OUR OWN window to the bottom of the z-order (Dock "retreat").
+    /// Must be paired with setAlwaysOnTop(false) on the Electron side: SetWindowPos(HWND_BOTTOM)
+    /// on a TOPMOST window only sinks it to the bottom of the topmost band, still above every
+    /// normal window -- that is why "sink" looked like a no-op.
+    /// Called through the resident helper, so this is a ~20ms round trip instead of a
+    /// fresh powershell start (~700ms) -- the difference between "Dock gets out of the way
+    /// immediately" and "Dock hangs over the app you just opened, then disappears".
+    public static int Sink(string hwndHex)
+    {
+        IntPtr h = (IntPtr)Convert.ToInt64(hwndHex, 16);
+        // HWND_BOTTOM=1, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
+        bool ok = SetWindowPos(h, (IntPtr)1, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010);
+        return ok ? 1 : 0;
+    }
+
 }
 `
 

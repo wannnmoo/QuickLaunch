@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react'
 import { DEFAULT_SETTINGS, type AppEntry, type AppSettings, type AudioDevice, type AudioSnapshot, type DriveInfo } from '../../shared/types'
 import FolderCard, { type FolderCardState } from './FolderCard'
-import AudioCard, { AudioGlyph, audioDisplayName } from './AudioCard'
+import AudioCard, { AudioGlyph, audioDisplayName, primeVolume } from './AudioCard'
 import SettingsCard from './SettingsCard'
 import { pushFolderIcons } from './folderIcons'
 import { normPath } from './format'
@@ -575,6 +575,14 @@ function App(): React.ReactElement {
     if (dropHintTimer.current) clearTimeout(dropHintTimer.current)
   }, [])
 
+  // 卸载时收掉另外两个仍可能在飞的定时器（窗口重建 / dev HMR / 页面重载都会卸载本组件）：
+  // 它们的回调里都是 setState，打到已卸载的组件上是白跑一趟；undoDeleteTimer 还会把
+  // 整个快照（含图标 data URL）多留 5 秒。
+  useEffect(() => () => {
+    if (launchClearTimer.current) { clearTimeout(launchClearTimer.current); launchClearTimer.current = null }
+    if (undoDeleteTimer.current) { clearTimeout(undoDeleteTimer.current); undoDeleteTimer.current = null }
+  }, [])
+
   // ─── 音频设备（「音频」系统条目 + 输出/输入切换卡片）─────────────────────
   // 一次枚举要起 PowerShell（实测 ~0.9s），所以：启动后 8s 预热一次（避开 4s 的 listDrives，
   // 两者都是 PowerShell 冷启动，撞在一起会把首屏拖慢），卡片打开读缓存，切换后强制刷新。
@@ -597,9 +605,44 @@ function App(): React.ReactElement {
   }, [])
 
   useEffect(() => {
-    const t = setTimeout(() => { void loadAudio(false) }, 8000)
+    const t = setTimeout(() => {
+      // ⚠️ 两条必须**串行**：每一个都是一次 powershell.exe 冷启动 + 把 12KB 的 `AUDIO_CS`
+      //    重新编译一遍。并发发出去会让两次 Add-Type 撞在一起（实测一起跑会有一个明显的
+      //    CPU 尖峰，Dock 的悬停放大在那一下会掉帧），串起来总耗时几乎不变
+      //    —— 第二次省掉了冷启动与编译里的重复部分。
+      void loadAudio(false)
+        // 音量也一起预热（v1.19.6）：卡片第一次打开才不会先显示「—」再跳数
+        .then(() => window.api.getAudioVolume())
+        .then((v) => primeVolume(v))
+        .catch(() => {})
+    }, 8000)
     return () => clearTimeout(t)
   }, [loadAudio])
+
+  // 「用户正在用这扇窗」心跳：主进程的退场看门狗靠它区分「在用 Dock」和「在用别的软件」。
+  // 只报**事件**（mousemove/keydown/wheel/pointerdown，节流 400ms）；「指针静止停在 Dock 上」
+  // 那种情况由主进程用光标坐标算（`pointerOverBar()`），不需要这里的定时器。
+  // ⚠️ 键盘事件不能省：Alt+Space 后按方向键导航时鼠标多半停在外面。
+  useEffect(() => {
+    let last = 0
+    const ping = (): void => {
+      const now = Date.now()
+      if (now - last < 400) return
+      last = now
+      window.api.dockActivity()
+    }
+    const opts = { passive: true } as const
+    window.addEventListener('mousemove', ping, opts)
+    window.addEventListener('pointerdown', ping, opts)
+    window.addEventListener('wheel', ping, opts)
+    window.addEventListener('keydown', ping, true)
+    return () => {
+      window.removeEventListener('mousemove', ping)
+      window.removeEventListener('pointerdown', ping)
+      window.removeEventListener('wheel', ping)
+      window.removeEventListener('keydown', ping, true)
+    }
+  }, [])
 
   /** 当前默认输出设备：图标形态（耳机/扬声器/HDMI）与悬浮标签都用它 */
   const defaultRender = useMemo(
@@ -1553,7 +1596,14 @@ function App(): React.ReactElement {
   useEffect(() => window.api.onSettingsChanged((next) => {
     if (!next) return
     setSettings({ ...DEFAULT_SETTINGS, ...next })
-    if (next.theme) {
+    // ⚠️ 只有「不跟随系统」时才用存储里的 theme 覆盖本地 theme。
+    //    `next.theme` 是 settings.json 里**存着的**那一档，而「跟随系统」生效时本地
+    //    theme 是 `prefers-color-scheme` 派生的值（见下面那个 effect）。无条件覆盖的
+    //    后果：开着跟随系统、系统深浅色与存储值不同时，之后**任何一次**设置写入
+    //    （改图标大小 / 放大 / 停靠位置，甚至只是点一下快捷设置卡）都会让 Dock
+    //    当场跳回存储的那一档，而且不会自愈 —— 那个 effect 的依赖只有
+    //    `followSystemTheme`，值没变就不会重跑。
+    if (next.theme && !next.followSystemTheme) {
       setTheme(next.theme)
       localStorage.setItem('ql-theme', next.theme) // 兼容旧版本 / 迁移用
     }
@@ -1820,7 +1870,9 @@ function App(): React.ReactElement {
         if (ok === false) {
           flagLaunchFailed()
           showDropHint('启动失败：目标不存在或无法运行')
-        } else if (ok === 'in-tray') showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
+        } else if (ok === 'in-tray') {
+          showDropHint('已在运行（窗口收在托盘）：点右下角托盘图标即可打开')
+        }
       })
       .catch(() => {
         flagLaunchFailed()
@@ -2623,8 +2675,18 @@ function App(): React.ReactElement {
   // （.dropdown-menu 的 bottom: calc(100% + 8px)、.group-panel 的 bottom: 154px），
   // 若只设 top，兜底的 bottom 仍在生效 → 高度 auto 的元素被算成
   // height = 容器高 - top - bottom（负数）→ 只剩内边距，菜单被压成一条白线。
-  const overlayBottomOffset = overlayBottom()
-  const overlayTopOffset = overlayTop()
+  // ⚠️ 只有真的开着浮层时才去量 `.dock-bg`：`overlayBottom()` / `overlayTop()` 各读一次
+  //    `getBoundingClientRect()`，而它们是在 **render 期间**被调用的 —— 等于每次 App
+  //    渲染都付两次强制同步布局。拖拽时 `dropIdx` 每跨一个图标就变一次（React 刚写完
+  //    DOM、这里立刻读几何），正好构成「布局失效 → 强制布局」的循环，是拖拽掉帧的一笔
+  //    固定开销。浮层全关时这两个值**没有任何消费者**（菜单/卡片/面板都只在打开时渲染），
+  //    给兜底值即可；下面那几条注释也写着「不能在 render 里读 dockBgRef」，这里是同一件事。
+  const anchorNeedsMeasure = !!(
+    menuPos || contextMenu || folderCard || showDrivesCard ||
+    audioCardOpen || settingsCardOpen || openGroupId !== null
+  )
+  const overlayBottomOffset = anchorNeedsMeasure ? overlayBottom() : PANEL_FALLBACK
+  const overlayTopOffset = anchorNeedsMeasure ? overlayTop() : PANEL_FALLBACK
   // 浮层可用高度 = 从贴边锚点外侧到窗口另一侧，再留 8px 边距。
   //
   // ⚠️ 这里过去写的是 `BASE_WINDOW_H - offset - 8`，**基准取错了**：
@@ -2747,6 +2809,7 @@ function App(): React.ReactElement {
         '--glass-sat-sm': String(Math.min(1.6, 1.2 + (settings.glassSaturate - 1) * 0.4))
       } as React.CSSProperties}
       onMouseEnter={() => window.api.dockPointer(true)}
+      onMouseLeave={() => window.api.dockPointer(false)}
     >
       <div
         className={'dock' + (fileDragOver ? ' drop-active' : '')}
@@ -3011,10 +3074,15 @@ function App(): React.ReactElement {
               schedulePanelAutoClose()
             }}
           >
-            {viewGroupMembers.map((m, index) => {
+            {(() => {
               // 面板插入线使用「可显示成员」下标空间（分隔线不占槽位），
-              // 与 calcPanelDropIndex / 重排锚点保持同一套编号
-              const slot = viewGroupMembers.slice(0, index).filter((x) => !x.isSeparator).length
+              // 与 calcPanelDropIndex / 重排锚点保持同一套编号。
+              // ⚠️ 用**累加器**而不是每个成员都 `slice(0, index).filter(...)`：后者是
+              //    O(n²) 且每项分配一个新数组，而这段在面板每次渲染都要跑（悬停、拖拽、
+              //    任何 App 状态变化都算）。分隔线不占槽位，所以只在普通成员处 +1。
+              //    （主 Dock 那一侧早就是这个写法，见 viewTopLevel 的 map。）
+              let slot = 0
+              return viewGroupMembers.map((m) => {
               if (m.isSeparator) {
                 return (
                   <div key={m.id} style={{ display: 'contents' }}>
@@ -3032,9 +3100,11 @@ function App(): React.ReactElement {
                   </div>
                 )
               }
+              const mySlot = slot
+              slot += 1
               return (
                 <div key={m.id} style={{ display: 'contents' }}>
-                  {panelDropIdx === slot && <div className="drop-indicator" />}
+                  {panelDropIdx === mySlot && <div className="drop-indicator" />}
                   <div
                     className={'dock-item' + (dragId === m.id ? ' dragging' : '') + (navId === m.id ? ' selected' : '')
                       + (launchingId === m.id ? ' launching' : '') + (launchFailedId === m.id ? ' launch-failed' : '')}
@@ -3105,7 +3175,8 @@ function App(): React.ReactElement {
                   </div>
                 </div>
               )
-            })}
+              })
+            })()}
             {viewGroupMembers.length === 0 && (
               <EmptyState
                 className="group-panel-empty"

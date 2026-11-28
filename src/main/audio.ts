@@ -37,6 +37,19 @@ const AUDIO_LIST_TTL_MS = 3000
 
 let cache: { at: number; data: AudioSnapshot } | null = null
 let inflight: Promise<AudioSnapshot> | null = null
+/** 缓存代际：每次失效 +1，用于作废「失效之前发出的在途请求」的写缓存资格。 */
+let cacheGen = 0
+
+/** 音量状态：与设备列表分开缓存（音量变化频繁，列表变化慢）。
+ *  300ms 足够挡住「拖动滑块几十次」的抖动，又不至于让外部改动看起来滞后。 */
+export type VolumeState = { level: number; mute: boolean }
+let volCache: { at: number; data: VolumeState } | null = null
+let volInflight: Promise<VolumeState | null> | null = null
+const VOLUME_TTL_MS = 300
+
+export function invalidateVolumeCache(): void {
+  volCache = null
+}
 
 const EMPTY: AudioSnapshot = { render: [], capture: [] }
 
@@ -92,13 +105,15 @@ else { Write-Output ('AUDIOLIST=' + (ConvertTo-Json -InputObject @($devs) -Compr
     runPowerShell(script, 15000, ({ err, stdout, stderr }) => {
       if (err) {
         logWarn('audio', '枚举音频设备失败（PowerShell）', err)
-        resolve(EMPTY)
+        // 枚举失败时返回**上一次的列表**而不是空表：空表会让卡片显示「没有可用设备」、
+        // Dock 上的音频字形与「音频 · 耳机」标签也一起消失，看起来像功能坏了。
+        resolve(cache?.data ?? EMPTY)
         return
       }
       const list = parseList(stdout)
       if (!list) {
         logWarn('audio', `枚举音频设备没有可用输出：${String(stderr ?? '').slice(0, 200)}`)
-        resolve(EMPTY)
+        resolve(cache?.data ?? EMPTY)
         return
       }
       resolve(list)
@@ -114,22 +129,30 @@ export function getAudioSnapshot(force = false): Promise<AudioSnapshot> {
   if (!force && cache && Date.now() - cache.at < AUDIO_LIST_TTL_MS) {
     return Promise.resolve(cache.data)
   }
-  if (inflight) return inflight
-  inflight = runList()
-    .then((data) => {
-      // 只有「非空」才写缓存：枚举偶尔失败时不要把空表缓存 3 秒，否则卡片会闪成空
-      if (data.render.length > 0 || data.capture.length > 0) cache = { at: Date.now(), data }
-      return data
-    })
-    .finally(() => {
-      inflight = null
-    })
+  // ⚠️ `force` **不能**复用 inflight：那是在「切换设备之前」发出的请求，它拿到的默认
+  //    设备可能还是旧的。切完之后 renderer 会强刷（loadAudio(true)），若在这里把旧请求
+  //    还回去，卡片上的对勾就会先乐观挪过去、一秒后又跳回旧设备（用户得再刷一次才对）。
+  if (!force && inflight) return inflight
+  const gen = force ? ++cacheGen : cacheGen
+  const run = runList().then((data) => {
+    const nonEmpty = data.render.length > 0 || data.capture.length > 0
+    // 只有「非空」才写缓存：枚举偶尔失败时不要把空表缓存 3 秒，否则卡片会闪成空。
+    // 另加代际校验：期间发生过 invalidate（切换设备成功）就丢弃这份过期结果。
+    if (nonEmpty && gen === cacheGen) cache = { at: Date.now(), data }
+    return data
+  })
+  if (force) return run
+  inflight = run.finally(() => {
+    inflight = null
+  })
   return inflight
 }
 
 /** 缓存失效（切换成功后调用，让卡片立刻反映新状态） */
 export function invalidateAudioCache(): void {
   cache = null
+  // 作废在途请求的写缓存资格：它是切换**之前**的快照
+  cacheGen += 1
 }
 
 /**
@@ -175,5 +198,101 @@ Write-Output ('AUDIOHR=' + ($hr -join ','))`
       else logInfo('audio', `已切换默认设备 roles=${roleList}`)
       resolve(failed)
     })
+  })
+}
+
+// ─── 音量 / 静音（v1.19.5）─────────────────────────────────────────────────
+// 走 AUDIO_CS 里的 IAudioEndpointVolume，作用对象是**当前默认输出设备**（eMultimedia 角色），
+// 与「切换默认设备」用的是同一套 Core Audio，切完设备滑块自然跟着走。
+// ⚠️ 输出只认 `VOL=` / `VOLERR=` 标记行 —— 与列表同一个坑（见文件头）。
+
+/** 读当前默认输出设备的音量（0-100）与静音状态；失败返回 null。 */
+export function getAudioVolume(force = false): Promise<VolumeState | null> {
+  const now = Date.now()
+  if (!force && volCache && now - volCache.at < VOLUME_TTL_MS) return Promise.resolve(volCache.data)
+  if (volInflight) return volInflight
+  const script = `${AUDIO_CS}
+Write-Output ([QLAudio]::VolumeInfo())`
+  volInflight = new Promise<VolumeState | null>((resolve) => {
+    runPowerShell(script, 15000, ({ err, stdout }) => {
+      if (err) {
+        logWarn('audio', '读取音量失败（PowerShell）', err)
+        resolve(null)
+        return
+      }
+      const line = String(stdout ?? '')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('VOL=') || l.startsWith('VOLERR='))
+        .pop()
+      if (!line || line.startsWith('VOLERR=')) {
+        logWarn('audio', `读取音量失败：${line ?? '无输出'}`)
+        resolve(null)
+        return
+      }
+      const m = /VOL=(\d+);MUTE=(\d)/.exec(line)
+      if (!m) {
+        resolve(null)
+        return
+      }
+      const data: VolumeState = { level: Number(m[1]), mute: m[2] === '1' }
+      volCache = { at: Date.now(), data }
+      resolve(data)
+    })
+  }).finally(() => {
+    volInflight = null
+  })
+  return volInflight ?? Promise.resolve(null)
+}
+
+/** 设置音量（0-100）。返回 true = 落地。 */
+export function setAudioVolume(level: number): Promise<boolean> {
+  const pct = Math.max(0, Math.min(100, Math.round(level)))
+  // ⚠️ 旧状态必须在**发起调用之前**拍下来：回调里会 invalidateVolumeCache()
+  //    （`volCache = null`），而下面的 .then 里要读「当前的静音状态」来写乐观缓存 ——
+  //    那时 volCache 已经是 null，`volCache?.data.mute ?? false` 恒等于 false，
+  //    于是一次调音量就顺手把 UI 的静音状态改成「未静音」（系统状态其实没变）。
+  const prev = volCache?.data
+  const script = `${AUDIO_CS}
+Write-Output ('VOLLHR=' + [QLAudio]::SetVolume(${pct}))`
+  return new Promise<boolean>((resolve) => {
+    runPowerShell(script, 15000, ({ err, stdout }) => {
+      if (err) {
+        logWarn('audio', '设置音量失败（PowerShell）', err)
+        resolve(false)
+        return
+      }
+      const ok = String(stdout ?? '').includes('VOLLHR=0')
+      invalidateVolumeCache()
+      resolve(ok)
+    })
+  }).then((ok) => {
+    // 乐观缓存：滑块是连续拖动的，下一次读不能等 900ms 的 PowerShell。
+    // 失败时不写 —— 让下一次读去拿系统的真实值，而不是把一个没落地的值留在缓存里。
+    if (ok) volCache = { at: Date.now(), data: { level: pct, mute: prev?.mute ?? false } }
+    return ok
+  })
+}
+
+/** 静音开关。返回 true = 落地。 */
+export function setAudioMute(mute: boolean): Promise<boolean> {
+  // 与 setAudioVolume 同一条理由：旧音量要在 invalidate 之前拍下来
+  const prev = volCache?.data
+  const script = `${AUDIO_CS}
+Write-Output ('MUTEHR=' + [QLAudio]::SetMute(${mute ? 1 : 0}))`
+  return new Promise<boolean>((resolve) => {
+    runPowerShell(script, 15000, ({ err, stdout }) => {
+      if (err) {
+        logWarn('audio', '设置静音失败（PowerShell）', err)
+        resolve(false)
+        return
+      }
+      const ok = String(stdout ?? '').includes('MUTEHR=0')
+      invalidateVolumeCache()
+      resolve(ok)
+    })
+  }).then((ok) => {
+    if (ok) volCache = { at: Date.now(), data: { level: prev?.level ?? 0, mute } }
+    return ok
   })
 }

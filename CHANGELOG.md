@@ -2,6 +2,481 @@
 
 基于 **React 19 + TypeScript 7 + Electron 43 + Vite 7** 构建的 Windows 桌面应用——透明毛玻璃 Dock 栏悬浮桌面，一键启动程序、文件夹和系统位置。
 
+## 移除「隐藏任务栏」功能（v1.21，未发版）
+
+**用户结论**：这个功能「还是不太实用」—— 隐藏任务栏抢不回那 48px（二选一：要贴边不唤出就抢不回工作区；
+要工作区全屏就得开 auto-hide，而鼠标一贴底边任务栏又滑回来），隐藏后连**我们自己的托盘图标**也一起没了，
+而托盘型应用（微信/QQ）的唤出又必须先有一个看得见的任务栏 —— 于是整条功能删除。
+
+> 铺垫在上面那节「托盘应用『点不动』事故与回滚」里：为了绕开任务栏而直接 `ShowWindow` 隐藏窗口，
+> 结果给微信留下了「可见但点不动」的假窗口；重启 exe 又会多开实例；不展开就点托盘图标在 Win11 上没有落点。
+> 三条路都不通，这个功能就没有存在价值了。
+
+### 清理范围
+
+| 位置 | 删掉的东西 |
+|---|---|
+| `src/main/ps.ts` | `ACTIVATE_CS` 里整段任务栏 C#：`TbState` / `TbSet` / `TbHideInstant` / `TbRevealOffscreen` / `TbShowInstant` / `TaskbarWindows` / `AppBarState` / `AppBarSetState` / `SetWorkAreaFor` / `BroadcastWorkAreaChange`，以及随之无用的 `APPBARDATA` / `SHAppBarMessage` / `MONITORINFO` / `MonitorFromWindow` / `GetMonitorInfo` / `GetWindowRect` / `GetSystemMetrics` / `SendMessageTimeout(string)` / `SystemParametersInfo(RECT)`。`ACTIVATE_CS` 从 **23.9KB → 12.4KB**；另删掉上一版那个会留「假活窗口」的 `ShowHidden` |
+| `src/main/index.ts` | 任务栏模块（`TASKBAR_WATCH_MS` / `taskbarHiddenByUs` / `savedBarState` / `taskbarWatchTimer` / `queryTaskbar` / `showTaskbar` / `hideTaskbar` / `toggleTaskbar` / `startTaskbarWatch` / `stopTaskbarWatch` / `repairTaskbarOnStart` / `restoreTaskbarOnQuit` / `helperRequest`）、助手指令 `TB?` / `TBO` / `TBI` / `TB …`、IPC `taskbar-state` / `taskbar-toggle`、`DIRECT_SHOW_TRAY_WINDOW` 与 `helperShowHidden`、`whenReady` 里的崩溃自检定时器、`will-quit` 里的同步还原，以及**全项目唯一一处 `execFileSync`** |
+| `src/preload/index.ts` + `env.d.ts` | `getTaskbarState()` / `toggleTaskbar()` 两个通道与对应类型 |
+| `src/shared/types.ts` + `src/main/settings.ts` | `AppSettings.trayClickReveal` 及其 normalize 分支（老 `settings.json` 里残留该键会被忽略，不需要迁移） |
+| `src/renderer/src/App.tsx` | `taskbarHidden` state / 读取 effect / `handleToggleTaskbar`；`'in-tray'` 提示里那句「先＋→ 显示任务栏」的分支与它的依赖项 |
+| `src/renderer/src/AddMenu.tsx` | 「隐藏任务栏」「托盘应用可唤出任务栏」两个菜单项与对应 props |
+| 产物 | 构建后 `out/main/index.js` 里 `TbState` / `taskbar-toggle` / `trayClickReveal` / `ShowHidden` 命中数均为 **0** |
+
+### 现在的行为
+
+托盘型应用（微信/QQ）收在托盘时，点 Dock 图标仍是「用 UIA 点**它自己的**托盘图标」：
+任务栏可见 → 一路正常；任务栏被用户自己隐藏了 → 返回 `in-tray` 并提示「点右下角托盘图标即可打开」，
+**不做任何系统级改动、不显示任务栏、也不强行 `ShowWindow`**。
+
+顺带保留的两处纯改进（与本次事故无关）：`FindWindowIn` 同 rank 内优先「非 `WS_EX_TOOLWINDOW` / 非 owned」
+的窗口（微信有个隐藏的 `Weixin` 工具窗，按枚举顺序会挑错）；`AnimationsRestore()` 不再无条件把
+「最小化动画」写成开（先记住调用前的值）。
+
+## 托盘应用「点不动」事故与回滚（v1.21，未发版）
+
+**用户报障**：隐藏任务栏后点微信，必须等任务栏重新出现在屏幕上它才会从托盘里出来；
+随后按上一版（直接 `ShowWindow` 隐藏窗口）改完之后又出现新症状：**微信显示出来但卡死、点不动**。
+
+### 结论：直接显示隐藏窗口这条路是错的，已回滚
+
+托盘最小化 ≠ 销毁窗口，句柄确实还在（实测微信收托盘时
+`hwnd=526470 cls=Qt51514QWindowIcon title=[微信] vis=0`），所以上一版据此推断
+「`ShowWindow(SW_SHOW)` 就等于点托盘图标」并把它设为主路径 —— **这个推断漏了一层**：
+
+微信 4 是基于 Chromium 的（进程里有 `wechatappex`，窗口线程挂着 `Chrome_SystemMessageWindow`），
+它躲进托盘时会**销毁自己的渲染表面**。从外部把窗口壳显示出来不会重建那层表面，于是：
+
+> 窗口出现了、画面是上一帧的残影、点哪里都没有反应。
+
+**当时的验证看错了层次**：`WM_NULL` 有回应、`IsHungAppWindow=false`、`IsWindowEnabled=true`、
+`GUI flags=0` —— 消息层一切正常。**消息层活着 ≠ 界面活着**，拿这些指标判「能不能点」会得到
+一个非常有说服力的错误结论（记进 CLAUDE.md 了）。
+
+顺带否掉的另两条替代路线：
+
+| 尝试 | 实测结果 |
+|---|---|
+| 再启一次 exe，指望单实例逻辑唤出主窗 | 微信**直接多开**：进程数 5→6，多出一个 `微信` 主窗（正是整套探询机制要防的事） |
+| 不展开就点托盘图标 | Win11 托盘已无 `ToolbarWindow32`（实测 `Shell_TrayWnd` 下只剩 `TrayNotifyWnd` / `ReBarWindow32` / XAML bridge），溢出区图标微软官方确认「不显示出来就无法用 UIA 枚举」 |
+
+### 改动
+
+- `src/main/index.ts`：新增 `DIRECT_SHOW_TRAY_WINDOW = false` 开关，把「直接显示隐藏窗口」这条路
+  **默认关掉**，`run-app` 的 `tray` 分支回到「UIA 点它自己的托盘图标」这条唯一可靠的路径
+  （**随后这一版的实现连同整条隐藏任务栏功能一起被删除，见上一节**）。
+- `CLAUDE.md`：更正上一版写错的结论（「老注释只对了一半」是错的），补上
+  「消息层活着 ≠ 界面活着」这条判据，并保留两条已验证的宏观结论（Win11 无 `ToolbarWindow32`、
+  UIA 无法枚举未展开的溢出区）。
+- 保留两处与本次事故无关的顺带修复（都是纯改进）：`FindWindowIn` 同 rank 内优先非
+  `WS_EX_TOOLWINDOW`/非 owned 窗口（微信有个隐藏的 `Weixin` 工具窗，按枚举顺序会挑错）；
+  `AnimationsRestore()` 不再无条件把「最小化动画」写成开（先记住原值）。
+
+### 那么「任务栏不出现」还有没有解？
+
+对微信这类 Chromium 应用：**没有**。要么接受那 ~1.5s 的任务栏出现（`trayClickReveal = true`，默认），
+要么一次都不碰任务栏、只提示用户自己去点（`trayClickReveal = false`）。
+**唯一的例外**是原生控件类托盘应用（老式 Qt/纯 Win32）—— 理论上可以直接显示窗口，
+但那需要逐个应用验证，所以不设为默认。
+
+## 代码体检（基于 v1.20.1，未发版）
+
+全量通读 + 三路并行审查（主进程 / 渲染进程 / PowerShell 与存储层），按「崩溃 → 逻辑 → 卡顿 → 数据安全」修了一批。
+以下每一条都能在代码里定位到具体行为，标了实测数字的是本次量过的。
+
+### 崩溃与「看起来没崩但废了」
+
+- **`finishSink()` 在存活判定之前读了窗口几何**（`index.ts`）：沉底走一次性 PowerShell 慢路时（~700ms），
+  期间窗口完全可能已被销毁（托盘退出 / 切档重建 / 渲染进程崩溃后的重建）→ `pointerOverBar()` 里的
+  `win.getContentBounds()` 抛 `Object has been destroyed`。慢路里那是 `execFile` 回调，异常落进
+  `uncaughtException` 只打一行日志，而**这一次「仍然有效 / 需要补偿」的判定整条被跳过**（Dock 可能卡在半吊子状态）；
+  快路里则是未处理 rejection。现在存活判定提到最前。
+- **三处 `webContents.send()` 只判了窗口、没判 webContents**（`index.ts` 的 `applyDockEdge` / `setDockEdge` /
+  桌面监听）：渲染进程崩溃且崩溃看门狗限流放弃重建后，「窗口在、渲染没了」会一直留到重启 —— 期间改分辨率、
+  桌面增删都会往废掉的 webContents 发消息并抛错。抽出 `safeSend()` 统一兜住。
+- **常驻激活助手死掉后永远拉不起来**（`index.ts` 的 `ensureActivateHelper`）：`activateHelperStarting`
+  是一个**已 resolve(true) 的 Promise**，`exit` / 启动抛错 / 4s 超时三条路都没复位它 → 之后
+  `ensureActivateHelper()` 永远返回旧值，助手再也不会 spawn。后果：点图标退回 ~0.9s 的一次性 PowerShell，
+  探询恒 `retry`（「已在运行就不多开」整条失效，微信会被开出第二个登录窗），「隐藏/显示任务栏」全部静默失败。
+  三处都补了复位，超时那一路还会把没编译完的 powershell 收掉（原来它会成孤儿常驻）。
+- **`AddMenu` 的条件 hooks**：`if (!menuPos) return null` 写在 `useState` / `useLayoutEffect` **之前**
+  —— 菜单关着 = 0 个 hook、打开 = 2 个，违反 Hook 规则。实测 React 19 在打包版侥幸不崩、dev 每次首开都往
+  main.log 抛一句 `Expected static flag was missing`；以后在早退前再加一个 hook 就会立刻变成「点 + 直接进崩溃屏」。
+- **设置窗渲染期抛异常 = 一块白窗**：`main.tsx` 的 `?view=settings` 分支原来没包 `ErrorBoundary`（Dock 那侧有）。
+- **设置窗构建失败不回滚 Dock**（`settingsWindow.ts`）：先 `onOpenedHook()` 藏 Dock 再建窗，`catch` 里只
+  `return false` → 「Dock 没了、设置窗也没出来」，只能自己去托盘找。现在失败会调 `onClosedHook()` 把 Dock 还回来；
+  另给 `did-fail-load` 加了自毁（否则窗口对象非 null 但永不显示，再点「完整设置…」只会聚焦一个空窗）。
+
+### 逻辑 bug（用户能直接看见的）
+
+- **调音量会顺手把 UI 的静音状态改掉**（`audio.ts`）：`invalidateVolumeCache()` 把 `volCache` 置空后，
+  `.then` 里写乐观缓存时读的是 `volCache?.data.mute ?? false` —— 恒等于 `false`。于是「拖动滑块」会把静音标记
+  显示成未静音，「切静音」会把音量显示成 0（系统状态其实没变）。改成在调用前先拍下旧值。
+- **切换默认设备后对勾会跳回旧设备**（`audio.ts`）：`force=true` 的强刷复用了「切换**之前**发出的」
+  `inflight` 请求，它拿到的默认设备是旧的；结果卡片先乐观挪对勾、一秒后又跳回去，得再刷一次才对。
+  现在 `force` 不复用 inflight，并加了缓存代际（`cacheGen`）作废过期结果的写缓存资格。
+- **开了「跟随系统主题」后，改任何设置都会让 Dock 跳回存储的那一档**（`App.tsx`）：`settings-changed`
+  广播里带的是 settings.json 里存着的 `theme`，无条件 `setTheme(next.theme)` 会覆盖 `prefers-color-scheme`
+  派生出来的值，而且那个 effect 依赖只有 `followSystemTheme`，值没变就永不重跑 → 不会自愈。
+- **隐藏任务栏后点托盘型应用，提示还在让你「点右下角」**（`App.tsx`）：`handleRun` 的依赖数组漏了
+  `taskbarHidden`，读到陈旧闭包。
+- **`showTaskbar()` 不检查助手返回值**（`index.ts`）：`TBSET=0`（失败）也匹配那个正则、`null`（助手不可用）
+  更没检查，却照样清 `taskbarHiddenByUs`、删崩溃标记、停 5s 巡检 —— 一旦恢复失败，任务栏永久隐藏且失去
+  全部自愈路径（只能重启 Explorer）。现在只认 `TBSET=1`，失败保留原状让巡检继续重试。
+- **沉底串行化的重试丢了 `strict`**（`index.ts`）：启动后那次沉底若命中「已有任务在跑 → 180ms 重试」，
+  重试体调的是 `sendToBottom(win)`（`strict=false`）→ 收尾里「指针还在玻璃条上」判成用户抓回 Dock →
+  `recoverDock()` 把刚沉下去的窗口拉回来。这正是 v1.19.4 修过的「打开应用 Dock 闪一下」症状。
+- **托盘「显示窗口」少了 `markDockShown()`**（`index.ts`）：其它四条显示路径都有这一句，只有这条漏了 ——
+  而 `--autostart` 那次启动会把 `dockShownAt` 显式打成 0，于是从托盘唤回后点一下别的软件，Dock 立刻被沉底。
+- **失败恢复后按 Alt+Space「没反应」**（`index.ts`）：`restoreDockAfterFailedLaunch` 的 `sink` 分支与
+  `finishSink` 的失败分支都只 `recoverDock()`、没清 `dockAutoSunk` → 下一次 Alt+Space 命中「唤回」分支
+  （位置本来就在顶上）→ 按一下什么都不发生，要按两次。
+- **任务栏隐藏时点托盘图标可能被 5s 巡检抢回去**：`run-app` 的 `tray` 分支「临时显示任务栏 → 点 → 藏回」
+  全程约 1.5s，而巡检只看 `taskbarHiddenByUs` 和可见性，看到 visible 就重新隐藏 → UIA 拿到空树 → 点不中。
+- **音频卡片的方向键会穿透到 Dock 导航**（`AudioCard` / `SettingsCard`）：卡片只对 `Esc`（音频卡另含 `↑↓/Enter`）
+  `stopPropagation`，`←/→/Home/End` 会冒泡到 document 级 `useDockKeyboard` → 在卡片**背后**点亮选中框，
+  关掉卡片后 5s 内按 Enter 会启动那个看不见的选中项。现在导航键在卡片内一律拦截（滑块仍能正常调）。
+
+### 卡顿（都带实测）
+
+- **`runPowerShell()` 漏了 `windowsHide`**（`ps.ts`，全项目唯一一处）：Node 默认 `false`，而本进程是 GUI
+  子系统，spawn 控制台程序会新建一个控制台窗口 —— 每次调用闪一下黑框。音频枚举、盘符、桌面扫描、图标提取、
+  沉底兜底全走这一个入口。
+- **`list-drives` 完全没有缓存**（`index.ts`）：`openDrivesCard` 每次悬停「此电脑」都刷新一次，而一次调用要起
+  一个 powershell（0.3~0.6s）。鼠标在图标上来回划几下就是好几个进程并发。补 3s TTL + 请求合并。
+- **拖一次设置滑块 = 308ms 主进程同步阻塞**（`settings.ts`，实测 60 次 `writeFileAtomic`）：
+  设置窗滑块是「每个 input 事件一次 set-settings」，每次都要 normalize + open→write→**fsync**→读旧文件→
+  JSON.parse→copy 成 .bak→rename + 广播所有 WebContents，期间 `setShape`/托盘/音频 IPC 全部排队。
+  改成 150ms 合并写盘（内存 cache 仍立即更新，`will-quit` 里强制 flush）。
+- **启动第 8 秒的两个 PS 撞在一起**（`App.tsx`）：`loadAudio()` 与 `getAudioVolume()` 并发发出，各自
+  冷启动 + 把 12KB 的 `AUDIO_CS` 重新编译一遍 → 一个明显的 CPU 尖峰。改成串行。
+- **`App` 每次渲染两次强制同步布局**（`App.tsx`）：`overlayBottom()` / `overlayTop()` 在 render 期间无条件读
+  `.dock-bg` 的 `getBoundingClientRect()`，哪怕一个浮层都没开。拖拽时 `dropIdx` 每跨一个图标就变一次，
+  正好构成「布局失效 → 强制布局」的循环。现在只在真有浮层打开时才测量。
+- **拖拽期间 window 监听反复重挂**（`useEdgeScroll.ts`）：`App` 传进去的 `onDropIdx` / `isDragging` 是内联箭头
+  函数，每次渲染换引用 → `step` 换 → `pumpEdgeScroll` 换 → 那个 effect 每重渲染就卸载再挂 3 个 window 监听。
+  回调改走 ref，`step` / `pump` 变稳定引用。
+- **面板成员渲染是 O(n²)**（`App.tsx`）：每个成员都 `slice(0, index).filter(...)` 重算槽位并分配新数组。
+  改成累加器（主 Dock 那侧早就是这个写法）。
+- **`primeDesktopIconsHidden()` 的超时是 5s**（`index.ts`）：它在 `createWindow` **之前**被 await，
+  超时多长，用户双击图标后就多久看不到任何东西（连托盘和 Alt+Space 都还没建）。降到 2s（正常 50~200ms，
+  探测失败时渲染端本来就有「不翻转文案」的兜底）。
+- **沉底失败会让看门狗每 500ms 起一个 powershell**（`index.ts`）：失败时 `recoverDock()` 把窗口恢复置顶，
+  而下一拍 watchdog 又判定该沉底 → 死循环（每次 ~700ms CPU）。加失败退避 5s。
+
+### 数据安全与泄漏
+
+- **换一次图标就让 `.bak` 变成「引用了已删除文件的备份」**（`iconStore.ts` / `shortcutsStore.ts`）：
+  保存流程是「写新 shortcuts.json（顺手把旧的复制成 .bak）→ 按**当前**条目清孤儿图标」，于是 `.bak` 里
+  上一代的 `iconFile` 立刻变孤儿被删。之后主文件一旦损坏、走「从 .bak 恢复」，恢复出来的条目图标全部 404
+  且没有补图路径。`pruneIcons()` 现在会并入 `.bak` / `.recovery` 引用的文件名。
+- **清孤儿图标失败会让一次已经写成功的保存对外报 `false`**（`shortcutsStore.ts`）：`pruneIcons` 与写盘
+  在同一个 try 里，它一抛（目录被删 / 权限）就返回 false，用户看到「保存失败」而磁盘其实已是新数据，还会
+  多落一份没必要的 `.recovery`。现在单独 try/catch。
+- **助手 stdout 的 `buf` 无界增长**（`index.ts`）：等 READY 用的那条监听器在 ready 之后仍无条件
+  `buf += …`（每次响应 10~20B 永久堆积，`includes()` 还是 O(n)）。拿到 READY 立刻摘掉。
+- **托盘点击脚本按 pid 复用文件名**（`index.ts`）：600ms 内点两个不同托盘型应用时，第二次覆盖同一路径，
+  而第一次结束时 `rmSync` 删掉的正是第二次还没被读到的脚本 → 第二次静默失败。文件名加时间戳 + 随机后缀，
+  9s 兜底定时器也纳入 `finish()` 清理。
+- **日志按 UTF-16 码元数当字节数**（`logger.ts`）：本文件日志绝大多数是中文（UTF-8 下 3 字节/字），用
+  `line.length` 会把大小低估 2~3 倍（main.log 实到 400~600KB 才轮转），且与初始化时的 `statSync().size`
+  口径不一致。改成 `Buffer.byteLength()`。
+- **托盘初始化没 try/catch**（`index.ts`）：`resolveResource` 回落到不存在的路径 → `new Tray(emptyImage)`
+  抛错 → 这个 async 回调变成 unhandledRejection，**后面所有初始化整段跳过**（含 `globalShortcut.register`）→
+  「有 Dock、没托盘、Alt+Space 也没反应」，且用户没有任何 UI 入口能退出。
+- **看门狗定时器句柄没人持有**（`index.ts`）：退出流程会 `preventDefault()` 并最长等 800ms，这段时间里
+  它仍可能再起一个 PowerShell。现在存句柄、`will-quit` 里停掉。
+- 另修：`AudioCard` 的两个定时器在卸载后仍会跑（`setState` 打到已卸载组件、并白起一次 PS 读音量）；
+  `App` 的起跳/撤销定时器补了卸载清理。
+
+### 顺带修了探针的一个长期假红
+
+`hitregion-e2e.cjs` 里 `INSET = 20` 是**写死的 60 档值**，而产品侧的内缩量随图标档位缩放
+（`round(20 × iconSize / 60)`：48→16 / 60→20 / 72→24）—— 只要用户把图标调成 48 或 72 档，
+`region top / bottom` 这 5 项断言必然差 4px（超出 TOL=2）而全红。已改成连接后从渲染进程读实际
+`--dock-icon` 再算内缩与放大区高度，标签也按实际值打印。**本机当前是 48 档，实测 5 项假红全部转绿。**
+
+## v1.19.9（2026-11-28）
+
+**隐藏任务栏后不再留那 60px 空带** —— 改用「自动隐藏 + 工作区广播」，做法照 [Windhawk 的
+Toggle Taskbar Visibility](https://github.com/Asteski/windhawk-mods/blob/main/mods/asteski-toggle-taskbar-visibility.wh.cpp)。
+
+### 调研结论（别人的做法）
+
+| 项目 | 做法 | 参考 |
+|---|---|---|
+| Windhawk mod（**在 explorer 内**运行） | Win11 分支注释原文：*"use auto-hide mode, which removes reserved maximize space"* | [源码](https://github.com/Asteski/windhawk-mods/blob/main/mods/asteski-toggle-taskbar-visibility.wh.cpp) |
+| 同上，隐藏动作 | `ABM_SETSTATE(ABS_AUTOHIDE)` + `SetWindowPos(SWP_FRAMECHANGED)` + `SPI_SETWORKAREA(rcMonitor)` + 广播 `WM_SETTINGCHANGE` | 同上 |
+| Win10 老办法 | `ShowWindow(SW_HIDE)` + `SPI_SETWORKAREA` + 广播 | [LazPlanet](https://lazplanet.gitlab.io/2014/02/show-hide-windows-taskbar-lazarus.html) |
+
+**关键结论**：Win11 上没人做到「完全隐藏 + 全屏」——auto-hide 就是拿回空间的那个开关。
+（我们自己另测的两条都无效：`SPI_SETWORKAREA` 单用会被 AppBar 覆盖，`ABM_SETPOS` 跨进程被忽略。）
+
+### 改动
+
+- `TbHideInstant()`：`ABS_AUTOHIDE` + `SW_HIDE` + `SetWindowPos(FRAMECHANGED)`
+  + `SPI_SETWORKAREA(整屏)` + **广播 `WM_SETTINGCHANGE`**（这一拍才是让已开着的窗口立刻重读工作区的关键）
+- `SetWorkAreaFor()`：恢复时用 `ABM_GETTASKBARPOS` 算回「整屏 − 任务栏」再写回去
+- 实测：隐藏 → 工作区 `1380 → 1440`（铺满，空带消失）；恢复 → `1440 → 1380`
+
+### 代价（用户已知并接受）
+
+底边仍留 2px 感应条，鼠标贴上去任务栏会滑出来 —— 这是 auto-hide 的固有行为，
+换来的正是「最大化窗口铺满全屏」。
+
+## v1.19.8（2026-11-28）
+
+**修「微信仍然打不开」。** 两个独立原因：
+
+1. **任务栏被隐藏时根本没去点托盘图标**（v1.19.7 为了「不要展开任务栏」直接跳过了这一步）——
+   而托盘图标是微信从托盘恢复的唯一入口，跳过就等于永远打不开。
+   现在改成：**短暂把任务栏请回来 → 点 → 立刻藏回去**（实测全程 ~2.1s）。
+2. **点得太早**：`TB 1` 刚返回就去遍历 UIA 树，此时托盘图标还没挂进去 → 拿到空树 → 直接失败。
+   补 **250ms 落定等待**，这是关键的一拍。
+
+顺带把托盘图标的候选名补全：除了窗口标题与 exe 名，再加 exe 版本信息里的
+`FileDescription` / `ProductName`（微信 4 的托盘 UIA 名与窗口标题不一致时也能命中）。
+
+实测（任务栏隐藏 + 微信收在托盘）：
+```
+15:25:05.599 任务栏已隐藏
+15:25:06.119 目标在运行但窗口收在托盘里（助手）
+15:25:06.130 为点托盘图标临时显示任务栏（点完立刻藏回）
+15:25:08.275 托盘点击输出: 1          ← 点中了
+微信窗口: 微信=1                       ← 打开了
+任务栏: {"known":true,"hidden":true}   ← 又藏回去了
+```
+
+### 关于「底部空了一块」
+
+这是「纯隐藏」的固有代价：任务栏一旦不隐藏成 auto-hide，它的 AppBar 占位就一直保留
+（`SPI_SETWORKAREA` / `ABM_SETPOS` 都试过：返回 TRUE，值都不生效）。
+**二选一**：要让那 60px 回来只能用 auto-hide，而 auto-hide 必然带来「贴边冒出来」。
+当前默认选「贴边不冒出来」。要「工作区全屏」的话，把 `TbHideInstant` 里的
+`ABS_AUTOHIDE` 那一步加回去即可（一行）。
+
+## v1.19.7（2026-11-28）
+
+**隐藏任务栏之后，鼠标贴到屏幕底边不再把它唤出来。**
+
+之前用的是 Windows 的「自动隐藏」——它能把工作区还给全屏，但代价是底边留一条 2px 的感应条，
+鼠标一贴上去 Explorer 就把整条任务栏滑出来（用户明确要求不要这个）。
+
+- `TbHideInstant()` 改成**纯 `SW_HIDE`**，不再切 `ABS_AUTOHIDE`：没有 auto-hide 就没有贴边唤出
+- 实测：隐藏后把光标停在底边 1.5 秒，两条任务栏始终 `vis=0`；再点「显示任务栏」正常回来
+- 试过但**不成立**的两条路（记下来省得再走）：
+  - 把任务栏窗口挪到屏幕外 → Explorer 会立刻把它摆回停靠位
+  - 纯隐藏后再 `SPI_SETWORKAREA` 抢回工作区 → 返回 TRUE，值不生效（AppBar 仍占着那块）
+- **代价（明确接受）**：工作区仍保留那 48px，最大化窗口底部会留一条空带。
+  「贴边不唤出」和「工作区全屏」在 Windows 这层二选一：前者要关掉 auto-hide，后者只有 auto-hide 给得了
+
+## v1.19.6（2026-11-28）
+
+修 v1.19.5 的三个问题（用户实机反馈）。
+
+### 1. 音量卡片先显示 50 再跳到真值
+
+`useState(50)` 是写死的占位，而真值要 PowerShell 读（~0.9s）才回来 —— 那 1 秒里显示的是假数。
+
+- 改成**模块级记住上次读到的真值**（跨卡片开关复用），本次会话一次都没读到过就显示 `—` + 禁用滑块，
+  绝不显示一个编出来的数字
+- App 启动 8s 的预热里顺手读一次音量（原先只预热设备列表），所以正常情况下卡片一打开就是真值
+
+### 2. 隐藏任务栏时卡
+
+原因：`TbSet` 里 `Thread.Sleep(260)` 等滑动动画 —— 睡的是**常驻助手**，它那条命令队列被堵住 260ms，
+期间任何「点图标激活 / 沉底」都得排队。
+
+- 拆成两步、由 TS 侧串起来：`TB <show> <state>`（切自动隐藏）→ 320ms → `TBH`（收掉窗口）
+- 助手不再 sleep，随时能响应其它指令
+
+### 3. 点已存在实例「从后台托盘打开」
+
+日志实录（15:00:18）：微信当时**真的收在托盘里**，走的是「点托盘图标唤出」；Edge 那类是最小化，
+走 `SW_RESTORE`。两者都会播 Windows 的还原动画 —— 那个动画原本是从任务栏位置飞出来，
+任务栏藏起来之后就变成「从后台凭空冒出来」。
+
+- 激活最小化窗口时**临时关掉系统动画**（`SPI_SETANIMATION`，`AnimationsOff/Restore` 包住那一次
+  `SW_RESTORE`），窗口直接在原位置出现，不再从任务栏飞出来
+
+### 4. 任务栏藏起来后，点微信不再「展开任务栏」
+
+**根因链**：微信收在托盘 → 只能靠点它的托盘图标唤出 → 托盘图标长在任务栏上 → 任务栏被藏了 → 点不到。
+
+实测三条边界（都试过，记下来免得再走一遍）：
+
+1. 直接 `ShowWindow` 显示微信的隐藏主窗口 —— **无效**，它自己立刻收回（`vis` 始终 0）
+2. 给 Qt 的托盘消息窗口发回调：`WM_USER+100` 的 `wParam` 当鼠标键 / 当图标 id 各试一次，
+   再把 `WM_USER+0..120` × `WM_LBUTTONUP` 全扫一遍 —— **无命中**
+3. 把任务栏窗口「显示到屏幕外 + 保持自动隐藏」—— UIA 依然遍历不到托盘图标
+   （实测隐藏状态下 `Shell_TrayWnd` 下只剩 3 个元素）；UIA 要的是「真的在屏幕上」
+
+所以：**任务栏隐藏时不再尝试点托盘图标，也绝不展开任务栏**（用户明确要求），
+提示改成可执行的「先「＋」→ 显示任务栏，再点托盘图标」。任务栏可见时行为不变。
+
+### 5. 隐藏任务栏要「立马隐藏，不要动画」
+
+- `TbHideInstant()`：`AnimationsOff` → `SETSTATE(AUTOHIDE)` → `SW_HIDE` → `AnimationsRestore`，
+  一次调用、一次往返，任务栏**直接消失**，没有滑出/淡出
+- 之前是两步（切自动隐藏 → 320ms 后再收窗口），用户看到的正是那段滑动动画
+- 菜单文案改用「我们自己的意图」优先：刚切完的一两百毫秒里 Explorer 报的矩形还是旧值，
+  只信查询会让文案立刻跳回去
+
+## v1.19.5（2026-11-28）
+
+两个新功能：**一键隐藏/显示 Windows 任务栏**，以及把**音量**并进「音频」条目。
+
+### 新增：任务栏一键显隐（「+」菜单，紧挨「隐藏桌面图标」）
+
+- 点一下隐藏，再点一下恢复；菜单文案跟着状态变（隐藏任务栏 / 显示任务栏）
+- **不是简单的 `ShowWindow`**：实测那样做，工作区仍然扣着任务栏那 48px（2048×1104），
+  最大化窗口会在底部留一条空带；而 `SPI_SETWORKAREA` 返回成功却不生效（Explorer 的 AppBar 占着）。
+  正确做法是先用 `SHAppBarMessage(ABM_SETSTATE, ABS_AUTOHIDE)` 让它把工作区还回来（→2048×1152），
+  等滑动动画结束再 `ShowWindow(SW_HIDE)` 把窗口也收掉
+- 主屏与副屏的 `Shell_SecondaryTrayWnd` 一起处理；**按各自显示器**的底边判断「是否已滑出屏幕」
+  （副屏坐标空间不同，用 `SM_CYSCREEN` 会误判 → 看门狗会每 5s 重新触发一次动画，画面闪烁）
+- 三道还原保险：退出时同步还原（`will-quit` + `execFileSync`，全项目唯一一处）→
+  崩溃后靠 `taskbar-hidden.json` 在下次启动补还原 → Explorer 重启把任务栏放回来时，5s 巡检再藏一次
+- 全部走常驻助手（`TB?` / `TB 0|1 <state>`），一次往返 ~20ms
+
+### 新增：音量并入「音频」卡片
+
+- 「音频」条目卡片顶部加了音量条：静音键 + 滑块 + 数值，作用对象是**当前默认输出设备**
+- 支持静音（图标换成划掉的喇叭，用强调色淡底而不是红——淡玻璃里红太重）
+- 滑块**本地乐观**：拖动时不等于 PowerShell（~0.9s 一次），松手后再回读真值；↑↓/←→ 也走同一条提交
+- 走 `IAudioEndpointVolume`（`AUDIO_CS` 里新增，vtable 顺序与 native 一致）；卡片可见行数 5 → 4（让出 28px 给音量条）
+
+### 实测
+
+```
+音量：读 2% → 设 30 → 静音 → 取消 → 还原（回读全部一致）
+任务栏：hidden:false → 隐藏（work 1104→1152，两条都滑出屏幕）→ 恢复（work 回到 1104、位置复原）
+```
+
+> 说明：这台机器上「隐藏」表现为 Windows 的自动隐藏（滑出屏幕、工作区还给全屏），
+> 鼠标贴底边仍会把它唤回来——这是 Explorer 的行为，不改注册表就绕不过去。
+
+## v1.19.4（2026-11-28）
+
+修「打开微信时 Dock 闪一下、过一会儿才退到后台」。两个独立原因叠在一起。
+
+### 修复
+
+- **启动后的沉底被自己撤销了**（「闪一下」的真凶）：`sendToBottom` 收尾里有一句
+  「期间用户有没有重新抓住 Dock」的补偿判定，其中包含「指针停在玻璃条上 / 刚在 Dock 上动过」。
+  而**点图标这个动作必然**让这两条成立 → 每次启动后的沉底 4ms 内就被 `recoverDock()` 拉回顶部，
+  再等退场看门狗 2.5s 后重新沉。日志实录：
+  ```
+  02.033  sendToBottom(助手) seq=2
+  02.074  recoverDock seq=2 top=false      ← 41ms 后自己撤销
+  06.317  watchdog state=sink              ← 4.3s 后才真沉
+  ```
+  修法：`sendToBottom(win, strict)` —— 启动路径传 `strict = true`，只认
+  「sinkSeq 变了 / 窗口被藏了」这两种真正的反悔信号，不再看指针与活动。
+- **沉底走常驻助手**（「过一会儿」的真凶）：原来每次沉底都起一个 powershell（~700ms），
+  新窗口早弹出来了、Dock 还挂在上面。现在给助手加了 `SINK <hwnd>` 指令
+  （`QLActivate.Sink`，一次管道往返实测 ~20ms），助手不可用时才退回一次性 PowerShell。
+  实测：点图标 → 40ms 内 `exstyle` 从 `0x200008`（置顶）变 `0x200000`，且**保持**不再回弹。
+
+### 已知取舍
+
+`state = tray`（窗口真收进托盘）这条路径仍要 ~1.9s：它走的是 UI Automation 点托盘图标，
+是 UIA 的固有开销；而且 UIA 失败时 Dock 会保持可见 2.5s（让你看见「请点托盘图标」的提示），
+之后由退场看门狗收走。
+
+## v1.19.3（2026-11-28）
+
+点开应用后 Dock 的默认去向改成「退到后台」，并修掉 `sink` 模式其实没生效的老 bug。
+
+### 变更
+
+- **`afterLaunch` 默认从「隐藏到托盘」改为「让位沉底」**：点开应用后 Dock **仍然可见**，
+  只是退到所有窗口后面；想再用它，Alt+Space / 托盘一下就回来（不用去托盘里找）
+- 设置 → 行为 的三项顺序调整为 `让位沉底 / 隐藏到托盘 / 保持显示`（默认排第一个）
+- 三条启动路径统一走这个三态：`run-app`（含「激活已运行实例」）、`run-as-admin`、`open-sound-settings`
+
+### 修复
+
+- 🚫 **`sink` 模式只调了 `sendToBottom()`，没先清置顶位**：`SetWindowPos(HWND_BOTTOM)` 对
+  **置顶窗口**只是把它沉到「置顶层内部的最底」，照样盖在所有普通窗口上面 —— 所以「让位沉底」
+  看起来毫无效果（用户报障：「点了应用 Dock 还挡着，不会退到后台」）。
+  现在与 blur / 退场看门狗两条让位路径一致：**先 `setAlwaysOnTop(false)` 再沉底**
+- 沉底后置 `dockAutoSunk`：Alt+Space / 托盘那一下是**唤回**而不是「隐藏到托盘」
+
+### 实测
+
+点前 `exstyle=0x200008`（`WS_EX_TOPMOST`）→ 启动记事本 → 点后 `exstyle=0x200000` 且窗口**仍可见**，
+即「退到后台但没消失」。
+
+## v1.19.2（2026-11-28）
+
+修「已经登录的微信，点图标又弹一个登录窗；Edge 也开不出已有窗口」——点图标对单实例应用
+多开了进程。根因是「先探测再启动」被整段关掉了（v1.13.8 起 `PROBE_BEFORE_LAUNCH = false`）。
+
+### 修复
+
+- **重新打开四态探询**（`PROBE_BEFORE_LAUNCH = true`）：
+  `running` → 激活已有窗口（**不新开进程**）；`tray` → 用 UI Automation 点托盘图标唤出；
+  `absent` → 启动；`failed` → fail-open 照旧启动
+- **常驻激活助手**（「秒开」的关键）：应用启动 5s 后预热一个 PowerShell 进程，
+  `ACTIVATE_CS` 只在这里编译一次，之后每点一次图标只走一次 stdin/stdout 往返
+  - 实测冷启动成本：`powershell` 最小启动 **604ms**、加 `Add-Type` **869ms**（原来每次都付）
+  - 助手预热后：**8~30ms**；助手空闲 10 分钟自退，父进程消失时随 stdin EOF 退出
+  - 顺带否掉了一条看似更快的路：`cscript` 的 `AppActivate` 只要 44ms，但它内部就是
+    `SetForegroundWindow`，窗口不是前台时被前台锁直接拒（实测微信退化成 3s），
+    且不认最小化/托盘 —— 所以没采用
+- **`tasklist` 快路只在助手没预热时用**：助手预热后连「没在运行」也只要 ~20ms，
+  比 `tasklist` 的 ~70ms 还快
+- **探询改异步**：原来 `execFileSync` 在主进程里同步等约 0.9s（最坏 3 次重试 ≈ 3.5s），
+  期间 Dock 整个假死（悬停放大、动画全停）；现在全链路 `await`
+- **窗口挑选按可见度打分**（正常 3 / 最小化 2 / 隐藏 1）：原来取枚举到的**第一个**有标题窗口，
+  而微信 4.x 这类应用会造一堆**带标题的隐藏辅助窗口**，明明开着主窗口却被判成「收在托盘」，
+  只弹一句「请点托盘图标」
+
+### 实测
+
+| 目标 | 结果 | 耗时 | 进程数 |
+|---|---|---|---|
+| 微信（已登录、窗口可见） | `true`（激活） | **9ms** | 5 → **5** |
+| Edge（已开着） | `true`（激活） | **17ms** | 26 → **26** |
+| 记事本（没在运行） | `true`（启动） | **~50ms** | 0 → 1 |
+| 微信（收在托盘） | 走 UIA 点托盘图标 | ~1.9s（UIA 固有开销） | 5 → **5** |
+
+## v1.19.1（2026-11-28）
+
+修「点了别的软件，Dock 还盖在上面不退」——Dock 悬浮在屏幕中间时压住视频/编辑器的那个。
+根因是**焦点信号在这扇窗上根本不可用**，不是阈值调得不对。
+
+### 修复
+
+- **退场改由看门狗判定**：每 500ms 一拍，只要「可见 + 没收托盘 + 光标不在玻璃条上 +
+  没有浮层 + 用户 2.5s 没在 Dock 上动过」就沉底一次（沉完 `isAlwaysOnTop()` 变 false，
+  下一拍跳过，不会反复起 PowerShell）
+- **删掉悬停时的 `focus()`**：`dock-pointer` 里那声 `mainWindow.focus()` 会被前台锁拒绝激活、
+  却仍把键盘焦点拿到本线程 —— 于是 `win.isFocused()` / `document.hasFocus()` **永久卡在 true**，
+  Windows 之后再不发 `WM_KILLFOCUS`，`blur` 永不触发（实机日志里整段会话 `sendToBottom` 一次都没有）。
+  纯悬停本来也不该抢焦点；真实点击图标时系统会自己给
+- **沉底的迟到补偿不再看 `isFocused()`**：改看「指针是否回到玻璃条 / 浮层是否打开 /
+  刚有没有在 Dock 上动过」。原来那行 `!win.isFocused()` 在焦点卡死时会判成「已被拉回」，
+  于是每次沉底都被紧跟着的 `recoverDock()` 撤销 —— 表现是「沉一下又弹回来」，
+  并且每 500ms 白起一个 PowerShell
+- **`verifyDockOnTop()` 巡检给沉底让路**：新增 `lastSinkAt`，沉底后 3s 内不再断言置顶
+  （巡检 250ms 一次、比沉底的 ~700ms PowerShell 快，晚到一拍就会把窗口拉回顶部）
+- **指针是否停在 Dock 上**改由主进程直接量（`screen.getCursorScreenPoint()` +
+  `getContentBounds()` + renderer 上报的玻璃条矩形）；renderer 只上报「动过」的心跳，
+  不再依赖 enter/leave 事件（实测会被莫名的 mouseleave 提前清掉）
+- **Alt+Space / 托盘「唤回」语义**：被看门狗压到底之后按一次是**拉回前台**，不是隐藏到托盘
+  （原来窗口明明看不见，还要按两次）
+
+### 排查笔记（别再走一遍）
+
+- `powerMonitor.getSystemIdleTime()` 在本机恒返回 0（实测系统已空闲 3s），不能用来判「有没有人在操作」
+- 从外部 `SetForegroundWindow` 会被前台锁拒绝；「合成 Alt 键再调」在探针进程里能成功，
+  但在 Electron spawn 出来的 PowerShell 里仍然被拒，**不要指望靠抢前台来修 blur**
+- 判定「用户在用 Dock」不能用 `blur`、不能用 `isFocused()`、不能用系统空闲时间，
+  就只剩「光标坐标 + 交互心跳」两件事是可信的
+
 ## v1.19.0（2026-11-21）
 
 观感与入口的一版：先修手感与配色，再把「音频」「设置」做成 Dock 上的系统条目。

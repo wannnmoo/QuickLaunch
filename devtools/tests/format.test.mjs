@@ -50,8 +50,10 @@ test('DEFAULT_SETTINGS：关键字段的默认值与类型是稳定的', () => {
   assert.equal(DEFAULT_SETTINGS.glassSaturate, 1.7)
   assert.equal(DEFAULT_SETTINGS.folderCardDelay, 300)
   assert.equal(DEFAULT_SETTINGS.panelCloseDelay, 180)
-  assert.equal(DEFAULT_SETTINGS.afterLaunch, 'hide')
-  assert.equal(DEFAULT_SETTINGS.probeBeforeLaunch, false)
+  // v1.19.3：点开应用后默认「让位沉底」（退到后台但保持可见），原来默认是 hide（整条收进托盘）
+  assert.equal(DEFAULT_SETTINGS.afterLaunch, 'sink')
+  // v1.19.2：点图标前先探询「是不是已经在运行」的开关默认打开（关闭时微信会多开一个登录窗）
+  assert.equal(DEFAULT_SETTINGS.probeBeforeLaunch, true)
   assert.equal(DEFAULT_SETTINGS.searchEnabled, true)
   assert.equal(DEFAULT_SETTINGS.followSystemTheme, false)
 })

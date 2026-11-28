@@ -68,6 +68,13 @@ function buildWindow(iconPath: string, preloadPath: string): BrowserWindow {
     win.show()
     win.focus()
   })
+  // ⚠️ 页面加载失败必须自己收掉：否则 `settingsWindow` 是一个**永远不可见**的窗口
+  //    （ready-to-show 不会来），之后再点「完整设置…」只会 show()+focus() 一个空窗，
+  //    用户怎么点都看不到内容。销毁它会触发下面的 'closed' → Dock 自动回来。
+  win.webContents.on('did-fail-load', (_e, code, desc) => {
+    logWarn('settings-window', `设置中心页面加载失败 code=${code} ${desc}，销毁窗口`)
+    if (!win.isDestroyed()) win.destroy()
+  })
   win.on('closed', () => {
     if (settingsWindow === win) settingsWindow = null
     // 关掉设置窗 → Dock 回来。放在 closed 而不是 close，是因为 close 可以被阻止
@@ -109,6 +116,14 @@ export function openSettingsWindow(iconPath: string, preloadPath: string): boole
   } catch (err) {
     logWarn('settings-window', '设置窗口创建失败', err)
     settingsWindow = null
+    // ⚠️ 必须把 Dock 还给用户：上面已经调过 onOpenedHook()（Dock 收进托盘/让位），
+    //    这里不回滚就是「Dock 没了、设置窗也没出来」，用户只能自己去托盘或按 Alt+Space 找。
+    //    showDockAfterSettings 内部有 dockHiddenBySettings 守卫，Dock 本来就没藏时不会误显示。
+    try {
+      onClosedHook?.()
+    } catch (restoreErr) {
+      logWarn('settings-window', '设置窗口创建失败后恢复 Dock 也失败', restoreErr)
+    }
     return false
   }
 }

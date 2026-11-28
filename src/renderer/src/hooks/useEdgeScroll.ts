@@ -33,6 +33,12 @@ export function useEdgeScroll(opts: Options): {
   const { innerRef, updateScrollState, calcDropIndex, onDropIdx, isDragging } = opts
   const rafRef = useRef<number | null>(null)
   const clientXRef = useRef(0)
+  // ⚠️ 回调全部走 ref：调用方（App.tsx）传的是**内联箭头函数**，每次渲染都是新引用。
+  //    若让 step 依赖它们，`pumpEdgeScroll` 也会跟着换引用 → App 里那个「拖拽 window
+  //    监听」effect 每重渲染一次就卸载再挂 3 个 window 监听（拖拽期间每跨过一个图标都会
+  //    触发一次重渲染），正是那段注释想避免的开销。放进 ref 之后 step / pump 都是稳定引用。
+  const cb = useRef({ updateScrollState, calcDropIndex, onDropIdx, isDragging })
+  cb.current = { updateScrollState, calcDropIndex, onDropIdx, isDragging }
 
   const stopEdgeScroll = useCallback(() => {
     if (rafRef.current !== null) {
@@ -67,11 +73,12 @@ export function useEdgeScroll(opts: Options): {
     const stepPx = Math.max(1, Math.round(Math.pow(strength, 1.35) * EDGE_MAX_SPEED))
     el.scrollLeft = before + (right > left ? 1 : -1) * stepPx
     if (el.scrollLeft !== before) {
-      updateScrollState()
-      if (isDragging()) onDropIdx(calcDropIndex(x))
+      const c = cb.current
+      c.updateScrollState()
+      if (c.isDragging()) c.onDropIdx(c.calcDropIndex(x))
     }
     rafRef.current = requestAnimationFrame(step)
-  }, [innerRef, updateScrollState, isDragging, onDropIdx, calcDropIndex])
+  }, [innerRef])
 
   const pumpEdgeScroll = useCallback(
     (clientX: number) => {

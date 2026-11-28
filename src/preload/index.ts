@@ -4,6 +4,7 @@ import type {
   AppEntry,
   AppSettings,
   AudioSnapshot,
+  AudioVolume,
   DockEdge,
   FolderIconsPayload,
   FolderListing,
@@ -92,6 +93,13 @@ const api = {
    *  缺省三个全设（只设系统会出现「切了但微信语音还在旧设备」）。 */
   setDefaultAudioDevice: (id: string, roles?: number[]): Promise<boolean> =>
     ipcRenderer.invoke('set-default-audio-device', id, roles),
+  /** 当前默认输出设备的音量（0-100）与静音状态；orce 跳过 300ms 缓存 */
+  getAudioVolume: (force?: boolean): Promise<AudioVolume | null> =>
+    ipcRenderer.invoke('get-audio-volume', force === true),
+  /** 设置音量（0-100 整数，超出会被主进程 clamp） */
+  setAudioVolume: (level: number): Promise<boolean> => ipcRenderer.invoke('set-audio-volume', level),
+  /** 静音开关 */
+  setAudioMute: (mute: boolean): Promise<boolean> => ipcRenderer.invoke('set-audio-mute', mute),
   /** 打开 Windows 的「系统 > 声音」设置页（ms-settings: URI，不是文件路径）。 */
   openSoundSettings: (): Promise<boolean> =>
     ipcRenderer.invoke('open-sound-settings'),
@@ -195,6 +203,10 @@ const api = {
    *  沉底仅由点击其他软件（blur）触发——鼠标移出或在其他软件上滚动都不让位。 */
   dockPointer: (inside: boolean): void =>
     ipcRenderer.send('dock-pointer', inside),
+  /** 「用户刚在 Dock 里动过」心跳（mousemove / keydown / wheel / pointerdown，renderer 侧节流）。
+   *  主进程的沉底 watchdog 靠它区分「用户在用 Dock」和「用户在用别的软件」——
+   *  不能改用 `isFocused()`：本机会卡在 true（前台是别的程序也不发 WM_KILLFOCUS）。 */
+  dockActivity: (): void => ipcRenderer.send('dock-activity'),
   /** 上报玻璃条（`.dock-bar`）当前矩形与「有没有浮层开着」，主进程据此调用
    *  `win.setShape()` 把窗口的**命中区**裁成只有玻璃条那一条（+ 8px 阴影余量），
    *  上方 134px 透明区与玻璃条左右两侧的留白彻底交给桌面。

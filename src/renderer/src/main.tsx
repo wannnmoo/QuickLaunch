@@ -74,9 +74,14 @@ window.addEventListener('unhandledrejection', (e) => {
 
 if (isSettingsView) {
   // Esc 关窗由 SettingsApp 自己处理（它需要知道当前窗口是不是设置窗）
+  // ⚠️ 设置窗也要包 ErrorBoundary：Dock 那侧有兜底，设置窗原来没有 —— 一旦渲染期抛异常
+  //    （坏 settings 字段、新增分类里的解引用），用户看到的是 480×308 的空白窗，
+  //    既没有说明也没有自救入口，错误只进日志。
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
-      <SettingsApp />
+      <ErrorBoundary>
+        <SettingsApp />
+      </ErrorBoundary>
     </React.StrictMode>
   )
 } else {

@@ -10,6 +10,7 @@ type DockEdge = import('../../shared/types').DockEdge
 type LnkInfo = import('../../shared/types').LnkInfo
 type DriveInfo = import('../../shared/types').DriveInfo
 type AudioSnapshot = import('../../shared/types').AudioSnapshot
+type AudioVolume = import('../../shared/types').AudioVolume
 type AppSettings = import('../../shared/types').AppSettings
 /** 持久化条目形状（= 共享的 AppEntry） */
 type ShortcutEntry = import('../../shared/types').AppEntry
@@ -39,6 +40,9 @@ interface Window {
     listAudioDevices: (force?: boolean) => Promise<AudioSnapshot>
     /** 设为系统默认。roles：0=系统 / 1=多媒体 / 2=通话，缺省三个全设 */
     setDefaultAudioDevice: (id: string, roles?: number[]) => Promise<boolean>
+  getAudioVolume: (force?: boolean) => Promise<AudioVolume | null>
+  setAudioVolume: (level: number) => Promise<boolean>
+  setAudioMute: (mute: boolean) => Promise<boolean>
     /** 打开 Windows「系统 > 声音」设置页 */
     openSoundSettings: () => Promise<boolean>
     pickIcon: () => Promise<{ path: string; iconDataUrl: string } | null>
@@ -82,6 +86,8 @@ interface Window {
     getAutoStart: () => Promise<boolean>
     setAutoStart: (enabled: boolean) => Promise<boolean>
     dockPointer: (inside: boolean) => void
+  /** 「用户刚在 Dock 里动过」心跳，主进程沉底 watchdog 用（不要改成轮询 isFocused） */
+  dockActivity: () => void
     /** 上报 `.dock-bar` 矩形 + 浮层状态，主进程用它算 `setShape()` 的命中区 */
     setDockHitRegion: (rect: {
       x: number
